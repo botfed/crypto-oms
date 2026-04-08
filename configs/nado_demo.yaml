@@ -1,0 +1,26 @@
+# Nado OMS demo config
+#
+# Private key: set NADO_PRIVATE_KEY env var
+# Account address: set NADO_ACCOUNT_ADDRESS env var
+
+nado:
+  subaccount_name: "default"
+  poll_interval_ms: 3000
+  inflight_timeout_ms: 5000
+
+# crypto-feeds market data subscriptions
+perp:
+  binance:
+    - BTC_USDT
+    - ETH_USDT
+  bybit:
+    - BTC_USDT
+    - ETH_USDT
+  hyperliquid:
+    - BTC_USDC
+    - ETH_USDC
+  nado:
+    - BTC_USDT
+    - ETH_USDT
+
+sample_interval_ms: 10

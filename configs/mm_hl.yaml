@@ -1,0 +1,42 @@
+hyperliquid:
+  poll_interval_ms: 3000
+  inflight_timeout_ms: 5000
+
+perp:
+  binance: [BTC_USDT, AIXBT_USDT]
+  hyperliquid: [BTC_USDC, AIXBT_USDC]
+
+sample_interval_ms: 10
+
+fair_price:
+  basis_halflife_secs: 600.0
+  basis_tick_ms: 100
+  pairs:
+    - target_exchange: hyperliquid
+      target_symbol: PERP_AIXBT_USDC
+      reference_exchange: binance
+      reference_symbol: PERP_AIXBT_USDT
+
+inventory:
+  mode: static
+  static_target:
+    target: 0.0
+  hedge:
+    exposure_file: "/tmp/aerobot/0x313b6755EFe1A31E16aa7D375AE918384ACD737e.json"
+    poll_ms: 100
+    mappings:
+      BTC:
+        - "0xWBTC_ADDRESS"
+        - "0xcbBTC_ADDRESS"
+
+strategy:
+  symbol: PERP_AIXBT_USDC
+  half_spread_bps: 50.0
+  order_notional_usd: 25.0
+  max_position_usd: 500.0
+  max_skew_bps: 5.0
+  cancel_threshold_bps: 25
+  requote_tolerance_bps: 50
+  quote_interval_ms: 150
+  post_only: false
+  warmup_secs: 10

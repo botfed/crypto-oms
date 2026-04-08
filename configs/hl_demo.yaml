@@ -1,0 +1,19 @@
+# Hyperliquid OMS demo config
+#
+# Private key: set HL_PRIVATE_KEY env var
+
+hyperliquid:
+  base_url: "https://api.hyperliquid.xyz"
+  poll_interval_ms: 3000
+  inflight_timeout_ms: 5000
+
+# crypto-feeds market data subscriptions
+perp:
+  binance:
+    - BTC_USDT
+    - ETH_USDT
+  bybit:
+    - BTC_USDT
+    - ETH_USDT
+
+sample_interval_ms: 10
