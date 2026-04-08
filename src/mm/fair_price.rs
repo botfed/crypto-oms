@@ -152,6 +152,11 @@ impl FairPriceEngine {
         Some((chrono::Utc::now() - ts).num_milliseconds())
     }
 
+    /// Read live mid from any exchange (public, for diagnostics).
+    pub fn get_mid(&self, exchange: ExchangeId, symbol_id: SymbolId) -> Option<f64> {
+        self.collection_for(exchange).get_midquote(&symbol_id)
+    }
+
     /// Read live mid from the appropriate MarketDataCollection.
     fn get_live_mid(&self, exchange: ExchangeId, symbol_id: SymbolId) -> Option<f64> {
         let coll = self.collection_for(exchange);

@@ -569,9 +569,17 @@ impl MmEngine {
             .get_ref_age_ms(ExchangeId::Hyperliquid, self.hl_symbol_id)
             .unwrap_or(-1);
 
+        let hl_mid = self.fair_price.get_mid(ExchangeId::Hyperliquid, self.hl_symbol_id);
+        let residual_bps = match (hl_mid, fair) {
+            (Some(hl), Some(f)) if f != 0.0 => (hl - f) / f * 10_000.0,
+            _ => 0.0,
+        };
+
         info!(
-            "status: fair={:.6} basis={:+.2}bps skew={:+.2}bps pos={:+.6} target={:+.6} bid={} ask={} ref_age={}ms",
+            "status: fair={:.6} hl_mid={:.6} resid={:+.2}bps basis={:+.2}bps skew={:+.2}bps pos={:+.6} target={:+.6} bid={} ask={} ref_age={}ms",
             fair.unwrap_or(0.0),
+            hl_mid.unwrap_or(0.0),
+            residual_bps,
             basis_bps,
             skew_bps,
             position,
