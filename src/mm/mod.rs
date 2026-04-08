@@ -322,8 +322,9 @@ impl MmEngine {
                     if let Err(e) = self.oms.cancel_order(&q.client_id).await {
                         warn!("failed to cancel bid {}: {e}", q.client_id.0);
                     }
+                    // Don't clear tracker — let sync_quote_state confirm cancel
                 }
-                self.bid_quote = None;
+                if self.ghost { self.bid_quote = None; }
             }
         }
 
@@ -344,8 +345,9 @@ impl MmEngine {
                     if let Err(e) = self.oms.cancel_order(&q.client_id).await {
                         warn!("failed to cancel ask {}: {e}", q.client_id.0);
                     }
+                    // Don't clear tracker — let sync_quote_state confirm cancel
                 }
-                self.ask_quote = None;
+                if self.ghost { self.ask_quote = None; }
             }
         }
     }
@@ -355,6 +357,9 @@ impl MmEngine {
     // -----------------------------------------------------------------------
 
     async fn evaluate_and_place_quotes(&mut self) {
+        // Cancel any stray orders on our symbol that we don't own
+        self.cancel_stray_orders().await;
+
         let Some(fair) = self.fair_price.get_fair_price(ExchangeId::Hyperliquid, self.hl_symbol_id) else {
             return;
         };
@@ -394,13 +399,14 @@ impl MmEngine {
                 if !is_inflight {
                     if self.ghost {
                         info!("[GHOST] would CANCEL bid cid={} price={:.6} (slow path requote)", q.client_id.0, q.price);
+                        self.bid_quote = None;
                     } else {
                         debug!("slow cancel bid cid={} price={:.6}", q.client_id.0, q.price);
                         if let Err(e) = self.oms.cancel_order(&q.client_id).await {
                             warn!("failed to cancel bid {}: {e}", q.client_id.0);
                         }
+                        // Don't clear tracker — let sync_quote_state confirm cancel
                     }
-                    self.bid_quote = None;
                 }
             }
         }
@@ -418,13 +424,14 @@ impl MmEngine {
                 if !is_inflight {
                     if self.ghost {
                         info!("[GHOST] would CANCEL ask cid={} price={:.6} (slow path requote)", q.client_id.0, q.price);
+                        self.ask_quote = None;
                     } else {
                         debug!("slow cancel ask cid={} price={:.6}", q.client_id.0, q.price);
                         if let Err(e) = self.oms.cancel_order(&q.client_id).await {
                             warn!("failed to cancel ask {}: {e}", q.client_id.0);
                         }
+                        // Don't clear tracker — let sync_quote_state confirm cancel
                     }
-                    self.ask_quote = None;
                 }
             }
         }
@@ -661,6 +668,26 @@ impl MmEngine {
     // -----------------------------------------------------------------------
     // Cancel helpers
     // -----------------------------------------------------------------------
+
+    /// Cancel any open orders on our symbol that we don't recognize as ours.
+    async fn cancel_stray_orders(&mut self) {
+        if self.ghost {
+            return;
+        }
+        let open = self.oms.open_orders(Some(&self.config.symbol));
+        let our_bid = self.bid_quote.as_ref().map(|q| q.client_id);
+        let our_ask = self.ask_quote.as_ref().map(|q| q.client_id);
+
+        for o in &open {
+            if Some(o.client_id) != our_bid && Some(o.client_id) != our_ask {
+                warn!("cancelling stray order cid={} side={:?} price={:?}",
+                    o.client_id.0, o.side, o.order_type);
+                if let Err(e) = self.oms.cancel_order(&o.client_id).await {
+                    warn!("failed to cancel stray {}: {e}", o.client_id.0);
+                }
+            }
+        }
+    }
 
     async fn cancel_all_quotes(&mut self) {
         if self.ghost {
