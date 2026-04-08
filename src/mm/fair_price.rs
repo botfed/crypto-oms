@@ -121,6 +121,21 @@ impl FairPriceEngine {
         Some(ref_mid + basis)
     }
 
+    /// Returns (fair_price, ref_age_ms). Reads live reference mid at call time.
+    pub fn get_fair_price_with_age(&self, exchange: ExchangeId, symbol_id: SymbolId) -> Option<(f64, i64)> {
+        let pair = self.pairs.iter().find(|p| {
+            p.target_exchange == exchange && p.target_symbol_id == symbol_id
+        })?;
+        let coll = self.collection_for(pair.reference_exchange);
+        let md = coll.latest(&pair.reference_symbol_id)?;
+        let ref_mid = md.midquote()?;
+        let age_ms = md.exchange_ts
+            .map(|ts| (Utc::now() - ts).num_milliseconds())
+            .unwrap_or(i64::MAX);
+        let basis = self.basis.get(&(exchange, symbol_id)).map(|v| *v).unwrap_or(0.0);
+        Some((ref_mid + basis, age_ms))
+    }
+
     /// Get the current basis estimate (for diagnostics/logging).
     pub fn get_basis(&self, exchange: ExchangeId, symbol_id: SymbolId) -> Option<f64> {
         self.basis.get(&(exchange, symbol_id)).map(|v| *v)

@@ -161,9 +161,12 @@ pub struct StrategyConfig {
     /// Slow-path cadence for quote evaluation (ms)
     #[serde(default = "default_quote_interval")]
     pub quote_interval_ms: u64,
-    /// Pause if feed older than this (ms)
+    /// Pause engine if feed older than this (ms) — feed is dead
     #[serde(default = "default_max_feed_age")]
     pub max_feed_age_ms: u64,
+    /// Cancel all quotes if ref feed age exceeds this (ms) — trading staleness
+    #[serde(default = "default_max_stale")]
+    pub max_stale_ms: u64,
     /// Use PostOnly (true) or GTC (false) for quotes
     #[serde(default = "default_post_only")]
     pub post_only: bool,
@@ -177,6 +180,7 @@ fn default_cancel_threshold() -> f64 { 0.5 }
 fn default_requote_tolerance() -> f64 { 1.5 }
 fn default_quote_interval() -> u64 { 150 }
 fn default_max_feed_age() -> u64 { 5_000 }
+fn default_max_stale() -> u64 { 500 }
 fn default_post_only() -> bool { true }
 fn default_warmup_secs() -> u64 { 10 }
 

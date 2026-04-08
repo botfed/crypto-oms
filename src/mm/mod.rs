@@ -151,6 +151,20 @@ impl MmEngine {
                         .map(|t| t.elapsed() >= Duration::from_secs(self.config.warmup_secs))
                         .unwrap_or(false);
 
+                    // ── STALENESS CHECK: cancel all if ref feed is stale ──
+                    if let Some((_, age_ms)) = self.fair_price.get_fair_price_with_age(
+                        ExchangeId::Hyperliquid, self.hl_symbol_id
+                    ) {
+                        if age_ms > self.config.max_stale_ms as i64 {
+                            if self.bid_quote.is_some() || self.ask_quote.is_some() {
+                                warn!("ref feed stale (age={}ms > {}ms), cancelling all quotes",
+                                    age_ms, self.config.max_stale_ms);
+                                self.cancel_all_quotes().await;
+                            }
+                            continue;
+                        }
+                    }
+
                     // Sync local trackers with OMS reality
                     self.sync_quote_state();
 
@@ -217,6 +231,17 @@ impl MmEngine {
                 self.last_status_log = Instant::now();
             }
             return false;
+        }
+
+        // Check feed is alive (engine-level — feed completely dead)
+        if let Some(age_ms) = self.fair_price.get_ref_age_ms(ExchangeId::Hyperliquid, self.hl_symbol_id) {
+            if age_ms > self.config.max_feed_age_ms as i64 {
+                if should_log {
+                    warn!("paused: reference feed dead (age={}ms > {}ms)", age_ms, self.config.max_feed_age_ms);
+                    self.last_status_log = Instant::now();
+                }
+                return false;
+            }
         }
 
         true
