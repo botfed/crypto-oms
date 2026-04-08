@@ -106,6 +106,9 @@ pub struct OrderHandle {
     pub exchange_ts: Option<DateTime<Utc>>,
     #[serde(skip)]
     pub submitted_at: Option<Instant>,
+    /// Updated on every state change — used for stray order detection
+    #[serde(skip)]
+    pub last_modified: Option<Instant>,
 }
 
 // ---------------------------------------------------------------------------

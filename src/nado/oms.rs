@@ -877,6 +877,7 @@ impl ExchangeOms for NadoOms {
             reject_reason: None,
             exchange_ts: None,
             submitted_at: Some(Instant::now()),
+            last_modified: Some(Instant::now()),
         };
         self.state.orders.insert(cid, handle);
         let _ = self

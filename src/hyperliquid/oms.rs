@@ -247,6 +247,7 @@ impl HyperliquidOms {
                     } else {
                         handle.state = OrderState::Accepted;
                     }
+                    handle.last_modified = Some(Instant::now());
                 }
             } else {
                 // Order we don't know about — came from outside this OMS session
@@ -281,6 +282,7 @@ impl HyperliquidOms {
                     reject_reason: None,
                     exchange_ts: None,
                     submitted_at: None,
+                    last_modified: Some(Instant::now()),
                 };
 
                 self.state.oid_map.insert(oid_str, cid);
@@ -313,6 +315,7 @@ impl HyperliquidOms {
                     handle.state = OrderState::Cancelled;
                     let _ = self.event_tx.send(OmsEvent::OrderCancelled(handle.client_id));
                 }
+                handle.last_modified = Some(Instant::now());
             }
         }
 
@@ -631,6 +634,7 @@ impl HyperliquidOms {
             } else {
                 handle.state = OrderState::PartiallyFilled;
             }
+            handle.last_modified = Some(Instant::now());
         }
 
         let event = OmsEvent::OrderPartialFill(oms_core::Fill {
@@ -680,6 +684,7 @@ impl HyperliquidOms {
                         drop(entry);
                         if let Some(mut h) = self.state.orders.get_mut(&cid) {
                             h.state = OrderState::TimedOut;
+                            h.last_modified = Some(Instant::now());
                         }
                         let _ = self
                             .event_tx
@@ -798,6 +803,7 @@ impl ExchangeOms for HyperliquidOms {
             reject_reason: None,
             exchange_ts: None,
             submitted_at: Some(Instant::now()),
+            last_modified: Some(Instant::now()),
         };
         self.state.orders.insert(cid, handle);
         let _ = self
@@ -816,6 +822,7 @@ impl ExchangeOms for HyperliquidOms {
                 if let Some(mut h) = self.state.orders.get_mut(&cid) {
                     h.state = OrderState::Rejected;
                     h.reject_reason = Some(msg.clone());
+                    h.last_modified = Some(Instant::now());
                 }
                 let _ = self.event_tx.send(OmsEvent::OrderRejected {
                     client_id: ClientOrderId(cid),
@@ -833,6 +840,7 @@ impl ExchangeOms for HyperliquidOms {
                                 if let Some(mut h) = self.state.orders.get_mut(&cid) {
                                     h.exchange_id = Some(oid_str.clone());
                                     h.state = OrderState::Accepted;
+                                    h.last_modified = Some(Instant::now());
                                 }
                                 self.state.oid_map.insert(oid_str.clone(), cid);
                                 let _ = self.event_tx.send(OmsEvent::OrderAccepted {
@@ -849,6 +857,7 @@ impl ExchangeOms for HyperliquidOms {
                                     h.state = OrderState::Filled;
                                     h.filled_size = total_sz;
                                     h.avg_fill_price = Some(avg_px);
+                                    h.last_modified = Some(Instant::now());
                                 }
                                 self.state.oid_map.insert(oid_str, cid);
                             }
@@ -856,6 +865,7 @@ impl ExchangeOms for HyperliquidOms {
                                 if let Some(mut h) = self.state.orders.get_mut(&cid) {
                                     h.state = OrderState::Rejected;
                                     h.reject_reason = Some(error.clone());
+                                    h.last_modified = Some(Instant::now());
                                 }
                                 let _ = self.event_tx.send(OmsEvent::OrderRejected {
                                     client_id: ClientOrderId(cid),
@@ -903,6 +913,7 @@ impl ExchangeOms for HyperliquidOms {
             hyperliquid_rust_sdk::ExchangeResponseStatus::Ok(_) => {
                 if let Some(mut h) = self.state.orders.get_mut(&id.0) {
                     h.state = OrderState::Cancelling;
+                    h.last_modified = Some(Instant::now());
                 }
                 // Don't emit OrderCancelled yet — wait for REST poll or WS confirmation
             }
@@ -959,6 +970,7 @@ impl ExchangeOms for HyperliquidOms {
 
             if should_cancel {
                 entry.state = OrderState::Cancelling;
+                entry.last_modified = Some(Instant::now());
             }
         }
 
@@ -1039,6 +1051,7 @@ impl ExchangeOms for HyperliquidOms {
         // Mark old order as cancelling (pending confirmation)
         if let Some(mut h) = self.state.orders.get_mut(&id.0) {
             h.state = OrderState::Cancelling;
+            h.last_modified = Some(Instant::now());
         }
 
         // Track the new order as inflight
@@ -1056,6 +1069,7 @@ impl ExchangeOms for HyperliquidOms {
             reject_reason: None,
             exchange_ts: None,
             submitted_at: Some(Instant::now()),
+            last_modified: Some(Instant::now()),
         };
         self.state.orders.insert(new_cid, new_handle);
 

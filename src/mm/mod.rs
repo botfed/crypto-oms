@@ -701,10 +701,10 @@ impl MmEngine {
             if o.state == OrderState::Cancelling {
                 continue;
             }
-            // Only cancel if the order has been around long enough
-            let old_enough = o.submitted_at
+            // Only cancel if the order hasn't been recently modified
+            let old_enough = o.last_modified
                 .map(|t| t.elapsed() >= min_age)
-                .unwrap_or(true); // no submitted_at = came from REST snapshot = old enough
+                .unwrap_or(true); // no last_modified = old enough
             if old_enough {
                 warn!("cancelling stray order cid={} side={:?} price={:?}",
                     o.client_id.0, o.side, o.order_type);
