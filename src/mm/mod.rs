@@ -484,8 +484,12 @@ impl MmEngine {
             return fair_value;
         }
         let denom = if target.abs() > 1e-12 { target.abs() } else { max_pos };
+        // raw ∈ [-ln(2), ln(2)] when diff ∈ [-denom, denom]
+        // Normalize to [-1, 1] then scale by max_skew_bps
         let raw = diff.signum() * (1.0 + diff.abs() / denom).ln();
-        let skew_bps = raw.clamp(-self.config.max_skew_bps, self.config.max_skew_bps);
+        let normalized = raw / std::f64::consts::LN_2; // ∈ [-1, 1] at 100% off target
+        let skew_bps = (normalized * self.config.max_skew_bps)
+            .clamp(-self.config.max_skew_bps, self.config.max_skew_bps);
         fair_value + skew_bps * fair_value / 10_000.0
     }
 
