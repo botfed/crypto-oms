@@ -697,6 +697,10 @@ impl MmEngine {
             if Some(o.client_id) == our_bid || Some(o.client_id) == our_ask {
                 continue;
             }
+            // Skip orders already being cancelled
+            if o.state == OrderState::Cancelling {
+                continue;
+            }
             // Only cancel if the order has been around long enough
             let old_enough = o.submitted_at
                 .map(|t| t.elapsed() >= min_age)
