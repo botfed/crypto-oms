@@ -691,7 +691,7 @@ impl MmEngine {
         let open = self.oms.open_orders(Some(&self.config.symbol));
         let our_bid = self.bid_quote.as_ref().map(|q| q.client_id);
         let our_ask = self.ask_quote.as_ref().map(|q| q.client_id);
-        let min_age = Duration::from_secs(1);
+        let min_age = Duration::from_millis(self.config.stray_order_age_ms);
 
         for o in &open {
             if Some(o.client_id) == our_bid || Some(o.client_id) == our_ask {

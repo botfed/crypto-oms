@@ -167,6 +167,9 @@ pub struct StrategyConfig {
     /// Cancel all quotes if ref feed age exceeds this (ms) — trading staleness
     #[serde(default = "default_max_stale")]
     pub max_stale_ms: u64,
+    /// Minimum age (ms) before an unrecognized order is treated as stray and cancelled
+    #[serde(default = "default_stray_age_ms")]
+    pub stray_order_age_ms: u64,
     /// Use PostOnly (true) or GTC (false) for quotes
     #[serde(default = "default_post_only")]
     pub post_only: bool,
@@ -181,6 +184,7 @@ fn default_requote_tolerance() -> f64 { 1.5 }
 fn default_quote_interval() -> u64 { 150 }
 fn default_max_feed_age() -> u64 { 5_000 }
 fn default_max_stale() -> u64 { 500 }
+fn default_stray_age_ms() -> u64 { 1000 }
 fn default_post_only() -> bool { true }
 fn default_warmup_secs() -> u64 { 10 }
 

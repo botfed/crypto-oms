@@ -43,3 +43,4 @@ strategy:
   quote_interval_ms: 150
   post_only: false
   warmup_secs: 10
+  stray_order_age_ms: 5000
