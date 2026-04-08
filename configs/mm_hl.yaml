@@ -36,10 +36,10 @@ strategy:
   max_stale_ms: 1500
   order_notional_usd: 25.0
   max_position_usd: 1000.0
-  half_spread_bps: 50.0
-  cancel_threshold_bps: 35.0
+  half_spread_bps: 20.0
+  cancel_threshold_bps: 10.0
+  requote_tolerance_bps: 10.0
   max_skew_bps: 10.0
-  requote_tolerance_bps: 50.0
   quote_interval_ms: 150
   post_only: false
   warmup_secs: 10
