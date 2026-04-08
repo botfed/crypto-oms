@@ -60,6 +60,7 @@ impl MmConfig {
             base_url: self.hyperliquid.base_url.clone(),
             poll_interval: Duration::from_millis(self.hyperliquid.poll_interval_ms),
             inflight_timeout: Duration::from_millis(self.hyperliquid.inflight_timeout_ms),
+            stray_order_age: Duration::from_millis(self.strategy.stray_order_age_ms),
         }
     }
 }

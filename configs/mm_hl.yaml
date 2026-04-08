@@ -4,6 +4,8 @@ hyperliquid:
 
 perp:
   binance: [BTC_USDT, AIXBT_USDT]
+  okx: [AIXBT_USDT]
+  bybit: [AIXBT_USDT]
   hyperliquid: [BTC_USDC, AIXBT_USDC]
 
 sample_interval_ms: 10
@@ -43,4 +45,4 @@ strategy:
   quote_interval_ms: 150
   post_only: false
   warmup_secs: 10
-  stray_order_age_ms: 5000
+  stray_order_age_ms: 6000

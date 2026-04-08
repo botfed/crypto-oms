@@ -7,8 +7,9 @@ use crypto_oms::mm::fair_price::FairPriceEngine;
 use crypto_oms::mm::inventory::start_inventory_manager;
 use crypto_oms::mm::MmEngine;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Notify;
-use tracing::info;
+use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -54,7 +55,12 @@ async fn main() -> Result<()> {
     let sd = shutdown.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
+        info!("Ctrl-C received, shutting down...");
         sd.notify_waiters();
+        // Force exit after 3s if graceful shutdown is stuck
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        warn!("graceful shutdown timed out, forcing exit");
+        std::process::exit(1);
     });
 
     // Start crypto-feeds

@@ -23,6 +23,7 @@ use crypto_feeds::market_data::InstrumentType;
 #[derive(Debug, Clone)]
 struct LiveQuote {
     client_id: ClientOrderId,
+    exchange_id: Option<String>,
     price: f64,
     #[allow(dead_code)]
     size: f64,
@@ -252,24 +253,33 @@ impl MmEngine {
     // -----------------------------------------------------------------------
 
     fn sync_quote_state(&mut self) {
-        if let Some(ref q) = self.bid_quote {
+        if let Some(ref mut q) = self.bid_quote {
             match self.oms.get_order(&q.client_id) {
                 Some(h) if matches!(
                     h.state,
                     OrderState::Accepted | OrderState::PartiallyFilled | OrderState::Inflight | OrderState::Cancelling
-                ) => {}
+                ) => {
+                    // Sync exchange_id from OMS
+                    if q.exchange_id.is_none() && h.exchange_id.is_some() {
+                        q.exchange_id = h.exchange_id.clone();
+                    }
+                }
                 _ => {
                     debug!("bid quote {} no longer active, clearing tracker", q.client_id.0);
                     self.bid_quote = None;
                 }
             }
         }
-        if let Some(ref q) = self.ask_quote {
+        if let Some(ref mut q) = self.ask_quote {
             match self.oms.get_order(&q.client_id) {
                 Some(h) if matches!(
                     h.state,
                     OrderState::Accepted | OrderState::PartiallyFilled | OrderState::Inflight | OrderState::Cancelling
-                ) => {}
+                ) => {
+                    if q.exchange_id.is_none() && h.exchange_id.is_some() {
+                        q.exchange_id = h.exchange_id.clone();
+                    }
+                }
                 _ => {
                     debug!("ask quote {} no longer active, clearing tracker", q.client_id.0);
                     self.ask_quote = None;
@@ -462,6 +472,7 @@ impl MmEngine {
                         info!("placed bid cid={} price={:.6} size={:.4}", cid.0, desired_bid, order_size);
                         self.bid_quote = Some(LiveQuote {
                             client_id: cid,
+                            exchange_id: None,
                             price: desired_bid,
                             size: order_size,
                             placed_at: Instant::now(),
@@ -495,6 +506,7 @@ impl MmEngine {
                         info!("placed ask cid={} price={:.6} size={:.4}", cid.0, desired_ask, order_size);
                         self.ask_quote = Some(LiveQuote {
                             client_id: cid,
+                            exchange_id: None,
                             price: desired_ask,
                             size: order_size,
                             placed_at: Instant::now(),
@@ -663,6 +675,22 @@ impl MmEngine {
         }
     }
 
+    /// Check if an order from open_orders matches our tracked bid or ask.
+    /// Matches by client_id OR exchange_id (fallback for synthetic handles from REST poll).
+    fn is_tracked_order(&self, o: &OrderHandle) -> bool {
+        for q in [&self.bid_quote, &self.ask_quote].into_iter().flatten() {
+            if q.client_id == o.client_id {
+                return true;
+            }
+            if let (Some(q_eid), Some(o_eid)) = (&q.exchange_id, &o.exchange_id) {
+                if q_eid == o_eid {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn is_our_order(&self, cid: &ClientOrderId) -> bool {
         self.bid_quote.as_ref().map(|q| q.client_id == *cid).unwrap_or(false)
             || self.ask_quote.as_ref().map(|q| q.client_id == *cid).unwrap_or(false)
@@ -682,34 +710,124 @@ impl MmEngine {
     // -----------------------------------------------------------------------
 
     /// Cancel any open orders on our symbol that we don't recognize as ours.
-    /// Cancel open orders on our symbol that we don't recognize as ours.
-    /// Only considers orders older than 1 second to avoid racing with in-flight operations.
+    /// Handle duplicate/stray orders on our symbol.
+    /// - If we have a tracked quote on a side: cancel all other orders on that side
+    /// - If we DON'T have a tracked quote: adopt the closest to fair, cancel the rest
+    /// - Only act on orders where last_modified age >= stray_order_age_ms
+    /// - Skip orders in Cancelling state
     async fn cancel_stray_orders(&mut self) {
         if self.ghost {
             return;
         }
+
         let open = self.oms.open_orders(Some(&self.config.symbol));
-        let our_bid = self.bid_quote.as_ref().map(|q| q.client_id);
-        let our_ask = self.ask_quote.as_ref().map(|q| q.client_id);
         let min_age = Duration::from_millis(self.config.stray_order_age_ms);
 
+        let fair = self.fair_price.get_fair_price(ExchangeId::Hyperliquid, self.hl_symbol_id)
+            .unwrap_or(0.0);
+
+        // Separate strays by side
+        let mut stray_bids: Vec<&OrderHandle> = Vec::new();
+        let mut stray_asks: Vec<&OrderHandle> = Vec::new();
+
         for o in &open {
-            if Some(o.client_id) == our_bid || Some(o.client_id) == our_ask {
+            // Skip our tracked orders — match by client_id OR exchange_id
+            if self.is_tracked_order(o) {
                 continue;
             }
-            // Skip orders already being cancelled
+            // Skip orders still being cancelled
             if o.state == OrderState::Cancelling {
                 continue;
             }
-            // Only cancel if the order hasn't been recently modified
+            // Skip orders that are too recent
             let old_enough = o.last_modified
                 .map(|t| t.elapsed() >= min_age)
-                .unwrap_or(true); // no last_modified = old enough
-            if old_enough {
-                warn!("cancelling stray order cid={} side={:?} price={:?}",
-                    o.client_id.0, o.side, o.order_type);
+                .unwrap_or(true);
+            if !old_enough {
+                continue;
+            }
+
+            match o.side {
+                Side::Buy => stray_bids.push(o),
+                Side::Sell => stray_asks.push(o),
+            }
+        }
+
+        // Handle stray bids
+        if !stray_bids.is_empty() {
+            if self.bid_quote.is_some() {
+                // We already have a bid — cancel all strays
+                for o in &stray_bids {
+                    warn!("cancelling stray bid cid={} price={:?}", o.client_id.0, o.order_type);
+                    if let Err(e) = self.oms.cancel_order(&o.client_id).await {
+                        warn!("failed to cancel stray bid {}: {e}", o.client_id.0);
+                    }
+                }
+            } else {
+                // No tracked bid — adopt the closest to fair, cancel the rest
+                self.adopt_closest_cancel_rest(&stray_bids, Side::Buy, fair).await;
+            }
+        }
+
+        // Handle stray asks
+        if !stray_asks.is_empty() {
+            if self.ask_quote.is_some() {
+                // We already have an ask — cancel all strays
+                for o in &stray_asks {
+                    warn!("cancelling stray ask cid={} price={:?}", o.client_id.0, o.order_type);
+                    if let Err(e) = self.oms.cancel_order(&o.client_id).await {
+                        warn!("failed to cancel stray ask {}: {e}", o.client_id.0);
+                    }
+                }
+            } else {
+                // No tracked ask — adopt the closest to fair, cancel the rest
+                self.adopt_closest_cancel_rest(&stray_asks, Side::Sell, fair).await;
+            }
+        }
+    }
+
+    /// From a list of stray orders on one side, adopt the one closest to fair price
+    /// as our tracked quote, cancel the rest.
+    async fn adopt_closest_cancel_rest(&mut self, strays: &[&OrderHandle], side: Side, fair: f64) {
+        if strays.is_empty() {
+            return;
+        }
+
+        // Find the one closest to fair
+        let best_idx = strays.iter().enumerate()
+            .min_by(|(_, a), (_, b)| {
+                let price_a = match a.order_type { OrderType::Limit { price, .. } => price, _ => 0.0 };
+                let price_b = match b.order_type { OrderType::Limit { price, .. } => price, _ => 0.0 };
+                let dist_a = (price_a - fair).abs();
+                let dist_b = (price_b - fair).abs();
+                dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        for (i, o) in strays.iter().enumerate() {
+            if i == best_idx {
+                // Adopt this one
+                let price = match o.order_type { OrderType::Limit { price, .. } => price, _ => 0.0 };
+                info!("adopting stray {:?} cid={} price={:.6} as tracked quote",
+                    side, o.client_id.0, price);
+                let quote = LiveQuote {
+                    client_id: o.client_id,
+                    exchange_id: o.exchange_id.clone(),
+                    price,
+                    size: o.size,
+                    placed_at: o.submitted_at.unwrap_or_else(Instant::now),
+                };
+                match side {
+                    Side::Buy => self.bid_quote = Some(quote),
+                    Side::Sell => self.ask_quote = Some(quote),
+                }
+            } else {
+                // Cancel this one
+                warn!("cancelling duplicate {:?} cid={} price={:?}",
+                    side, o.client_id.0, o.order_type);
                 if let Err(e) = self.oms.cancel_order(&o.client_id).await {
-                    warn!("failed to cancel stray {}: {e}", o.client_id.0);
+                    warn!("failed to cancel duplicate {}: {e}", o.client_id.0);
                 }
             }
         }

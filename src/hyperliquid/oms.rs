@@ -31,6 +31,8 @@ pub struct HyperliquidOmsConfig {
     pub poll_interval: Duration,
     /// How long to wait for exchange ack before marking order as timed out
     pub inflight_timeout: Duration,
+    /// How long to wait before overriding Cancelling/Cancelled state from REST poll
+    pub stray_order_age: Duration,
 }
 
 impl Default for HyperliquidOmsConfig {
@@ -41,6 +43,7 @@ impl Default for HyperliquidOmsConfig {
             base_url: None,
             poll_interval: Duration::from_secs(3),
             inflight_timeout: Duration::from_secs(5),
+            stray_order_age: Duration::from_secs(5),
         }
     }
 }
@@ -234,20 +237,58 @@ impl HyperliquidOms {
             let oid_str = oo.oid.to_string();
             exchange_oids.insert(oid_str.clone());
 
-            // If we already track this order (by exchange oid), update it
+            // If we already track this order (by exchange oid), reconcile it
             if let Some(cid) = self.state.oid_map.get(&oid_str) {
                 let cid = *cid;
                 if let Some(mut handle) = self.state.orders.get_mut(&cid) {
                     let remaining_sz: f64 = oo.sz.parse().unwrap_or(0.0);
                     let orig_sz: f64 = oo.orig_sz.parse().unwrap_or(handle.size);
                     handle.filled_size = orig_sz - remaining_sz;
-                    // Exchange says it's open — trust the exchange as source of truth
-                    if handle.filled_size > 0.0 {
-                        handle.state = OrderState::PartiallyFilled;
+
+                    let active_state = if handle.filled_size > 0.0 {
+                        OrderState::PartiallyFilled
                     } else {
-                        handle.state = OrderState::Accepted;
+                        OrderState::Accepted
+                    };
+
+                    let age_exceeded = handle.last_modified
+                        .map(|t| t.elapsed() >= self.config.stray_order_age)
+                        .unwrap_or(true);
+
+                    match handle.state {
+                        // Already active — just update fill info
+                        OrderState::Accepted | OrderState::PartiallyFilled => {
+                            handle.state = active_state;
+                        }
+                        // Inflight — exchange has it, promote
+                        OrderState::Inflight => {
+                            handle.state = active_state;
+                            handle.last_modified = Some(Instant::now());
+                        }
+                        // Cancelling — only restore if stray age exceeded (cancel failed)
+                        OrderState::Cancelling => {
+                            if age_exceeded {
+                                warn!("cancel failed for cid={}, restoring to {:?}", cid, active_state);
+                                handle.state = active_state;
+                                handle.last_modified = Some(Instant::now());
+                            }
+                            // else: cancel still processing, leave as Cancelling
+                        }
+                        // Cancelled — zombie order, only restore if stray age exceeded
+                        OrderState::Cancelled => {
+                            if age_exceeded {
+                                warn!("zombie order cid={} still on exchange, restoring to {:?}", cid, active_state);
+                                handle.state = active_state;
+                                handle.last_modified = Some(Instant::now());
+                            }
+                            // else: just recently cancelled, HL lagging
+                        }
+                        // Other states (Filled, Rejected, TimedOut) — exchange says it's open, trust exchange
+                        _ => {
+                            handle.state = active_state;
+                            handle.last_modified = Some(Instant::now());
+                        }
                     }
-                    handle.last_modified = Some(Instant::now());
                 }
             } else {
                 // Order we don't know about — came from outside this OMS session
