@@ -185,7 +185,7 @@ fn default_warmup_secs() -> u64 { 10 }
 // ---------------------------------------------------------------------------
 
 pub trait MmParamSource: Send + Sync {
-    fn target_position(&self) -> f64;
+    fn target_position_usd(&self) -> f64;
     fn half_spread_bps(&self) -> f64;
     fn order_notional_usd(&self) -> f64;
     fn max_position_usd(&self) -> f64;
@@ -197,7 +197,7 @@ pub trait MmParamSource: Send + Sync {
 // ---------------------------------------------------------------------------
 
 pub struct WatchParams {
-    target_position: watch::Receiver<f64>,
+    target_position_usd: watch::Receiver<f64>,
     half_spread_bps: watch::Receiver<f64>,
     order_notional_usd: watch::Receiver<f64>,
     max_position_usd: watch::Receiver<f64>,
@@ -206,7 +206,7 @@ pub struct WatchParams {
 
 /// Controller side — hand this to external tasks to update params at runtime.
 pub struct WatchParamController {
-    pub target_position: watch::Sender<f64>,
+    pub target_position_usd: watch::Sender<f64>,
     pub half_spread_bps: watch::Sender<f64>,
     pub order_notional_usd: watch::Sender<f64>,
     pub max_position_usd: watch::Sender<f64>,
@@ -232,7 +232,7 @@ impl WatchParams {
         let (target_tx, _) = watch::channel(0.0);
 
         let params = WatchParams {
-            target_position: target_rx,
+            target_position_usd: target_rx,
             half_spread_bps: spread_rx,
             order_notional_usd: size_rx,
             max_position_usd: max_rx,
@@ -240,7 +240,7 @@ impl WatchParams {
         };
 
         let controller = WatchParamController {
-            target_position: target_tx,
+            target_position_usd: target_tx,
             half_spread_bps: spread_tx,
             order_notional_usd: size_tx,
             max_position_usd: max_tx,
@@ -252,8 +252,8 @@ impl WatchParams {
 }
 
 impl MmParamSource for WatchParams {
-    fn target_position(&self) -> f64 {
-        *self.target_position.borrow()
+    fn target_position_usd(&self) -> f64 {
+        *self.target_position_usd.borrow()
     }
 
     fn half_spread_bps(&self) -> f64 {

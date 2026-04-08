@@ -18,7 +18,7 @@ fair_price:
       reference_symbol: PERP_AIXBT_USDT
 
 inventory:
-  mode: static
+  mode: hedge
   static_target:
     target: 0.0
   hedge:
@@ -28,15 +28,17 @@ inventory:
       BTC:
         - "0xWBTC_ADDRESS"
         - "0xcbBTC_ADDRESS"
+      AIXBT:
+        - "0x4F9Fd6Be4a90f2620860d680c0d4d5Fb53d1A825"
 
 strategy:
   symbol: PERP_AIXBT_USDC
-  half_spread_bps: 50.0
   order_notional_usd: 25.0
   max_position_usd: 500.0
   max_skew_bps: 5.0
-  cancel_threshold_bps: 25
-  requote_tolerance_bps: 50
+  half_spread_bps: 50.0
+  cancel_threshold_bps: 35.0
+  requote_tolerance_bps: 50.0
   quote_interval_ms: 150
   post_only: false
   warmup_secs: 10

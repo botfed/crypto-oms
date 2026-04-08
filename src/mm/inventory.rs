@@ -86,12 +86,12 @@ fn spawn_hedge_task(
                     last_mtime = Some(mtime);
 
                     match read_and_compute_target(&exposure_file, &addresses) {
-                        Ok(target) => {
+                        Ok(target_usd) => {
                             info!(
-                                "hedge target updated: asset={}, target={:.6}",
-                                asset_name, target,
+                                "hedge target updated: asset={}, target_usd={:.2}",
+                                asset_name, target_usd,
                             );
-                            let _ = controller.send(target);
+                            let _ = controller.send(target_usd);
                         }
                         Err(e) => {
                             warn!("hedge: failed to read exposures: {e}");
@@ -103,31 +103,35 @@ fn spawn_hedge_task(
     })
 }
 
-/// Read the exposure JSON file, sum all mapped token addresses, negate for hedge.
+/// Read the exposure JSON file, sum USD exposures for mapped token addresses, negate for hedge.
+/// Returns the negated USD exposure (hedge target in USD).
 fn read_and_compute_target(path: &str, addresses: &[String]) -> Result<f64> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("reading {path}"))?;
 
-    let exposures: HashMap<String, serde_json::Value> = serde_json::from_str(&contents)
+    let root: serde_json::Value = serde_json::from_str(&contents)
         .with_context(|| format!("parsing {path}"))?;
 
-    let mut total_exposure = 0.0;
+    // Navigate to valuation.exposures_usd
+    let exposures = root
+        .get("valuation")
+        .and_then(|v| v.get("exposures_usd"))
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| anyhow::anyhow!("missing valuation.exposures_usd in {path}"))?;
+
+    let mut total_exposure_usd = 0.0;
     for addr in addresses {
-        // Try case-insensitive match on address keys
         let addr_lower = addr.to_lowercase();
-        for (key, val) in &exposures {
+        for (key, val) in exposures {
             if key.to_lowercase() == addr_lower {
                 if let Some(amount) = val.as_f64() {
-                    total_exposure += amount;
-                } else if let Some(s) = val.as_str() {
-                    if let Ok(amount) = s.parse::<f64>() {
-                        total_exposure += amount;
-                    }
+                    total_exposure_usd += amount;
                 }
             }
         }
     }
 
-    // Hedge = opposite of on-chain exposure
-    Ok(-total_exposure)
+    // Hedge = opposite of on-chain USD exposure
+    // The MM engine converts this USD target to base units using fair price
+    Ok(-total_exposure_usd)
 }

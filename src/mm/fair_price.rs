@@ -1,3 +1,4 @@
+use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -123,6 +124,17 @@ impl FairPriceEngine {
     /// Get the current basis estimate (for diagnostics/logging).
     pub fn get_basis(&self, exchange: ExchangeId, symbol_id: SymbolId) -> Option<f64> {
         self.basis.get(&(exchange, symbol_id)).map(|v| *v)
+    }
+
+    /// Get the age in ms of the reference feed's exchange_ts for a given target.
+    pub fn get_ref_age_ms(&self, exchange: ExchangeId, symbol_id: SymbolId) -> Option<i64> {
+        let pair = self.pairs.iter().find(|p| {
+            p.target_exchange == exchange && p.target_symbol_id == symbol_id
+        })?;
+        let coll = self.collection_for(pair.reference_exchange);
+        let md = coll.latest(&pair.reference_symbol_id)?;
+        let ts = md.exchange_ts?;
+        Some((chrono::Utc::now() - ts).num_milliseconds())
     }
 
     /// Read live mid from the appropriate MarketDataCollection.

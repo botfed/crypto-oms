@@ -268,7 +268,7 @@ impl MmEngine {
         };
 
         let position = self.get_position();
-        let target = self.params.target_position();
+        let target = self.params.target_position_usd() / fair;
         let max_pos = self.params.max_position_usd() / fair;
         let half_spread = self.params.half_spread_bps() * fair / 10_000.0;
         let cancel_thresh = self.config.cancel_threshold_bps * fair / 10_000.0;
@@ -335,7 +335,7 @@ impl MmEngine {
         };
 
         let position = self.get_position();
-        let target = self.params.target_position();
+        let target = self.params.target_position_usd() / fair;
         let half_spread = self.params.half_spread_bps() * fair / 10_000.0;
         let notional = self.params.order_notional_usd();
         let order_size = notional / fair;
@@ -506,7 +506,7 @@ impl MmEngine {
         let fair = self.fair_price.get_fair_price(ExchangeId::Hyperliquid, self.hl_symbol_id);
         let basis = self.fair_price.get_basis(ExchangeId::Hyperliquid, self.hl_symbol_id);
         let position = self.get_position();
-        let target = self.params.target_position();
+        let target = fair.map(|f| self.params.target_position_usd() / f).unwrap_or(0.0);
         let max_pos = fair.map(|f| self.params.max_position_usd() / f).unwrap_or(0.0);
 
         let basis_bps = match (basis, fair) {
@@ -529,8 +529,12 @@ impl MmEngine {
             .map(|q| format!("{:.6}", q.price))
             .unwrap_or_else(|| "-".into());
 
+        let ref_age_ms = self.fair_price
+            .get_ref_age_ms(ExchangeId::Hyperliquid, self.hl_symbol_id)
+            .unwrap_or(-1);
+
         info!(
-            "status: fair={:.6} basis={:+.2}bps skew={:+.2}bps pos={:+.6} target={:+.6} bid={} ask={}",
+            "status: fair={:.6} basis={:+.2}bps skew={:+.2}bps pos={:+.6} target={:+.6} bid={} ask={} ref_age={}ms",
             fair.unwrap_or(0.0),
             basis_bps,
             skew_bps,
@@ -538,6 +542,7 @@ impl MmEngine {
             target,
             bid_str,
             ask_str,
+            ref_age_ms,
         );
     }
 
