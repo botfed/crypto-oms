@@ -360,9 +360,13 @@ impl MmEngine {
         // Cancel any stray orders on our symbol that we don't own
         self.cancel_stray_orders().await;
 
-        let Some(fair) = self.fair_price.get_fair_price(ExchangeId::Hyperliquid, self.hl_symbol_id) else {
+        // Staleness check — don't place on stale data
+        let Some((fair, age_ms)) = self.fair_price.get_fair_price_with_age(ExchangeId::Hyperliquid, self.hl_symbol_id) else {
             return;
         };
+        if age_ms > self.config.max_stale_ms as i64 {
+            return;
+        }
 
         let position = self.get_position();
         let target = self.params.target_position_usd() / fair;
@@ -678,6 +682,8 @@ impl MmEngine {
     // -----------------------------------------------------------------------
 
     /// Cancel any open orders on our symbol that we don't recognize as ours.
+    /// Cancel open orders on our symbol that we don't recognize as ours.
+    /// Only considers orders older than 1 second to avoid racing with in-flight operations.
     async fn cancel_stray_orders(&mut self) {
         if self.ghost {
             return;
@@ -685,9 +691,17 @@ impl MmEngine {
         let open = self.oms.open_orders(Some(&self.config.symbol));
         let our_bid = self.bid_quote.as_ref().map(|q| q.client_id);
         let our_ask = self.ask_quote.as_ref().map(|q| q.client_id);
+        let min_age = Duration::from_secs(1);
 
         for o in &open {
-            if Some(o.client_id) != our_bid && Some(o.client_id) != our_ask {
+            if Some(o.client_id) == our_bid || Some(o.client_id) == our_ask {
+                continue;
+            }
+            // Only cancel if the order has been around long enough
+            let old_enough = o.submitted_at
+                .map(|t| t.elapsed() >= min_age)
+                .unwrap_or(true); // no submitted_at = came from REST snapshot = old enough
+            if old_enough {
                 warn!("cancelling stray order cid={} side={:?} price={:?}",
                     o.client_id.0, o.side, o.order_type);
                 if let Err(e) = self.oms.cancel_order(&o.client_id).await {
