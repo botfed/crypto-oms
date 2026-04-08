@@ -241,8 +241,11 @@ impl HyperliquidOms {
                     let remaining_sz: f64 = oo.sz.parse().unwrap_or(0.0);
                     let orig_sz: f64 = oo.orig_sz.parse().unwrap_or(handle.size);
                     handle.filled_size = orig_sz - remaining_sz;
-                    if handle.filled_size > 0.0 && handle.state == OrderState::Accepted {
+                    // Exchange says it's open — trust the exchange as source of truth
+                    if handle.filled_size > 0.0 {
                         handle.state = OrderState::PartiallyFilled;
+                    } else {
+                        handle.state = OrderState::Accepted;
                     }
                 }
             } else {
@@ -290,7 +293,9 @@ impl HyperliquidOms {
         let mut to_remove = Vec::new();
         for entry in self.state.orders.iter() {
             let handle = entry.value();
-            if handle.state == OrderState::Accepted || handle.state == OrderState::PartiallyFilled {
+            if matches!(handle.state,
+                OrderState::Accepted | OrderState::PartiallyFilled | OrderState::Cancelling
+            ) {
                 if let Some(eid) = &handle.exchange_id {
                     if !exchange_oids.contains(eid) {
                         // Order disappeared from exchange — probably filled or cancelled
@@ -306,6 +311,7 @@ impl HyperliquidOms {
                     handle.state = OrderState::Filled;
                 } else {
                     handle.state = OrderState::Cancelled;
+                    let _ = self.event_tx.send(OmsEvent::OrderCancelled(handle.client_id));
                 }
             }
         }
@@ -896,9 +902,9 @@ impl ExchangeOms for HyperliquidOms {
         match resp {
             hyperliquid_rust_sdk::ExchangeResponseStatus::Ok(_) => {
                 if let Some(mut h) = self.state.orders.get_mut(&id.0) {
-                    h.state = OrderState::Cancelled;
+                    h.state = OrderState::Cancelling;
                 }
-                let _ = self.event_tx.send(OmsEvent::OrderCancelled(*id));
+                // Don't emit OrderCancelled yet — wait for REST poll or WS confirmation
             }
             hyperliquid_rust_sdk::ExchangeResponseStatus::Err(msg) => {
                 warn!("cancel rejected: {msg}");
@@ -944,7 +950,7 @@ impl ExchangeOms for HyperliquidOms {
             .await
             .map_err(|e| anyhow::anyhow!("SDK bulk cancel failed: {e}"))?;
 
-        // Mark all matching orders as cancelled
+        // Mark all matching orders as cancelling (pending confirmation)
         for mut entry in self.state.orders.iter_mut() {
             let should_cancel = matches!(
                 entry.state,
@@ -952,10 +958,7 @@ impl ExchangeOms for HyperliquidOms {
             ) && symbol.map_or(true, |s| entry.symbol == s);
 
             if should_cancel {
-                entry.state = OrderState::Cancelled;
-                let _ = self
-                    .event_tx
-                    .send(OmsEvent::OrderCancelled(entry.client_id));
+                entry.state = OrderState::Cancelling;
             }
         }
 
@@ -1033,9 +1036,9 @@ impl ExchangeOms for HyperliquidOms {
             .await
             .map_err(|e| anyhow::anyhow!("SDK modify failed: {e}"))?;
 
-        // Mark old order as cancelled
+        // Mark old order as cancelling (pending confirmation)
         if let Some(mut h) = self.state.orders.get_mut(&id.0) {
-            h.state = OrderState::Cancelled;
+            h.state = OrderState::Cancelling;
         }
 
         // Track the new order as inflight
@@ -1074,6 +1077,7 @@ impl ExchangeOms for HyperliquidOms {
                     OrderState::Inflight
                         | OrderState::Accepted
                         | OrderState::PartiallyFilled
+                        | OrderState::Cancelling
                 ) && symbol.map_or(true, |s| h.symbol == s)
             })
             .map(|e| e.value().clone())

@@ -256,7 +256,7 @@ impl MmEngine {
             match self.oms.get_order(&q.client_id) {
                 Some(h) if matches!(
                     h.state,
-                    OrderState::Accepted | OrderState::PartiallyFilled | OrderState::Inflight
+                    OrderState::Accepted | OrderState::PartiallyFilled | OrderState::Inflight | OrderState::Cancelling
                 ) => {}
                 _ => {
                     debug!("bid quote {} no longer active, clearing tracker", q.client_id.0);
@@ -268,7 +268,7 @@ impl MmEngine {
             match self.oms.get_order(&q.client_id) {
                 Some(h) if matches!(
                     h.state,
-                    OrderState::Accepted | OrderState::PartiallyFilled | OrderState::Inflight
+                    OrderState::Accepted | OrderState::PartiallyFilled | OrderState::Inflight | OrderState::Cancelling
                 ) => {}
                 _ => {
                     debug!("ask quote {} no longer active, clearing tracker", q.client_id.0);

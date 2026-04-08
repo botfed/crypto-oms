@@ -41,6 +41,8 @@ pub enum OrderState {
     /// Exchange accepted, working
     Accepted,
     PartiallyFilled,
+    /// Cancel sent to exchange, awaiting confirmation
+    Cancelling,
     Filled,
     Cancelled,
     Rejected,
