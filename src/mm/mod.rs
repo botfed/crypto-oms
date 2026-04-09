@@ -142,7 +142,7 @@ impl MmEngine {
                     self.cancel_all_quotes().await;
                     return Ok(());
                 }
-                _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                _ = tokio::task::yield_now() => {
                     self.drain_oms_events();
 
                     if !self.check_preconditions() {
