@@ -153,7 +153,7 @@ impl MmEngine {
                         .unwrap_or(false);
 
                     // ── STALENESS CHECK: cancel all if ref feed is stale ──
-                    if let Some((_, age_ms)) = self.fair_price.get_fair_price_with_age(
+                    if let Some((_, age_ms, _)) = self.fair_price.get_fair_price_with_age(
                         ExchangeId::Hyperliquid, self.hl_symbol_id
                     ) {
                         if age_ms > self.config.max_stale_ms as i64 {
@@ -379,7 +379,7 @@ impl MmEngine {
         self.cancel_stray_orders().await;
 
         // Staleness check — don't place on stale data
-        let Some((fair, age_ms)) = self.fair_price.get_fair_price_with_age(ExchangeId::Hyperliquid, self.hl_symbol_id) else {
+        let Some((fair, age_ms, _)) = self.fair_price.get_fair_price_with_age(ExchangeId::Hyperliquid, self.hl_symbol_id) else {
             return;
         };
         if age_ms > self.config.max_stale_ms as i64 {
@@ -590,9 +590,10 @@ impl MmEngine {
             .map(|q| format!("{:.6}", q.price))
             .unwrap_or_else(|| "-".into());
 
-        let ref_age_ms = self.fair_price
-            .get_ref_age_ms(ExchangeId::Hyperliquid, self.hl_symbol_id)
-            .unwrap_or(-1);
+        let (ref_age_ms, ref_feed) = self.fair_price
+            .get_fair_price_with_age(ExchangeId::Hyperliquid, self.hl_symbol_id)
+            .map(|(_, age, feed)| (age, feed))
+            .unwrap_or((-1, "none"));
 
         let hl_mid = self.fair_price.get_mid(ExchangeId::Hyperliquid, self.hl_symbol_id);
         let residual_bps = match (hl_mid, fair) {
@@ -601,7 +602,7 @@ impl MmEngine {
         };
 
         info!(
-            "status: fair={:.6} hl_mid={:.6} resid={:+.2}bps basis={:+.2}bps skew={:+.2}bps pos={:+.6} target={:+.6} bid={} ask={} ref_age={}ms",
+            "status: fair={:.6} hl_mid={:.6} resid={:+.2}bps basis={:+.2}bps skew={:+.2}bps pos={:+.6} target={:+.6} bid={} ask={} ref={}@{}ms",
             fair.unwrap_or(0.0),
             hl_mid.unwrap_or(0.0),
             residual_bps,
@@ -611,6 +612,7 @@ impl MmEngine {
             target,
             bid_str,
             ask_str,
+            ref_feed,
             ref_age_ms,
         );
     }

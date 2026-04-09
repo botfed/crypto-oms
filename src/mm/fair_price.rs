@@ -1,5 +1,6 @@
 use chrono::Utc;
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,7 +20,20 @@ use super::config::FairPriceConfig;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExchangeId {
     Binance,
+    Bybit,
+    Okx,
     Hyperliquid,
+}
+
+impl fmt::Display for ExchangeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExchangeId::Binance => write!(f, "binance"),
+            ExchangeId::Bybit => write!(f, "bybit"),
+            ExchangeId::Okx => write!(f, "okx"),
+            ExchangeId::Hyperliquid => write!(f, "hyperliquid"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -31,7 +45,7 @@ struct ResolvedPair {
     target_symbol_id: SymbolId,
     reference_exchange: ExchangeId,
     reference_symbol_id: SymbolId,
-    /// Original config symbol string for cache key, e.g. "hyperliquid:PERP_BTC_USDC"
+    /// Cache key: "target_exchange:target_symbol:ref_exchange:ref_symbol"
     cache_key: String,
 }
 
@@ -41,10 +55,10 @@ struct ResolvedPair {
 
 pub struct FairPriceEngine {
     market_data: Arc<AllMarketData>,
-    /// (target_exchange, target_symbol_id) → current basis EWMA
-    basis: Arc<DashMap<(ExchangeId, SymbolId), f64>>,
-    /// Whether basis has been seeded (first observation)
-    seeded: Arc<DashMap<(ExchangeId, SymbolId), bool>>,
+    /// pair_index → current basis EWMA (one basis per pair)
+    basis: Arc<DashMap<usize, f64>>,
+    /// pair_index → whether basis has been seeded
+    seeded: Arc<DashMap<usize, bool>>,
     pairs: Vec<ResolvedPair>,
     config: FairPriceConfig,
 }
@@ -83,12 +97,16 @@ impl FairPriceEngine {
                 target_symbol_id,
                 reference_exchange: ref_exchange,
                 reference_symbol_id: ref_symbol_id,
-                cache_key: format!("{}:{}", pair_cfg.target_exchange, pair_cfg.target_symbol),
+                cache_key: format!(
+                    "{}:{}:{}:{}",
+                    pair_cfg.target_exchange, pair_cfg.target_symbol,
+                    pair_cfg.reference_exchange, pair_cfg.reference_symbol,
+                ),
             });
         }
 
-        let basis: Arc<DashMap<(ExchangeId, SymbolId), f64>> = Arc::new(DashMap::new());
-        let seeded: Arc<DashMap<(ExchangeId, SymbolId), bool>> = Arc::new(DashMap::new());
+        let basis: Arc<DashMap<usize, f64>> = Arc::new(DashMap::new());
+        let seeded: Arc<DashMap<usize, bool>> = Arc::new(DashMap::new());
 
         // Load cached basis from disk
         load_basis_cache(&config.basis_cache_path, &pairs, &basis, &seeded);
@@ -110,46 +128,88 @@ impl FairPriceEngine {
         });
     }
 
-    /// Returns live reference mid + cached basis for the target exchange/symbol.
-    /// The reference mid is read at call time (not cached).
+    /// Returns fair price using the freshest reference feed across all matching pairs.
     pub fn get_fair_price(&self, exchange: ExchangeId, symbol_id: SymbolId) -> Option<f64> {
-        let pair = self.pairs.iter().find(|p| {
-            p.target_exchange == exchange && p.target_symbol_id == symbol_id
-        })?;
-        let ref_mid = self.get_live_mid(pair.reference_exchange, pair.reference_symbol_id)?;
-        let basis = self.basis.get(&(exchange, symbol_id)).map(|v| *v).unwrap_or(0.0);
-        Some(ref_mid + basis)
+        self.get_fair_price_with_age(exchange, symbol_id).map(|(price, _, _)| price)
     }
 
-    /// Returns (fair_price, ref_age_ms). Reads live reference mid at call time.
-    pub fn get_fair_price_with_age(&self, exchange: ExchangeId, symbol_id: SymbolId) -> Option<(f64, i64)> {
-        let pair = self.pairs.iter().find(|p| {
-            p.target_exchange == exchange && p.target_symbol_id == symbol_id
-        })?;
-        let coll = self.collection_for(pair.reference_exchange);
-        let md = coll.latest(&pair.reference_symbol_id)?;
-        let ref_mid = md.midquote()?;
-        let age_ms = md.exchange_ts
-            .map(|ts| (Utc::now() - ts).num_milliseconds())
-            .unwrap_or(i64::MAX);
-        let basis = self.basis.get(&(exchange, symbol_id)).map(|v| *v).unwrap_or(0.0);
-        Some((ref_mid + basis, age_ms))
+    /// Returns (fair_price, ref_age_ms, ref_exchange_name). Uses the freshest reference feed.
+    pub fn get_fair_price_with_age(
+        &self,
+        exchange: ExchangeId,
+        symbol_id: SymbolId,
+    ) -> Option<(f64, i64, &str)> {
+        let now = Utc::now();
+        let mut best: Option<(f64, i64, usize)> = None; // (price, age, pair_idx)
+
+        for (idx, pair) in self.pairs.iter().enumerate() {
+            if pair.target_exchange != exchange || pair.target_symbol_id != symbol_id {
+                continue;
+            }
+
+            let coll = self.collection_for(pair.reference_exchange);
+            let Some(md) = coll.latest(&pair.reference_symbol_id) else { continue };
+            let Some(ref_mid) = md.midquote() else { continue };
+
+            let age_ms = md.exchange_ts
+                .map(|ts| (now - ts).num_milliseconds())
+                .unwrap_or(i64::MAX);
+
+            let basis = self.basis.get(&idx).map(|v| *v).unwrap_or(0.0);
+            let fair = ref_mid + basis;
+
+            match &best {
+                Some((_, best_age, _)) if age_ms < *best_age => {
+                    best = Some((fair, age_ms, idx));
+                }
+                None => {
+                    best = Some((fair, age_ms, idx));
+                }
+                _ => {}
+            }
+        }
+
+        best.map(|(price, age, idx)| {
+            let ref_name = match self.pairs[idx].reference_exchange {
+                ExchangeId::Binance => "binance",
+                ExchangeId::Bybit => "bybit",
+                ExchangeId::Okx => "okx",
+                ExchangeId::Hyperliquid => "hyperliquid",
+            };
+            (price, age, ref_name)
+        })
     }
 
-    /// Get the current basis estimate (for diagnostics/logging).
+    /// Get the current basis estimate for the freshest pair (for diagnostics).
     pub fn get_basis(&self, exchange: ExchangeId, symbol_id: SymbolId) -> Option<f64> {
-        self.basis.get(&(exchange, symbol_id)).map(|v| *v)
+        // Return basis of the freshest pair
+        self.get_fair_price_with_age(exchange, symbol_id)
+            .and_then(|(_, _, _)| {
+                // Find the freshest pair index
+                let now = Utc::now();
+                let mut best_idx = None;
+                let mut best_age = i64::MAX;
+                for (idx, pair) in self.pairs.iter().enumerate() {
+                    if pair.target_exchange != exchange || pair.target_symbol_id != symbol_id {
+                        continue;
+                    }
+                    let age = self.collection_for(pair.reference_exchange)
+                        .latest(&pair.reference_symbol_id)
+                        .and_then(|md| md.exchange_ts)
+                        .map(|ts| (now - ts).num_milliseconds())
+                        .unwrap_or(i64::MAX);
+                    if age < best_age {
+                        best_age = age;
+                        best_idx = Some(idx);
+                    }
+                }
+                best_idx.and_then(|idx| self.basis.get(&idx).map(|v| *v))
+            })
     }
 
-    /// Get the age in ms of the reference feed's exchange_ts for a given target.
+    /// Get the best (lowest) ref age across all matching pairs.
     pub fn get_ref_age_ms(&self, exchange: ExchangeId, symbol_id: SymbolId) -> Option<i64> {
-        let pair = self.pairs.iter().find(|p| {
-            p.target_exchange == exchange && p.target_symbol_id == symbol_id
-        })?;
-        let coll = self.collection_for(pair.reference_exchange);
-        let md = coll.latest(&pair.reference_symbol_id)?;
-        let ts = md.exchange_ts?;
-        Some((chrono::Utc::now() - ts).num_milliseconds())
+        self.get_fair_price_with_age(exchange, symbol_id).map(|(_, age, _)| age)
     }
 
     /// Read live mid from any exchange (public, for diagnostics).
@@ -157,15 +217,11 @@ impl FairPriceEngine {
         self.collection_for(exchange).get_midquote(&symbol_id)
     }
 
-    /// Read live mid from the appropriate MarketDataCollection.
-    fn get_live_mid(&self, exchange: ExchangeId, symbol_id: SymbolId) -> Option<f64> {
-        let coll = self.collection_for(exchange);
-        coll.get_midquote(&symbol_id)
-    }
-
     fn collection_for(&self, exchange: ExchangeId) -> &MarketDataCollection {
         match exchange {
             ExchangeId::Binance => &self.market_data.binance,
+            ExchangeId::Bybit => &self.market_data.bybit,
+            ExchangeId::Okx => &self.market_data.okx,
             ExchangeId::Hyperliquid => &self.market_data.hyperliquid,
         }
     }
@@ -207,30 +263,29 @@ impl FairPriceEngine {
     }
 
     fn update_basis(&self, alpha: f64) {
-        for pair in &self.pairs {
-            let target_mid = self.get_live_mid(pair.target_exchange, pair.target_symbol_id);
-            let ref_mid = self.get_live_mid(pair.reference_exchange, pair.reference_symbol_id);
+        for (idx, pair) in self.pairs.iter().enumerate() {
+            let target_mid = self.get_mid(pair.target_exchange, pair.target_symbol_id);
+            let coll = self.collection_for(pair.reference_exchange);
+            let ref_mid = coll.get_midquote(&pair.reference_symbol_id);
 
             let (Some(t_mid), Some(r_mid)) = (target_mid, ref_mid) else {
                 continue;
             };
 
             let instantaneous = t_mid - r_mid;
-            let key = (pair.target_exchange, pair.target_symbol_id);
 
-            let is_seeded = self.seeded.get(&key).map(|v| *v).unwrap_or(false);
+            let is_seeded = self.seeded.get(&idx).map(|v| *v).unwrap_or(false);
             if !is_seeded {
-                // First observation — seed directly
-                self.basis.insert(key, instantaneous);
-                self.seeded.insert(key, true);
+                self.basis.insert(idx, instantaneous);
+                self.seeded.insert(idx, true);
                 debug!(
-                    "basis seeded: {:?}/{} = {:.4} (target={:.2}, ref={:.2})",
-                    pair.target_exchange, pair.target_symbol_id, instantaneous, t_mid, r_mid
+                    "basis seeded: pair={} ({}) = {:.6} (target={:.6}, ref={:.6})",
+                    idx, pair.cache_key, instantaneous, t_mid, r_mid
                 );
             } else {
-                let prev = self.basis.get(&key).map(|v| *v).unwrap_or(0.0);
+                let prev = self.basis.get(&idx).map(|v| *v).unwrap_or(0.0);
                 let new_val = alpha * instantaneous + (1.0 - alpha) * prev;
-                self.basis.insert(key, new_val);
+                self.basis.insert(idx, new_val);
             }
         }
     }
@@ -243,6 +298,8 @@ impl FairPriceEngine {
 fn parse_exchange_id(s: &str) -> anyhow::Result<ExchangeId> {
     match s.to_lowercase().as_str() {
         "binance" => Ok(ExchangeId::Binance),
+        "bybit" => Ok(ExchangeId::Bybit),
+        "okx" => Ok(ExchangeId::Okx),
         "hyperliquid" | "hl" => Ok(ExchangeId::Hyperliquid),
         _ => anyhow::bail!("unknown exchange: {s}"),
     }
@@ -271,18 +328,18 @@ fn strip_instrument_prefix(symbol: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Basis disk cache
+// Basis disk cache (keyed by pair cache_key)
 // ---------------------------------------------------------------------------
 
 fn load_basis_cache(
     path: &str,
     pairs: &[ResolvedPair],
-    basis: &DashMap<(ExchangeId, SymbolId), f64>,
-    seeded: &DashMap<(ExchangeId, SymbolId), bool>,
+    basis: &DashMap<usize, f64>,
+    seeded: &DashMap<usize, bool>,
 ) {
     let contents = match std::fs::read_to_string(path) {
         Ok(c) => c,
-        Err(_) => return, // no cache file, start cold
+        Err(_) => return,
     };
 
     let cache: HashMap<String, f64> = match serde_json::from_str(&contents) {
@@ -293,11 +350,10 @@ fn load_basis_cache(
         }
     };
 
-    for pair in pairs {
+    for (idx, pair) in pairs.iter().enumerate() {
         if let Some(&val) = cache.get(&pair.cache_key) {
-            let key = (pair.target_exchange, pair.target_symbol_id);
-            basis.insert(key, val);
-            seeded.insert(key, true);
+            basis.insert(idx, val);
+            seeded.insert(idx, true);
             info!("basis loaded from cache: {} = {:.6}", pair.cache_key, val);
         }
     }
@@ -306,12 +362,11 @@ fn load_basis_cache(
 fn save_basis_cache(
     path: &str,
     pairs: &[ResolvedPair],
-    basis: &DashMap<(ExchangeId, SymbolId), f64>,
+    basis: &DashMap<usize, f64>,
 ) {
     let mut cache: HashMap<String, f64> = HashMap::new();
-    for pair in pairs {
-        let key = (pair.target_exchange, pair.target_symbol_id);
-        if let Some(val) = basis.get(&key) {
+    for (idx, pair) in pairs.iter().enumerate() {
+        if let Some(val) = basis.get(&idx) {
             cache.insert(pair.cache_key.clone(), *val);
         }
     }

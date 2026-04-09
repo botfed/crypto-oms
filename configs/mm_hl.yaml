@@ -18,6 +18,14 @@ fair_price:
       target_symbol: PERP_AIXBT_USDC
       reference_exchange: binance
       reference_symbol: PERP_AIXBT_USDT
+    - target_exchange: hyperliquid
+      target_symbol: PERP_AIXBT_USDC
+      reference_exchange: okx
+      reference_symbol: PERP_AIXBT_USDT
+    - target_exchange: hyperliquid
+      target_symbol: PERP_AIXBT_USDC
+      reference_exchange: bybit
+      reference_symbol: PERP_AIXBT_USDT
 
 inventory:
   mode: hedge
