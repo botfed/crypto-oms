@@ -622,7 +622,9 @@ impl MmEngine {
         };
 
         let vol_mult = self.get_vol_multiplier();
+        let adj_min_bps = (self.config.ref_min_spread_bps * vol_mult).max(self.config.min_edge_bps);
         let adj_spread_bps = (self.config.ref_half_spread_bps * vol_mult).max(self.config.min_edge_bps);
+        let adj_requote_bps = self.config.ref_requote_tolerance_bps * vol_mult;
 
         // Get raw vol prediction for logging
         let pred_vol_ann = self.vol_engine.as_ref().and_then(|ve| {
@@ -636,7 +638,7 @@ impl MmEngine {
         }).unwrap_or(0.0);
 
         info!(
-            "status: fair={:.6} hl_mid={:.6} resid={:+.2}bps basis={:+.2}bps skew={:+.2}bps vol={:.1}% vmult={:.2} spread={:.1}bps pos={:+.6} target={:+.6} bid={} ask={} ref={}@{}ms",
+            "status: fair={:.6} hl_mid={:.6} resid={:+.2}bps basis={:+.2}bps skew={:+.2}bps vol={:.1}% vmult={:.2} band=[{:.1},{:.1},{:.1}]bps pos={:+.6} target={:+.6} bid={} ask={} ref={}@{}ms",
             fair.unwrap_or(0.0),
             hl_mid.unwrap_or(0.0),
             residual_bps,
@@ -644,7 +646,9 @@ impl MmEngine {
             skew_bps,
             pred_vol_ann * 100.0,
             vol_mult,
+            adj_min_bps,
             adj_spread_bps,
+            adj_spread_bps + adj_requote_bps,
             position,
             target,
             bid_str,
