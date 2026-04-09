@@ -57,7 +57,7 @@ impl HyperliquidClient {
         let base_url = self.base_url.clone();
 
         self.exchange.get_or_try_init(|| async {
-            let wallet: ethers::signers::LocalWallet = pk
+            let wallet: alloy::signers::local::PrivateKeySigner = pk
                 .parse()
                 .context("failed to parse private key for SDK wallet")?;
 

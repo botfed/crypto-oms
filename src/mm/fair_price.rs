@@ -130,17 +130,21 @@ impl FairPriceEngine {
 
     /// Returns fair price using the freshest reference feed across all matching pairs.
     pub fn get_fair_price(&self, exchange: ExchangeId, symbol_id: SymbolId) -> Option<f64> {
-        self.get_fair_price_with_age(exchange, symbol_id).map(|(price, _, _)| price)
+        self.get_fair_price_with_age(exchange, symbol_id).map(|(price, _, _, _)| price)
     }
 
     /// Returns (fair_price, ref_age_ms, ref_exchange_name). Uses the freshest reference feed.
+    /// Returns (fair_price, exchange_ts_ms, received_age_ns, ref_exchange_name).
+    /// Picks the feed with the freshest received_ts (most recently arrived data).
     pub fn get_fair_price_with_age(
         &self,
         exchange: ExchangeId,
         symbol_id: SymbolId,
-    ) -> Option<(f64, i64, &str)> {
+    ) -> Option<(f64, i64, u64, &str)> {
         let now = Utc::now();
-        let mut best: Option<(f64, i64, usize)> = None; // (price, age, pair_idx)
+        // (fair, exchange_ts_ms, received_age_ns, pair_idx)
+        let mut best: Option<(f64, i64, u64, usize)> = None;
+        let mut best_recv_age = u64::MAX;
 
         for (idx, pair) in self.pairs.iter().enumerate() {
             if pair.target_exchange != exchange || pair.target_symbol_id != symbol_id {
@@ -151,32 +155,29 @@ impl FairPriceEngine {
             let Some(md) = coll.latest(&pair.reference_symbol_id) else { continue };
             let Some(ref_mid) = md.midquote() else { continue };
 
-            let age_ms = md.exchange_ts
-                .map(|ts| (now - ts).num_milliseconds())
-                .unwrap_or(i64::MAX);
+            let recv_age_ns = md.received_ts
+                .map(|ts| (now - ts).num_nanoseconds().unwrap_or(i64::MAX).max(0) as u64)
+                .unwrap_or(u64::MAX);
 
-            let basis = self.basis.get(&idx).map(|v| *v).unwrap_or(0.0);
-            let fair = ref_mid + basis;
+            let exchange_ts_ms = md.exchange_ts
+                .map(|ts| ts.timestamp_millis())
+                .unwrap_or(0);
 
-            match &best {
-                Some((_, best_age, _)) if age_ms < *best_age => {
-                    best = Some((fair, age_ms, idx));
-                }
-                None => {
-                    best = Some((fair, age_ms, idx));
-                }
-                _ => {}
+            if recv_age_ns < best_recv_age {
+                let basis = self.basis.get(&idx).map(|v| *v).unwrap_or(0.0);
+                best = Some((ref_mid + basis, exchange_ts_ms, recv_age_ns, idx));
+                best_recv_age = recv_age_ns;
             }
         }
 
-        best.map(|(price, age, idx)| {
+        best.map(|(price, ex_ts, recv_age, idx)| {
             let ref_name = match self.pairs[idx].reference_exchange {
                 ExchangeId::Binance => "binance",
                 ExchangeId::Bybit => "bybit",
                 ExchangeId::Okx => "okx",
                 ExchangeId::Hyperliquid => "hyperliquid",
             };
-            (price, age, ref_name)
+            (price, ex_ts, recv_age, ref_name)
         })
     }
 
@@ -184,7 +185,7 @@ impl FairPriceEngine {
     pub fn get_basis(&self, exchange: ExchangeId, symbol_id: SymbolId) -> Option<f64> {
         // Return basis of the freshest pair
         self.get_fair_price_with_age(exchange, symbol_id)
-            .and_then(|(_, _, _)| {
+            .and_then(|(_, _, _, _)| {
                 // Find the freshest pair index
                 let now = Utc::now();
                 let mut best_idx = None;
@@ -207,9 +208,63 @@ impl FairPriceEngine {
             })
     }
 
-    /// Get the best (lowest) ref age across all matching pairs.
+    /// Get the best (lowest) exchange_ts age in ms across all matching pairs.
+    /// Used for "is feed dead" check.
     pub fn get_ref_age_ms(&self, exchange: ExchangeId, symbol_id: SymbolId) -> Option<i64> {
-        self.get_fair_price_with_age(exchange, symbol_id).map(|(_, age, _)| age)
+        let now = Utc::now();
+        let mut best = i64::MAX;
+        for pair in &self.pairs {
+            if pair.target_exchange != exchange || pair.target_symbol_id != symbol_id {
+                continue;
+            }
+            let coll = self.collection_for(pair.reference_exchange);
+            if let Some(md) = coll.latest(&pair.reference_symbol_id) {
+                if let Some(ts) = md.exchange_ts {
+                    let age = (now - ts).num_milliseconds();
+                    if age < best { best = age; }
+                }
+            }
+        }
+        if best == i64::MAX { None } else { Some(best) }
+    }
+
+    /// Age in nanoseconds since the winning ref feed's `received_ts` (system latency).
+    pub fn get_received_age_ns(&self, exchange: ExchangeId, symbol_id: SymbolId) -> Option<u64> {
+        let now = Utc::now();
+        let mut best_age_ns: Option<u64> = None;
+        let mut best_exchange_age = i64::MAX;
+
+        for pair in &self.pairs {
+            if pair.target_exchange != exchange || pair.target_symbol_id != symbol_id {
+                continue;
+            }
+            let coll = self.collection_for(pair.reference_exchange);
+            let Some(md) = coll.latest(&pair.reference_symbol_id) else { continue };
+
+            // Use exchange_ts to pick the freshest feed (same logic as get_fair_price_with_age)
+            let ex_age = md.exchange_ts
+                .map(|ts| (now - ts).num_milliseconds())
+                .unwrap_or(i64::MAX);
+
+            if ex_age < best_exchange_age {
+                best_exchange_age = ex_age;
+                best_age_ns = md.received_ts
+                    .map(|ts| (now - ts).num_nanoseconds().unwrap_or(0).max(0) as u64);
+            }
+        }
+        best_age_ns
+    }
+
+    /// Sum of write_counts across all ref feeds for this target. Changes when any feed ticks.
+    pub fn ref_write_count(&self, exchange: ExchangeId, symbol_id: SymbolId) -> u64 {
+        let mut total = 0u64;
+        for pair in &self.pairs {
+            if pair.target_exchange == exchange && pair.target_symbol_id == symbol_id {
+                total += self.collection_for(pair.reference_exchange)
+                    .write_count(&pair.reference_symbol_id);
+            }
+        }
+        total
     }
 
     /// Read live mid from any exchange (public, for diagnostics).

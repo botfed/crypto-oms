@@ -17,6 +17,13 @@ use super::client::{
 };
 use super::types::*;
 
+/// A signed order payload ready for HTTP post.
+pub struct SignedPayload {
+    pub action_json: serde_json::Value,
+    pub signature: alloy::signers::Signature,
+    pub timestamp: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -843,9 +850,41 @@ impl HyperliquidOms {
         Ok((ClientOrderId(cid), sdk_req))
     }
 
-    /// Async part: sends the SDK request and processes the response.
-    pub async fn execute_place_order(&self, cid: u64, sdk_req: ClientOrderRequest) {
-        let resp = match self.client.exchange().order(sdk_req, None).await {
+    /// Sync: convert + hash + sign the order. Returns a signed payload ready to post.
+    pub fn sign_place_order(&self, sdk_req: ClientOrderRequest) -> Result<SignedPayload> {
+        let ex = self.client.exchange();
+        let timestamp = hyperliquid_rust_sdk::next_nonce();
+
+        // Convert ClientOrderRequest → wire format
+        let transformed = sdk_req.convert(&ex.coin_to_asset)
+            .map_err(|e| anyhow::anyhow!("order convert failed: {e}"))?;
+
+        let action = hyperliquid_rust_sdk::Actions::Order(
+            hyperliquid_rust_sdk::BulkOrder {
+                orders: vec![transformed],
+                grouping: "na".to_string(),
+                builder: None,
+            }
+        );
+
+        let connection_id = action.hash(timestamp, ex.vault_address)
+            .map_err(|e| anyhow::anyhow!("action hash failed: {e}"))?;
+
+        let action_json = serde_json::to_value(&action)
+            .map_err(|e| anyhow::anyhow!("json serialize failed: {e}"))?;
+
+        let is_mainnet = ex.http_client.is_mainnet();
+        let signature = hyperliquid_rust_sdk::sign_l1_action(&ex.wallet, connection_id, is_mainnet)
+            .map_err(|e| anyhow::anyhow!("signing failed: {e}"))?;
+
+        Ok(SignedPayload { action_json, signature, timestamp })
+    }
+
+    /// Async: post a signed payload and process the response.
+    pub async fn post_place_order(&self, cid: u64, signed: SignedPayload) {
+        let resp = match self.client.exchange()
+            .post(signed.action_json, signed.signature, signed.timestamp).await
+        {
             Ok(r) => r,
             Err(e) => {
                 warn!("SDK order failed for cid={}: {e}", cid);
@@ -959,7 +998,8 @@ impl ExchangeOms for HyperliquidOms {
 
     async fn place_order(&self, req: OrderRequest) -> Result<ClientOrderId> {
         let (cid, sdk_req) = self.prepare_place_order(&req)?;
-        self.execute_place_order(cid.0, sdk_req).await;
+        let signed = self.sign_place_order(sdk_req)?;
+        self.post_place_order(cid.0, signed).await;
         Ok(cid)
     }
 

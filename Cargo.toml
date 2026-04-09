@@ -6,6 +6,9 @@ name = "crypto-oms"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+profiling = []
+
 [dependencies]
 oms-core = { path = "crates/oms-core" }
 tokio = { version = "1", features = ["full"] }
@@ -28,9 +31,10 @@ crypto-feeds = { path = "../crypto-feeds" }
 nado-ws = { path = "../crypto-feeds/crates/nado-ws" }
 serde_yaml = "0.9"
 rmp-serde = "1"
-hyperliquid_rust_sdk = "0.6"
-ethers = { version = "2", features = ["eip712"] }
+hyperliquid_rust_sdk = { path = "../hyperliquid-rust-sdk" }
 uuid = { version = "1", features = ["v4"] }
+memmap2 = "0.9"
+ctrlc = "3"
 libc = "0.2"
 dotenv = "0.15"
 
@@ -56,3 +60,7 @@ path = "src/bin/nado_link_signer.rs"
 [[bin]]
 name = "mm_hl"
 path = "src/bin/mm_hl.rs"
+
+[[bin]]
+name = "mm_profile"
+path = "src/bin/mm_profile.rs"

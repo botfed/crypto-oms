@@ -17,6 +17,117 @@ use crypto_feeds::symbol_registry::{REGISTRY, SymbolId};
 use crypto_feeds::market_data::InstrumentType;
 
 // ---------------------------------------------------------------------------
+// Latency profiling (compiled in with --features profiling)
+// ---------------------------------------------------------------------------
+
+
+#[cfg(feature = "profiling")]
+pub mod latency {
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    pub const METRIC_TICK_FAST: u8 = 0;
+    pub const METRIC_T2D: u8 = 1;
+    pub const METRIC_FAIR: u8 = 2;
+    pub const METRIC_VOL: u8 = 3;
+    pub const METRIC_TICK_SLOW: u8 = 4;
+    pub const METRIC_T2T: u8 = 5;
+
+    // File layout
+    pub const HEADER_SIZE: usize = 64;
+    pub const SAMPLE_SIZE: usize = 16; // metric_id(1) + pad(7) + value_ns(8)
+    pub const FILE_SIZE: usize = 16 * 1024 * 1024; // 16 MB (~1M entries)
+    pub const CAPACITY: usize = (FILE_SIZE - HEADER_SIZE) / SAMPLE_SIZE;
+    pub const LATENCY_PATH: &str = "/tmp/mm_latency.bin";
+
+    /// Lightweight recorder for the hot loop.
+    /// Just pushes to a local Vec. A background task flushes to mmap every 10s.
+    pub struct LatencyRecorder {
+        buf: Arc<Mutex<Vec<(u8, u64)>>>,
+    }
+
+    impl LatencyRecorder {
+        #[inline]
+        pub fn record(&self, metric: u8, nanos: u64) {
+            // Lock is uncontended 99.99% of the time (only contended during 10s flush swap)
+            self.buf.lock().push((metric, nanos));
+        }
+    }
+
+    /// Initialize the profiler. Returns a recorder for the hot loop.
+    /// Spawns a background task that flushes samples to mmap every 10s.
+    pub fn init(shutdown: Arc<tokio::sync::Notify>) -> LatencyRecorder {
+        let buf: Arc<Mutex<Vec<(u8, u64)>>> = Arc::new(Mutex::new(Vec::with_capacity(500_000)));
+        let recorder = LatencyRecorder { buf: Arc::clone(&buf) };
+
+        // Create/open the mmap file
+        let file = std::fs::OpenOptions::new()
+            .read(true).write(true).create(true)
+            .open(LATENCY_PATH)
+            .expect("failed to open latency mmap file");
+        file.set_len(FILE_SIZE as u64).expect("failed to set latency file size");
+
+        let mut mmap = unsafe {
+            memmap2::MmapMut::map_mut(&file).expect("failed to mmap latency file")
+        };
+
+        // Reset file on startup — fresh session
+        mmap.fill(0);
+        mmap[8..16].copy_from_slice(&(CAPACITY as u64).to_le_bytes());
+        let mut write_pos: u64 = 0;
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            let shutdown_fut = shutdown.notified();
+            tokio::pin!(shutdown_fut);
+
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_fut => {
+                        flush(&buf, &mut mmap, &mut write_pos);
+                        return;
+                    }
+                    _ = interval.tick() => {
+                        flush(&buf, &mut mmap, &mut write_pos);
+                    }
+                }
+            }
+        });
+
+        recorder
+    }
+
+    fn flush(
+        buf: &Mutex<Vec<(u8, u64)>>,
+        mmap: &mut memmap2::MmapMut,
+        write_pos: &mut u64,
+    ) {
+        let samples = {
+            let mut guard = buf.lock();
+            std::mem::replace(&mut *guard, Vec::with_capacity(500_000))
+        };
+
+        if samples.is_empty() { return; }
+
+        let cap = CAPACITY as u64;
+        for (metric, value) in &samples {
+            let idx = (*write_pos % cap) as usize;
+            let offset = HEADER_SIZE + idx * SAMPLE_SIZE;
+            mmap[offset] = *metric;
+            // bytes 1-7 are padding (zeroed)
+            mmap[offset + 1..offset + 8].fill(0);
+            mmap[offset + 8..offset + 16].copy_from_slice(&value.to_le_bytes());
+            *write_pos += 1;
+        }
+
+        // Update write_pos in header
+        mmap[0..8].copy_from_slice(&write_pos.to_le_bytes());
+        let _ = mmap.flush_async();
+    }
+}
+
 // Types
 // ---------------------------------------------------------------------------
 
@@ -63,6 +174,10 @@ pub struct MmEngine {
     last_status_log: Instant,
     running_since: Option<Instant>,
     consecutive_rejects: u32,
+    last_ref_wc: u64,            // track seqlock write count to detect new ticks
+    last_exchange_ts_ms: i64,    // skip ticks with older exchange_ts
+    #[cfg(feature = "profiling")]
+    latency: latency::LatencyRecorder,
 }
 
 const MAX_CONSECUTIVE_REJECTS: u32 = 5;
@@ -96,6 +211,9 @@ impl MmEngine {
 
         let oms_events = oms.subscribe();
 
+        #[cfg(feature = "profiling")]
+        let latency = latency::init(Arc::clone(&shutdown));
+
         Ok(Self {
             oms,
             fair_price,
@@ -115,6 +233,10 @@ impl MmEngine {
             last_status_log: Instant::now(),
             running_since: None,
             consecutive_rejects: 0,
+            last_ref_wc: 0,
+            last_exchange_ts_ms: 0,
+            #[cfg(feature = "profiling")]
+            latency,
         })
     }
 
@@ -162,33 +284,74 @@ impl MmEngine {
                         .map(|t| t.elapsed() >= Duration::from_secs(self.config.warmup_secs))
                         .unwrap_or(false);
 
-                    // ── STALENESS CHECK: cancel all if ref feed is stale ──
-                    if let Some((_, age_ms, _)) = self.fair_price.get_fair_price_with_age(
+                    // ── CHECK FOR NEW DATA: skip if ref feed hasn't updated ──
+                    let wc = self.fair_price.ref_write_count(ExchangeId::Hyperliquid, self.hl_symbol_id);
+                    if wc == self.last_ref_wc {
+                        continue; // no new tick, spin
+                    }
+                    self.last_ref_wc = wc;
+
+                    #[cfg(feature = "profiling")]
+                    let fair_start = Instant::now();
+
+                    let tick_data = self.fair_price.get_fair_price_with_age(
                         ExchangeId::Hyperliquid, self.hl_symbol_id
-                    ) {
-                        if age_ms > self.config.max_stale_ms as i64 {
-                            if self.bid_quote.is_some() || self.ask_quote.is_some() {
-                                warn!("ref feed stale (age={}ms > {}ms), cancelling all quotes",
-                                    age_ms, self.config.max_stale_ms);
-                                self.cancel_all_quotes().await;
-                            }
-                            continue;
+                    );
+
+                    let Some((_, exchange_ts_ms, recv_age_ns, _)) = tick_data else { continue; };
+
+                    // Skip if this tick's exchange_ts is not newer than last processed
+                    if exchange_ts_ms <= self.last_exchange_ts_ms {
+                        continue;
+                    }
+                    self.last_exchange_ts_ms = exchange_ts_ms;
+
+                    // ── NEW TICK ──
+                    #[cfg(feature = "profiling")]
+                    let tick_start = Instant::now();
+                    #[cfg(feature = "profiling")]
+                    if warmed_up {
+                        self.latency.record(latency::METRIC_FAIR, fair_start.elapsed().as_nanos() as u64);
+                        self.latency.record(latency::METRIC_T2D, recv_age_ns);
+                    }
+
+                    // Staleness check uses received_age (in ms)
+                    let recv_age_ms = (recv_age_ns / 1_000_000) as i64;
+                    if recv_age_ms > self.config.max_stale_ms as i64 {
+                        if self.bid_quote.is_some() || self.ask_quote.is_some() {
+                            warn!("ref feed stale (recv_age={}ms > {}ms), cancelling all quotes",
+                                recv_age_ms, self.config.max_stale_ms);
+                            self.cancel_all_quotes().await;
                         }
+                        continue;
                     }
 
                     // Sync local trackers with OMS reality
                     self.sync_quote_state();
 
-                    // ── FAST PATH (~1ms): adverse cancel guard ──
-                    // (always run — even during warmup, cancel stale quotes)
+                    // ── FAST PATH: adverse cancel guard ──
                     self.fast_cancel_check();
 
                     // ── SLOW PATH (~quote_interval_ms): quote placement ──
-                    // Only place quotes after warmup
                     let interval = Duration::from_millis(self.config.quote_interval_ms);
                     if warmed_up && self.last_quote_eval.elapsed() >= interval {
+                        #[cfg(feature = "profiling")]
+                        let vol_start = Instant::now();
+
                         self.evaluate_and_place_quotes();
+
+                        #[cfg(feature = "profiling")]
+                        if warmed_up {
+                            self.latency.record(latency::METRIC_VOL, vol_start.elapsed().as_nanos() as u64);
+                            self.latency.record(latency::METRIC_TICK_SLOW, tick_start.elapsed().as_nanos() as u64);
+                        }
+
                         self.last_quote_eval = Instant::now();
+                    }
+
+                    #[cfg(feature = "profiling")]
+                    if warmed_up {
+                        self.latency.record(latency::METRIC_TICK_FAST, tick_start.elapsed().as_nanos() as u64);
                     }
 
                     // ── STATUS LOG (1/sec) ──
@@ -323,6 +486,8 @@ impl MmEngine {
             let can_cancel = matches!(state, Some(OrderState::Accepted) | Some(OrderState::PartiallyFilled));
             if can_cancel && q.price > fair - min_spread {
                 let drift_bps = (q.price - (fair - min_spread)) / fair * 10_000.0;
+                #[cfg(feature = "profiling")]
+                self.record_t2t();
                 if self.ghost {
                     info!(
                         "[GHOST] would CANCEL bid cid={} price={:.6} (inside min_spread {:.1}bps)",
@@ -350,6 +515,8 @@ impl MmEngine {
             let can_cancel = matches!(state, Some(OrderState::Accepted) | Some(OrderState::PartiallyFilled));
             if can_cancel && q.price < fair + min_spread {
                 let drift_bps = ((fair + min_spread) - q.price) / fair * 10_000.0;
+                #[cfg(feature = "profiling")]
+                self.record_t2t();
                 if self.ghost {
                     info!(
                         "[GHOST] would CANCEL ask cid={} price={:.6} (inside min_spread {:.1}bps)",
@@ -379,10 +546,10 @@ impl MmEngine {
         self.cancel_stray_orders();
 
         // Staleness check — don't place on stale data
-        let Some((fair, age_ms, _)) = self.fair_price.get_fair_price_with_age(ExchangeId::Hyperliquid, self.hl_symbol_id) else {
+        let Some((fair, _, recv_age_ns, _)) = self.fair_price.get_fair_price_with_age(ExchangeId::Hyperliquid, self.hl_symbol_id) else {
             return;
         };
-        if age_ms > self.config.max_stale_ms as i64 {
+        if (recv_age_ns / 1_000_000) as i64 > self.config.max_stale_ms as i64 {
             return;
         }
 
@@ -423,6 +590,8 @@ impl MmEngine {
                     .unwrap_or(false);
 
                 if !skip_cancel {
+                    #[cfg(feature = "profiling")]
+                    self.record_t2t();
                     if self.ghost {
                         info!("[GHOST] would CANCEL bid cid={} price={:.6} (slow path requote)", q.client_id.0, q.price);
                         self.bid_quote = None;
@@ -451,6 +620,8 @@ impl MmEngine {
                     .unwrap_or(false);
 
                 if !skip_cancel {
+                    #[cfg(feature = "profiling")]
+                    self.record_t2t();
                     if self.ghost {
                         info!("[GHOST] would CANCEL ask cid={} price={:.6} (slow path requote)", q.client_id.0, q.price);
                         self.ask_quote = None;
@@ -473,6 +644,10 @@ impl MmEngine {
         // before the HTTP call, so we can grab the cid and set the tracker immediately.
         // sync_quote_state sees Inflight → keeps tracker alive until Accepted/Rejected.
 
+        if self.bid_quote.is_none() && want_bid && self.ghost {
+            #[cfg(feature = "profiling")]
+            self.record_t2t();
+        }
         if self.bid_quote.is_none() && want_bid && !self.ghost {
             let tif = if self.config.post_only { TimeInForce::PostOnly } else { TimeInForce::GTC };
             let req = OrderRequest {
@@ -484,18 +659,25 @@ impl MmEngine {
             };
             match self.oms.prepare_place_order(&req) {
                 Ok((cid, sdk_req)) => {
-                    info!("placing bid cid={} price={:.6}", cid.0, desired_bid);
-                    self.bid_quote = Some(LiveQuote {
-                        client_id: cid,
-                        exchange_id: None,
-                        price: desired_bid,
-                        size: order_size,
-                        placed_at: Instant::now(),
-                    });
-                    let oms = Arc::clone(&self.oms);
-                    tokio::spawn(async move {
-                        oms.execute_place_order(cid.0, sdk_req).await;
-                    });
+                    match self.oms.sign_place_order(sdk_req) {
+                        Ok(signed) => {
+                            info!("placing bid cid={} price={:.6}", cid.0, desired_bid);
+                            self.bid_quote = Some(LiveQuote {
+                                client_id: cid,
+                                exchange_id: None,
+                                price: desired_bid,
+                                size: order_size,
+                                placed_at: Instant::now(),
+                            });
+                            #[cfg(feature = "profiling")]
+                            self.record_t2t();
+                            let oms = Arc::clone(&self.oms);
+                            tokio::spawn(async move {
+                                oms.post_place_order(cid.0, signed).await;
+                            });
+                        }
+                        Err(e) => warn!("failed to sign bid: {e}"),
+                    }
                 }
                 Err(e) => warn!("failed to prepare bid: {e}"),
             }
@@ -512,18 +694,25 @@ impl MmEngine {
             };
             match self.oms.prepare_place_order(&req) {
                 Ok((cid, sdk_req)) => {
-                    info!("placing ask cid={} price={:.6}", cid.0, desired_ask);
-                    self.ask_quote = Some(LiveQuote {
-                        client_id: cid,
-                        exchange_id: None,
-                        price: desired_ask,
-                        size: order_size,
-                        placed_at: Instant::now(),
-                    });
-                    let oms = Arc::clone(&self.oms);
-                    tokio::spawn(async move {
-                        oms.execute_place_order(cid.0, sdk_req).await;
-                    });
+                    match self.oms.sign_place_order(sdk_req) {
+                        Ok(signed) => {
+                            info!("placing ask cid={} price={:.6}", cid.0, desired_ask);
+                            self.ask_quote = Some(LiveQuote {
+                                client_id: cid,
+                                exchange_id: None,
+                                price: desired_ask,
+                                size: order_size,
+                                placed_at: Instant::now(),
+                            });
+                            #[cfg(feature = "profiling")]
+                            self.record_t2t();
+                            let oms = Arc::clone(&self.oms);
+                            tokio::spawn(async move {
+                                oms.post_place_order(cid.0, signed).await;
+                            });
+                        }
+                        Err(e) => warn!("failed to sign ask: {e}"),
+                    }
                 }
                 Err(e) => warn!("failed to prepare ask: {e}"),
             }
@@ -552,6 +741,16 @@ impl MmEngine {
 
     /// Clamp desired bid/ask so quotes never cross fair value.
     /// Get the vol multiplier from the vol engine. Returns 1.0 if no vol engine.
+    /// Record t2t: Utc::now() - received_ts of the winning feed, measured right now.
+    #[cfg(feature = "profiling")]
+    fn record_t2t(&self) {
+        if let Some((_, _, recv_age_ns, _)) = self.fair_price.get_fair_price_with_age(
+            ExchangeId::Hyperliquid, self.hl_symbol_id
+        ) {
+            self.latency.record(latency::METRIC_T2T, recv_age_ns);
+        }
+    }
+
     fn get_vol_multiplier(&self) -> f64 {
         let Some(ref ve) = self.vol_engine else { return 1.0; };
         let preds = match ve.predict_now(&self.config.vol_symbol, &self.market_data) {
@@ -583,7 +782,7 @@ impl MmEngine {
     // Periodic status log
     // -----------------------------------------------------------------------
 
-    fn log_status(&self) {
+    fn log_status(&mut self) {
         let fair = self.fair_price.get_fair_price(ExchangeId::Hyperliquid, self.hl_symbol_id);
         let basis = self.fair_price.get_basis(ExchangeId::Hyperliquid, self.hl_symbol_id);
         let position = self.get_position();
@@ -610,9 +809,9 @@ impl MmEngine {
             .map(|q| format!("{:.6}", q.price))
             .unwrap_or_else(|| "-".into());
 
-        let (ref_age_ms, ref_feed) = self.fair_price
+        let (recv_age_ms, ref_feed) = self.fair_price
             .get_fair_price_with_age(ExchangeId::Hyperliquid, self.hl_symbol_id)
-            .map(|(_, age, feed)| (age, feed))
+            .map(|(_, _, recv_ns, feed)| ((recv_ns / 1_000_000) as i64, feed))
             .unwrap_or((-1, "none"));
 
         let hl_mid = self.fair_price.get_mid(ExchangeId::Hyperliquid, self.hl_symbol_id);
@@ -654,7 +853,7 @@ impl MmEngine {
             bid_str,
             ask_str,
             ref_feed,
-            ref_age_ms,
+            recv_age_ms,
         );
     }
 
