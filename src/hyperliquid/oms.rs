@@ -360,6 +360,15 @@ impl HyperliquidOms {
             }
         }
 
+        // Clean up oid_map for orders in terminal states
+        self.state.oid_map.retain(|_oid, cid| {
+            self.state.orders.get(cid)
+                .map(|h| !matches!(h.state,
+                    OrderState::Filled | OrderState::Cancelled | OrderState::Rejected | OrderState::TimedOut
+                ))
+                .unwrap_or(false) // remove if order doesn't exist
+        });
+
         // Reconcile positions
         self.state.positions.clear();
         for ap in &clearinghouse.asset_positions {
@@ -617,6 +626,7 @@ impl HyperliquidOms {
 
         if let Some(mut handle) = self.state.orders.get_mut(&cid) {
             handle.state = new_state;
+            handle.last_modified = Some(Instant::now());
 
             let event = match new_state {
                 OrderState::Filled => OmsEvent::OrderFilled(Fill {
@@ -914,7 +924,26 @@ impl ExchangeOms for HyperliquidOms {
                                 });
                                 bail!("order rejected: {error}");
                             }
-                            _ => {}
+                            _ => {
+                                warn!("unexpected order status for cid={}, marking rejected", cid);
+                                if let Some(mut h) = self.state.orders.get_mut(&cid) {
+                                    h.state = OrderState::Rejected;
+                                    h.reject_reason = Some("unexpected response status".into());
+                                    h.last_modified = Some(Instant::now());
+                                }
+                            }
+                        }
+                    }
+                }
+                // If order is still Inflight after processing response, something went wrong
+                if let Some(h) = self.state.orders.get(&cid) {
+                    if h.state == OrderState::Inflight {
+                        drop(h);
+                        warn!("order cid={} still inflight after SDK Ok response, marking rejected", cid);
+                        if let Some(mut h) = self.state.orders.get_mut(&cid) {
+                            h.state = OrderState::Rejected;
+                            h.reject_reason = Some("no status in response".into());
+                            h.last_modified = Some(Instant::now());
                         }
                     }
                 }

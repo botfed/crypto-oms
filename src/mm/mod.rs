@@ -259,10 +259,11 @@ impl MmEngine {
                     h.state,
                     OrderState::Accepted | OrderState::PartiallyFilled | OrderState::Inflight | OrderState::Cancelling
                 ) => {
-                    // Sync exchange_id from OMS
                     if q.exchange_id.is_none() && h.exchange_id.is_some() {
                         q.exchange_id = h.exchange_id.clone();
                     }
+                    // Sync remaining size on partial fills
+                    q.size = h.size - h.filled_size;
                 }
                 _ => {
                     debug!("bid quote {} no longer active, clearing tracker", q.client_id.0);
@@ -279,6 +280,7 @@ impl MmEngine {
                     if q.exchange_id.is_none() && h.exchange_id.is_some() {
                         q.exchange_id = h.exchange_id.clone();
                     }
+                    q.size = h.size - h.filled_size;
                 }
                 _ => {
                     debug!("ask quote {} no longer active, clearing tracker", q.client_id.0);
@@ -317,7 +319,10 @@ impl MmEngine {
 
         // Check bid: is it TOO HIGH (inner side = adverse)?
         if let Some(ref q) = self.bid_quote {
-            if q.price > desired_bid + cancel_thresh {
+            let already_cancelling = self.oms.get_order(&q.client_id)
+                .map(|h| matches!(h.state, OrderState::Cancelling))
+                .unwrap_or(false);
+            if !already_cancelling && q.price > desired_bid + cancel_thresh {
                 let drift_bps = (q.price - desired_bid) / fair * 10_000.0;
                 if self.ghost {
                     info!(
@@ -332,7 +337,6 @@ impl MmEngine {
                     if let Err(e) = self.oms.cancel_order(&q.client_id).await {
                         warn!("failed to cancel bid {}: {e}", q.client_id.0);
                     }
-                    // Don't clear tracker — let sync_quote_state confirm cancel
                 }
                 if self.ghost { self.bid_quote = None; }
             }
@@ -340,7 +344,10 @@ impl MmEngine {
 
         // Check ask: is it TOO LOW (inner side = adverse)?
         if let Some(ref q) = self.ask_quote {
-            if q.price < desired_ask - cancel_thresh {
+            let already_cancelling = self.oms.get_order(&q.client_id)
+                .map(|h| matches!(h.state, OrderState::Cancelling))
+                .unwrap_or(false);
+            if !already_cancelling && q.price < desired_ask - cancel_thresh {
                 let drift_bps = (desired_ask - q.price) / fair * 10_000.0;
                 if self.ghost {
                     info!(
@@ -406,11 +413,11 @@ impl MmEngine {
 
             if should_cancel {
                 // Don't cancel inflight (no exchange OID yet)
-                let is_inflight = self.oms.get_order(&q.client_id)
-                    .map(|h| h.state == OrderState::Inflight)
+                let skip_cancel = self.oms.get_order(&q.client_id)
+                    .map(|h| matches!(h.state, OrderState::Inflight | OrderState::Cancelling))
                     .unwrap_or(false);
 
-                if !is_inflight {
+                if !skip_cancel {
                     if self.ghost {
                         info!("[GHOST] would CANCEL bid cid={} price={:.6} (slow path requote)", q.client_id.0, q.price);
                         self.bid_quote = None;
@@ -431,11 +438,11 @@ impl MmEngine {
                 || (q.price - desired_ask) > requote_thresh; // ask too HIGH = too passive
 
             if should_cancel {
-                let is_inflight = self.oms.get_order(&q.client_id)
-                    .map(|h| h.state == OrderState::Inflight)
+                let skip_cancel = self.oms.get_order(&q.client_id)
+                    .map(|h| matches!(h.state, OrderState::Inflight | OrderState::Cancelling))
                     .unwrap_or(false);
 
-                if !is_inflight {
+                if !skip_cancel {
                     if self.ghost {
                         info!("[GHOST] would CANCEL ask cid={} price={:.6} (slow path requote)", q.client_id.0, q.price);
                         self.ask_quote = None;
@@ -691,9 +698,24 @@ impl MmEngine {
         false
     }
 
+    /// Check if a client order ID belongs to one of our tracked quotes.
+    /// Matches by client_id directly, or by exchange_id if the cid corresponds
+    /// to an OMS order with an exchange_id matching our tracker.
     fn is_our_order(&self, cid: &ClientOrderId) -> bool {
-        self.bid_quote.as_ref().map(|q| q.client_id == *cid).unwrap_or(false)
-            || self.ask_quote.as_ref().map(|q| q.client_id == *cid).unwrap_or(false)
+        for q in [&self.bid_quote, &self.ask_quote].into_iter().flatten() {
+            if q.client_id == *cid {
+                return true;
+            }
+            // Fallback: check if the OMS order's exchange_id matches our tracker
+            if let Some(ref q_eid) = q.exchange_id {
+                if let Some(h) = self.oms.get_order(cid) {
+                    if h.exchange_id.as_ref() == Some(q_eid) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     fn clear_tracker(&mut self, cid: &ClientOrderId) {
