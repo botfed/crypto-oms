@@ -180,13 +180,13 @@ impl MmEngine {
 
                     // ── FAST PATH (~1ms): adverse cancel guard ──
                     // (always run — even during warmup, cancel stale quotes)
-                    self.fast_cancel_check().await;
+                    self.fast_cancel_check();
 
                     // ── SLOW PATH (~quote_interval_ms): quote placement ──
                     // Only place quotes after warmup
                     let interval = Duration::from_millis(self.config.quote_interval_ms);
                     if warmed_up && self.last_quote_eval.elapsed() >= interval {
-                        self.evaluate_and_place_quotes().await;
+                        self.evaluate_and_place_quotes();
                         self.last_quote_eval = Instant::now();
                     }
 
@@ -303,8 +303,7 @@ impl MmEngine {
     // Fast path: cancel guard (inner-side adverse detection)
     // -----------------------------------------------------------------------
 
-    async fn fast_cancel_check(&mut self) {
-        // If no live quotes, nothing to cancel
+    fn fast_cancel_check(&mut self) {
         if self.bid_quote.is_none() && self.ask_quote.is_none() {
             return;
         }
@@ -317,58 +316,55 @@ impl MmEngine {
         let min_edge = self.config.min_edge_bps * fair / 10_000.0;
         let min_spread = (self.config.ref_min_spread_bps * vol_mult * fair / 10_000.0).max(min_edge);
 
-        // Fast cancel: quote inside min_spread from fair → cancel
-        // bid cancel if: bid_price > fair - min_spread
-        // ask cancel if: ask_price < fair + min_spread
-
-        // Check bid: is it too close to fair?
+        // Check bid: inside min_spread from fair?
         if let Some(ref q) = self.bid_quote {
-            let already_cancelling = self.oms.get_order(&q.client_id)
-                .map(|h| matches!(h.state, OrderState::Cancelling))
-                .unwrap_or(false);
-            if !already_cancelling && q.price > fair - min_spread {
+            let state = self.oms.get_order(&q.client_id).map(|h| h.state);
+            let can_cancel = matches!(state, Some(OrderState::Accepted) | Some(OrderState::PartiallyFilled));
+            if can_cancel && q.price > fair - min_spread {
                 let drift_bps = (q.price - (fair - min_spread)) / fair * 10_000.0;
                 if self.ghost {
                     info!(
-                        "[GHOST] would CANCEL bid cid={} price={:.6} (inside min_spread {:.1}bps, limit={:.6})",
-                        q.client_id.0, q.price, drift_bps, fair - min_spread,
-                    );
-                } else {
-                    info!(
-                        "fast cancel bid cid={} price={:.6} (inner drift {:.1}bps)",
+                        "[GHOST] would CANCEL bid cid={} price={:.6} (inside min_spread {:.1}bps)",
                         q.client_id.0, q.price, drift_bps,
                     );
-                    if let Err(e) = self.oms.cancel_order(&q.client_id).await {
-                        warn!("failed to cancel bid {}: {e}", q.client_id.0);
-                    }
+                    self.bid_quote = None;
+                } else {
+                    info!("fast cancel bid cid={} price={:.6} ({:.1}bps inside)", q.client_id.0, q.price, drift_bps);
+                    let oms = Arc::clone(&self.oms);
+                    let cid = q.client_id;
+                    tokio::spawn(async move {
+                        if let Err(e) = oms.cancel_order(&cid).await {
+                            warn!("failed to cancel bid {}: {e}", cid.0);
+                        }
+                    });
+                    // OMS marks Cancelling synchronously inside cancel_order before the HTTP call
+                    // sync_quote_state will see Cancelling → keeps tracker → no new place until confirmed
                 }
-                if self.ghost { self.bid_quote = None; }
             }
         }
 
-        // Check ask: is it too close to fair?
+        // Check ask: inside min_spread from fair?
         if let Some(ref q) = self.ask_quote {
-            let already_cancelling = self.oms.get_order(&q.client_id)
-                .map(|h| matches!(h.state, OrderState::Cancelling))
-                .unwrap_or(false);
-            if !already_cancelling && q.price < fair + min_spread {
+            let state = self.oms.get_order(&q.client_id).map(|h| h.state);
+            let can_cancel = matches!(state, Some(OrderState::Accepted) | Some(OrderState::PartiallyFilled));
+            if can_cancel && q.price < fair + min_spread {
                 let drift_bps = ((fair + min_spread) - q.price) / fair * 10_000.0;
                 if self.ghost {
                     info!(
-                        "[GHOST] would CANCEL ask cid={} price={:.6} (inside min_spread {:.1}bps, limit={:.6})",
-                        q.client_id.0, q.price, drift_bps, fair + min_spread,
-                    );
-                } else {
-                    info!(
-                        "fast cancel ask cid={} price={:.6} (inner drift {:.1}bps)",
+                        "[GHOST] would CANCEL ask cid={} price={:.6} (inside min_spread {:.1}bps)",
                         q.client_id.0, q.price, drift_bps,
                     );
-                    if let Err(e) = self.oms.cancel_order(&q.client_id).await {
-                        warn!("failed to cancel ask {}: {e}", q.client_id.0);
-                    }
-                    // Don't clear tracker — let sync_quote_state confirm cancel
+                    self.ask_quote = None;
+                } else {
+                    info!("fast cancel ask cid={} price={:.6} ({:.1}bps inside)", q.client_id.0, q.price, drift_bps);
+                    let oms = Arc::clone(&self.oms);
+                    let cid = q.client_id;
+                    tokio::spawn(async move {
+                        if let Err(e) = oms.cancel_order(&cid).await {
+                            warn!("failed to cancel ask {}: {e}", cid.0);
+                        }
+                    });
                 }
-                if self.ghost { self.ask_quote = None; }
             }
         }
     }
@@ -377,9 +373,9 @@ impl MmEngine {
     // Slow path: evaluate and place quotes
     // -----------------------------------------------------------------------
 
-    async fn evaluate_and_place_quotes(&mut self) {
+    fn evaluate_and_place_quotes(&mut self) {
         // Cancel any stray orders on our symbol that we don't own
-        self.cancel_stray_orders().await;
+        self.cancel_stray_orders();
 
         // Staleness check — don't place on stale data
         let Some((fair, age_ms, _)) = self.fair_price.get_fair_price_with_age(ExchangeId::Hyperliquid, self.hl_symbol_id) else {
@@ -431,10 +427,13 @@ impl MmEngine {
                         self.bid_quote = None;
                     } else {
                         debug!("slow cancel bid cid={} price={:.6}", q.client_id.0, q.price);
-                        if let Err(e) = self.oms.cancel_order(&q.client_id).await {
-                            warn!("failed to cancel bid {}: {e}", q.client_id.0);
-                        }
-                        // Don't clear tracker — let sync_quote_state confirm cancel
+                        let oms = Arc::clone(&self.oms);
+                        let cid = q.client_id;
+                        tokio::spawn(async move {
+                            if let Err(e) = oms.cancel_order(&cid).await {
+                                warn!("failed to cancel bid {}: {e}", cid.0);
+                            }
+                        });
                     }
                 }
             }
@@ -456,77 +455,80 @@ impl MmEngine {
                         self.ask_quote = None;
                     } else {
                         debug!("slow cancel ask cid={} price={:.6}", q.client_id.0, q.price);
-                        if let Err(e) = self.oms.cancel_order(&q.client_id).await {
-                            warn!("failed to cancel ask {}: {e}", q.client_id.0);
-                        }
-                        // Don't clear tracker — let sync_quote_state confirm cancel
+                        let oms = Arc::clone(&self.oms);
+                        let cid = q.client_id;
+                        tokio::spawn(async move {
+                            if let Err(e) = oms.cancel_order(&cid).await {
+                                warn!("failed to cancel ask {}: {e}", cid.0);
+                            }
+                        });
                     }
                 }
             }
         }
 
         // ── PLACE new quotes where needed ──
+        // Placements are spawned fire-and-forget. The OMS inserts the Inflight order
+        // before the HTTP call, so we can grab the cid and set the tracker immediately.
+        // sync_quote_state sees Inflight → keeps tracker alive until Accepted/Rejected.
 
-        if self.bid_quote.is_none() && want_bid {
+        if self.bid_quote.is_none() && want_bid && !self.ghost {
             let tif = if self.config.post_only { TimeInForce::PostOnly } else { TimeInForce::GTC };
-            if self.ghost {
-                // status log already shows all quoting params
-            } else {
-                let req = OrderRequest {
-                    symbol: self.config.symbol.clone(),
-                    side: Side::Buy,
-                    order_type: OrderType::Limit { price: desired_bid, tif },
-                    size: order_size,
-                    reduce_only: false,
-                };
-                match self.oms.place_order(req).await {
-                    Ok(cid) => {
-                        info!("placed bid cid={} price={:.6} size={:.4}", cid.0, desired_bid, order_size);
-                        self.bid_quote = Some(LiveQuote {
-                            client_id: cid,
-                            exchange_id: None,
-                            price: desired_bid,
-                            size: order_size,
-                            placed_at: Instant::now(),
-                        });
-                        self.consecutive_rejects = 0;
-                    }
-                    Err(e) => {
-                        warn!("failed to place bid: {e}");
-                    }
+            let req = OrderRequest {
+                symbol: self.config.symbol.clone(),
+                side: Side::Buy,
+                order_type: OrderType::Limit { price: desired_bid, tif },
+                size: order_size,
+                reduce_only: false,
+            };
+            let oms = Arc::clone(&self.oms);
+            let price = desired_bid;
+            tokio::spawn(async move {
+                match oms.place_order(req).await {
+                    Ok(cid) => info!("placed bid cid={} price={:.6}", cid.0, price),
+                    Err(e) => warn!("failed to place bid: {e}"),
                 }
-            }
+            });
+            // We can't get the cid synchronously from the spawn.
+            // Instead, sync_quote_state will pick up new Inflight orders from OMS
+            // on the next tick via cancel_stray_orders → adopt_closest_cancel_rest.
+            // For now, set a placeholder so we don't double-place on the next tick.
+            // The placeholder cid 0 won't match any real order, but bid_quote.is_some()
+            // prevents re-entry. sync_quote_state will clear it if cid 0 isn't in OMS,
+            // but by then the real order should be visible.
+            self.bid_quote = Some(LiveQuote {
+                client_id: ClientOrderId(0), // placeholder
+                exchange_id: None,
+                price: desired_bid,
+                size: order_size,
+                placed_at: Instant::now(),
+            });
         }
 
-        if self.ask_quote.is_none() && want_ask {
+        if self.ask_quote.is_none() && want_ask && !self.ghost {
             let tif = if self.config.post_only { TimeInForce::PostOnly } else { TimeInForce::GTC };
-            if self.ghost {
-                // status log already shows all quoting params
-            } else {
-                let req = OrderRequest {
-                    symbol: self.config.symbol.clone(),
-                    side: Side::Sell,
-                    order_type: OrderType::Limit { price: desired_ask, tif },
-                    size: order_size,
-                    reduce_only: false,
-                };
-                match self.oms.place_order(req).await {
-                    Ok(cid) => {
-                        info!("placed ask cid={} price={:.6} size={:.4}", cid.0, desired_ask, order_size);
-                        self.ask_quote = Some(LiveQuote {
-                            client_id: cid,
-                            exchange_id: None,
-                            price: desired_ask,
-                            size: order_size,
-                            placed_at: Instant::now(),
-                        });
-                        self.consecutive_rejects = 0;
-                    }
-                    Err(e) => {
-                        warn!("failed to place ask: {e}");
-                    }
+            let req = OrderRequest {
+                symbol: self.config.symbol.clone(),
+                side: Side::Sell,
+                order_type: OrderType::Limit { price: desired_ask, tif },
+                size: order_size,
+                reduce_only: false,
+            };
+            let oms = Arc::clone(&self.oms);
+            let price = desired_ask;
+            tokio::spawn(async move {
+                match oms.place_order(req).await {
+                    Ok(cid) => info!("placed ask cid={} price={:.6}", cid.0, price),
+                    Err(e) => warn!("failed to place ask: {e}"),
                 }
-            }
+            });
+            self.ask_quote = Some(LiveQuote {
+                client_id: ClientOrderId(0), // placeholder
+                exchange_id: None,
+                price: desired_ask,
+                size: order_size,
+                placed_at: Instant::now(),
+            });
         }
     }
 
@@ -782,7 +784,7 @@ impl MmEngine {
     /// - If we DON'T have a tracked quote: adopt the closest to fair, cancel the rest
     /// - Only act on orders where last_modified age >= stray_order_age_ms
     /// - Skip orders in Cancelling state
-    async fn cancel_stray_orders(&mut self) {
+    fn cancel_stray_orders(&mut self) {
         if self.ghost {
             return;
         }
@@ -823,39 +825,43 @@ impl MmEngine {
         // Handle stray bids
         if !stray_bids.is_empty() {
             if self.bid_quote.is_some() {
-                // We already have a bid — cancel all strays
                 for o in &stray_bids {
                     warn!("cancelling stray bid cid={} price={:?}", o.client_id.0, o.order_type);
-                    if let Err(e) = self.oms.cancel_order(&o.client_id).await {
-                        warn!("failed to cancel stray bid {}: {e}", o.client_id.0);
-                    }
+                    let oms = Arc::clone(&self.oms);
+                    let cid = o.client_id;
+                    tokio::spawn(async move {
+                        if let Err(e) = oms.cancel_order(&cid).await {
+                            warn!("failed to cancel stray bid {}: {e}", cid.0);
+                        }
+                    });
                 }
             } else {
-                // No tracked bid — adopt the closest to fair, cancel the rest
-                self.adopt_closest_cancel_rest(&stray_bids, Side::Buy, fair).await;
+                self.adopt_closest_cancel_rest(&stray_bids, Side::Buy, fair);
             }
         }
 
         // Handle stray asks
         if !stray_asks.is_empty() {
             if self.ask_quote.is_some() {
-                // We already have an ask — cancel all strays
                 for o in &stray_asks {
                     warn!("cancelling stray ask cid={} price={:?}", o.client_id.0, o.order_type);
-                    if let Err(e) = self.oms.cancel_order(&o.client_id).await {
-                        warn!("failed to cancel stray ask {}: {e}", o.client_id.0);
-                    }
+                    let oms = Arc::clone(&self.oms);
+                    let cid = o.client_id;
+                    tokio::spawn(async move {
+                        if let Err(e) = oms.cancel_order(&cid).await {
+                            warn!("failed to cancel stray ask {}: {e}", cid.0);
+                        }
+                    });
                 }
             } else {
-                // No tracked ask — adopt the closest to fair, cancel the rest
-                self.adopt_closest_cancel_rest(&stray_asks, Side::Sell, fair).await;
+                self.adopt_closest_cancel_rest(&stray_asks, Side::Sell, fair);
             }
         }
     }
 
     /// From a list of stray orders on one side, adopt the one closest to fair price
     /// as our tracked quote, cancel the rest.
-    async fn adopt_closest_cancel_rest(&mut self, strays: &[&OrderHandle], side: Side, fair: f64) {
+    fn adopt_closest_cancel_rest(&mut self, strays: &[&OrderHandle], side: Side, fair: f64) {
         if strays.is_empty() {
             return;
         }
@@ -890,12 +896,15 @@ impl MmEngine {
                     Side::Sell => self.ask_quote = Some(quote),
                 }
             } else {
-                // Cancel this one
                 warn!("cancelling duplicate {:?} cid={} price={:?}",
                     side, o.client_id.0, o.order_type);
-                if let Err(e) = self.oms.cancel_order(&o.client_id).await {
-                    warn!("failed to cancel duplicate {}: {e}", o.client_id.0);
-                }
+                let oms = Arc::clone(&self.oms);
+                let cid = o.client_id;
+                tokio::spawn(async move {
+                    if let Err(e) = oms.cancel_order(&cid).await {
+                        warn!("failed to cancel duplicate {}: {e}", cid.0);
+                    }
+                });
             }
         }
     }

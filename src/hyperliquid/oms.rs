@@ -771,27 +771,9 @@ impl HyperliquidOms {
         Ok((idx, asset_name.to_string()))
     }
 
-}
-
-// ---------------------------------------------------------------------------
-// ExchangeOms trait implementation
-// ---------------------------------------------------------------------------
-
-#[async_trait]
-impl ExchangeOms for HyperliquidOms {
-    fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire)
-    }
-
-    async fn wait_ready(&self) -> Result<()> {
-        if self.is_ready() {
-            return Ok(());
-        }
-        self.ready_notify.notified().await;
-        Ok(())
-    }
-
-    async fn place_order(&self, req: OrderRequest) -> Result<ClientOrderId> {
+    /// Sync part of place_order: generates cid, builds SDK request, inserts Inflight order.
+    /// Returns (cid, sdk_request) for the caller to spawn the HTTP call.
+    pub fn prepare_place_order(&self, req: &OrderRequest) -> Result<(ClientOrderId, ClientOrderRequest)> {
         self.check_ready()?;
 
         let (asset_idx, asset_name) = self.resolve_asset(&req.symbol)?;
@@ -800,7 +782,6 @@ impl ExchangeOms for HyperliquidOms {
             .unwrap_or(8);
         let cid = self.next_client_id.fetch_add(1, Ordering::Relaxed);
 
-        // Build SDK order request
         let (price, order_type) = match req.order_type {
             OrderType::Limit { price, tif } => {
                 let tif_str = match tif {
@@ -830,7 +811,7 @@ impl ExchangeOms for HyperliquidOms {
         };
 
         let sdk_req = ClientOrderRequest {
-            asset: asset_name.clone(),
+            asset: asset_name,
             is_buy: req.side == Side::Buy,
             reduce_only: req.reduce_only,
             limit_px: round_price_for_hl(price),
@@ -839,7 +820,6 @@ impl ExchangeOms for HyperliquidOms {
             order_type,
         };
 
-        // Insert as inflight before sending
         let handle = OrderHandle {
             client_id: ClientOrderId(cid),
             exchange_id: None,
@@ -857,17 +837,27 @@ impl ExchangeOms for HyperliquidOms {
             last_modified: Some(Instant::now()),
         };
         self.state.orders.insert(cid, handle);
-        let _ = self
-            .event_tx
-            .send(OmsEvent::OrderInflight(ClientOrderId(cid)));
+        let _ = self.event_tx.send(OmsEvent::OrderInflight(ClientOrderId(cid)));
 
-        // Send via SDK
-        let resp = self.client.exchange().order(sdk_req, None)
-            .await
-            .map_err(|e| anyhow::anyhow!("SDK order failed: {e}"))?;
+        Ok((ClientOrderId(cid), sdk_req))
+    }
 
-        // Process response
-        use hyperliquid_rust_sdk::ExchangeResponseStatus;
+    /// Async part: sends the SDK request and processes the response.
+    pub async fn execute_place_order(&self, cid: u64, sdk_req: ClientOrderRequest) {
+        let resp = match self.client.exchange().order(sdk_req, None).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("SDK order failed for cid={}: {e}", cid);
+                if let Some(mut h) = self.state.orders.get_mut(&cid) {
+                    h.state = OrderState::Rejected;
+                    h.reject_reason = Some(format!("{e}"));
+                    h.last_modified = Some(Instant::now());
+                }
+                return;
+            }
+        };
+
+        use hyperliquid_rust_sdk::{ExchangeResponseStatus, ExchangeDataStatus};
         match resp {
             ExchangeResponseStatus::Err(msg) => {
                 if let Some(mut h) = self.state.orders.get_mut(&cid) {
@@ -877,14 +867,12 @@ impl ExchangeOms for HyperliquidOms {
                 }
                 let _ = self.event_tx.send(OmsEvent::OrderRejected {
                     client_id: ClientOrderId(cid),
-                    reason: msg.clone(),
+                    reason: msg,
                 });
-                bail!("order rejected: {msg}");
             }
             ExchangeResponseStatus::Ok(response) => {
                 if let Some(data) = response.data {
                     if let Some(status) = data.statuses.first() {
-                        use hyperliquid_rust_sdk::ExchangeDataStatus;
                         match status {
                             ExchangeDataStatus::Resting(resting) => {
                                 let oid_str = resting.oid.to_string();
@@ -922,24 +910,22 @@ impl ExchangeOms for HyperliquidOms {
                                     client_id: ClientOrderId(cid),
                                     reason: error.clone(),
                                 });
-                                bail!("order rejected: {error}");
                             }
                             _ => {
-                                warn!("unexpected order status for cid={}, marking rejected", cid);
+                                warn!("unexpected order status for cid={}", cid);
                                 if let Some(mut h) = self.state.orders.get_mut(&cid) {
                                     h.state = OrderState::Rejected;
-                                    h.reject_reason = Some("unexpected response status".into());
+                                    h.reject_reason = Some("unexpected response".into());
                                     h.last_modified = Some(Instant::now());
                                 }
                             }
                         }
                     }
                 }
-                // If order is still Inflight after processing response, something went wrong
+                // Still inflight after Ok? Mark rejected.
                 if let Some(h) = self.state.orders.get(&cid) {
                     if h.state == OrderState::Inflight {
                         drop(h);
-                        warn!("order cid={} still inflight after SDK Ok response, marking rejected", cid);
                         if let Some(mut h) = self.state.orders.get_mut(&cid) {
                             h.state = OrderState::Rejected;
                             h.reject_reason = Some("no status in response".into());
@@ -949,9 +935,33 @@ impl ExchangeOms for HyperliquidOms {
                 }
             }
         }
-
-        Ok(ClientOrderId(cid))
     }
+}
+
+// ---------------------------------------------------------------------------
+// ExchangeOms trait implementation
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl ExchangeOms for HyperliquidOms {
+    fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
+    async fn wait_ready(&self) -> Result<()> {
+        if self.is_ready() {
+            return Ok(());
+        }
+        self.ready_notify.notified().await;
+        Ok(())
+    }
+
+    async fn place_order(&self, req: OrderRequest) -> Result<ClientOrderId> {
+        let (cid, sdk_req) = self.prepare_place_order(&req)?;
+        self.execute_place_order(cid.0, sdk_req).await;
+        Ok(cid)
+    }
+
 
     async fn cancel_order(&self, id: &ClientOrderId) -> Result<()> {
         self.check_ready()?;
@@ -971,6 +981,12 @@ impl ExchangeOms for HyperliquidOms {
         let oid: u64 = exchange_id.parse().unwrap_or(0);
         drop(handle);
 
+        // Mark Cancelling BEFORE the HTTP call so the engine sees it immediately
+        if let Some(mut h) = self.state.orders.get_mut(&id.0) {
+            h.state = OrderState::Cancelling;
+            h.last_modified = Some(Instant::now());
+        }
+
         let cancel_req = ClientCancelRequest {
             asset: asset_name,
             oid,
@@ -981,14 +997,15 @@ impl ExchangeOms for HyperliquidOms {
 
         match resp {
             hyperliquid_rust_sdk::ExchangeResponseStatus::Ok(_) => {
-                if let Some(mut h) = self.state.orders.get_mut(&id.0) {
-                    h.state = OrderState::Cancelling;
-                    h.last_modified = Some(Instant::now());
-                }
+                // Already marked Cancelling above. REST poll will confirm.
                 // Don't emit OrderCancelled yet — wait for REST poll or WS confirmation
             }
             hyperliquid_rust_sdk::ExchangeResponseStatus::Err(msg) => {
-                warn!("cancel rejected: {msg}");
+                warn!("cancel rejected for {}: {msg}, restoring to Accepted", id.0);
+                if let Some(mut h) = self.state.orders.get_mut(&id.0) {
+                    h.state = OrderState::Accepted;
+                    h.last_modified = Some(Instant::now());
+                }
             }
         }
 
