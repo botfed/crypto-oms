@@ -315,6 +315,7 @@ impl MmEngine {
             fair,
             skewed_mid - half_spread,
             skewed_mid + half_spread,
+            self.config.min_edge_bps,
         );
 
         // Check bid: is it TOO HIGH (inner side = adverse)?
@@ -398,6 +399,7 @@ impl MmEngine {
             fair,
             skewed_mid - half_spread,
             skewed_mid + half_spread,
+            self.config.min_edge_bps,
         );
 
         // Determine if we should quote each side (position limits)
@@ -549,8 +551,8 @@ impl MmEngine {
     }
 
     /// Clamp desired bid/ask so quotes never cross fair value.
-    fn clamp_to_fair(fair_value: f64, desired_bid: f64, desired_ask: f64) -> (f64, f64) {
-        let min_edge = 0.1 * fair_value / 10_000.0; // 0.1 bps buffer
+    fn clamp_to_fair(fair_value: f64, desired_bid: f64, desired_ask: f64, min_edge_bps: f64) -> (f64, f64) {
+        let min_edge = min_edge_bps * fair_value / 10_000.0;
         (
             desired_bid.min(fair_value - min_edge),
             desired_ask.max(fair_value + min_edge),

@@ -153,6 +153,9 @@ pub struct StrategyConfig {
     /// Max inventory skew in bps (log formula, capped at this value)
     #[serde(default = "default_max_skew")]
     pub max_skew_bps: f64,
+    /// Minimum edge from fair price in bps — quotes are clamped to not cross this
+    #[serde(default = "default_min_edge_bps")]
+    pub min_edge_bps: f64,
     /// Inner-side (adverse) drift in bps before fast-path cancel
     #[serde(default = "default_cancel_threshold")]
     pub cancel_threshold_bps: f64,
@@ -180,6 +183,7 @@ pub struct StrategyConfig {
 }
 
 fn default_max_skew() -> f64 { 5.0 }
+fn default_min_edge_bps() -> f64 { 0.1 }
 fn default_cancel_threshold() -> f64 { 0.5 }
 fn default_requote_tolerance() -> f64 { 1.5 }
 fn default_quote_interval() -> u64 { 150 }
