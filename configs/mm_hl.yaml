@@ -47,7 +47,7 @@ strategy:
   order_notional_usd: 100.0
   max_position_usd: 10000.0
   half_spread_bps: 20.0
-  cancel_threshold_bps: 10.0
+  cancel_threshold_bps: 15.0
   requote_tolerance_bps: 10.0
   max_skew_bps: 10.0
   min_edge_bps: 2.0
