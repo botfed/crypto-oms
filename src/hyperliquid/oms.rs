@@ -18,8 +18,9 @@ use super::client::{
 use super::types::*;
 
 /// A signed order payload ready for HTTP post.
+/// JSON serialization is deferred to the post step (off hot path).
 pub struct SignedPayload {
-    pub action_json: serde_json::Value,
+    pub action: hyperliquid_rust_sdk::Actions,
     pub signature: alloy::signers::Signature,
     pub timestamp: u64,
 }
@@ -870,20 +871,32 @@ impl HyperliquidOms {
         let connection_id = action.hash(timestamp, ex.vault_address)
             .map_err(|e| anyhow::anyhow!("action hash failed: {e}"))?;
 
-        let action_json = serde_json::to_value(&action)
-            .map_err(|e| anyhow::anyhow!("json serialize failed: {e}"))?;
-
         let is_mainnet = ex.http_client.is_mainnet();
         let signature = hyperliquid_rust_sdk::sign_l1_action(&ex.wallet, connection_id, is_mainnet)
             .map_err(|e| anyhow::anyhow!("signing failed: {e}"))?;
 
-        Ok(SignedPayload { action_json, signature, timestamp })
+        // JSON serialization deferred to post_place_order (off hot path)
+        Ok(SignedPayload { action, signature, timestamp })
     }
 
     /// Async: post a signed payload and process the response.
     pub async fn post_place_order(&self, cid: u64, signed: SignedPayload) {
+        // JSON serialization happens here, off the hot path
+        let action_json = match serde_json::to_value(&signed.action) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("JSON serialize failed for cid={}: {e}", cid);
+                if let Some(mut h) = self.state.orders.get_mut(&cid) {
+                    h.state = OrderState::Rejected;
+                    h.reject_reason = Some(format!("{e}"));
+                    h.last_modified = Some(Instant::now());
+                }
+                return;
+            }
+        };
+
         let resp = match self.client.exchange()
-            .post(signed.action_json, signed.signature, signed.timestamp).await
+            .post(action_json, signed.signature, signed.timestamp).await
         {
             Ok(r) => r,
             Err(e) => {
