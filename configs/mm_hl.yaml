@@ -42,6 +42,7 @@ strategy:
   cancel_threshold_bps: 10.0
   requote_tolerance_bps: 10.0
   max_skew_bps: 10.0
+  min_edge_bps: 2.0
   quote_interval_ms: 150
   post_only: false
   warmup_secs: 10
