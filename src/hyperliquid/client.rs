@@ -1,6 +1,5 @@
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
-use tracing::debug;
 
 use super::types::*;
 

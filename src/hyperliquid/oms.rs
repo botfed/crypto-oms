@@ -111,6 +111,7 @@ impl OmsState {
         }
     }
 
+    #[allow(dead_code)]
     fn clear(&self) {
         self.orders.clear();
         self.oid_map.clear();
@@ -138,7 +139,7 @@ pub struct HyperliquidOms {
 
 impl HyperliquidOms {
     pub fn new(config: HyperliquidOmsConfig) -> Result<Arc<Self>> {
-        let mut client = HyperliquidClient::new(
+        let client = HyperliquidClient::new(
             &config.private_key,
             config.account_address.clone(),
             config.base_url.clone(),
@@ -408,22 +409,22 @@ impl HyperliquidOms {
         // The perp clearinghouse is a derivative view into how that USDC is deployed.
         self.state.balances.clear();
 
-        let perp_margin_used: f64 = clearinghouse
+        let _perp_margin_used: f64 = clearinghouse
             .margin_summary
             .total_margin_used
             .parse()
             .unwrap_or(0.0);
-        let perp_account_value: f64 = clearinghouse
+        let _perp_account_value: f64 = clearinghouse
             .margin_summary
             .account_value
             .parse()
             .unwrap_or(0.0);
-        let perp_ntl_pos: f64 = clearinghouse
+        let _perp_ntl_pos: f64 = clearinghouse
             .margin_summary
             .total_ntl_pos
             .parse()
             .unwrap_or(0.0);
-        let withdrawable: f64 = clearinghouse.withdrawable.parse().unwrap_or(0.0);
+        let _withdrawable: f64 = clearinghouse.withdrawable.parse().unwrap_or(0.0);
 
         // Spot balances — USDC total here is the real account equity
         for sb in &spot_state.balances {

@@ -27,6 +27,7 @@ struct LiveQuote {
     price: f64,
     #[allow(dead_code)]
     size: f64,
+    #[allow(dead_code)]
     placed_at: Instant,
 }
 
@@ -481,28 +482,23 @@ impl MmEngine {
                 size: order_size,
                 reduce_only: false,
             };
-            let oms = Arc::clone(&self.oms);
-            let price = desired_bid;
-            tokio::spawn(async move {
-                match oms.place_order(req).await {
-                    Ok(cid) => info!("placed bid cid={} price={:.6}", cid.0, price),
-                    Err(e) => warn!("failed to place bid: {e}"),
+            match self.oms.prepare_place_order(&req) {
+                Ok((cid, sdk_req)) => {
+                    info!("placing bid cid={} price={:.6}", cid.0, desired_bid);
+                    self.bid_quote = Some(LiveQuote {
+                        client_id: cid,
+                        exchange_id: None,
+                        price: desired_bid,
+                        size: order_size,
+                        placed_at: Instant::now(),
+                    });
+                    let oms = Arc::clone(&self.oms);
+                    tokio::spawn(async move {
+                        oms.execute_place_order(cid.0, sdk_req).await;
+                    });
                 }
-            });
-            // We can't get the cid synchronously from the spawn.
-            // Instead, sync_quote_state will pick up new Inflight orders from OMS
-            // on the next tick via cancel_stray_orders → adopt_closest_cancel_rest.
-            // For now, set a placeholder so we don't double-place on the next tick.
-            // The placeholder cid 0 won't match any real order, but bid_quote.is_some()
-            // prevents re-entry. sync_quote_state will clear it if cid 0 isn't in OMS,
-            // but by then the real order should be visible.
-            self.bid_quote = Some(LiveQuote {
-                client_id: ClientOrderId(0), // placeholder
-                exchange_id: None,
-                price: desired_bid,
-                size: order_size,
-                placed_at: Instant::now(),
-            });
+                Err(e) => warn!("failed to prepare bid: {e}"),
+            }
         }
 
         if self.ask_quote.is_none() && want_ask && !self.ghost {
@@ -514,21 +510,23 @@ impl MmEngine {
                 size: order_size,
                 reduce_only: false,
             };
-            let oms = Arc::clone(&self.oms);
-            let price = desired_ask;
-            tokio::spawn(async move {
-                match oms.place_order(req).await {
-                    Ok(cid) => info!("placed ask cid={} price={:.6}", cid.0, price),
-                    Err(e) => warn!("failed to place ask: {e}"),
+            match self.oms.prepare_place_order(&req) {
+                Ok((cid, sdk_req)) => {
+                    info!("placing ask cid={} price={:.6}", cid.0, desired_ask);
+                    self.ask_quote = Some(LiveQuote {
+                        client_id: cid,
+                        exchange_id: None,
+                        price: desired_ask,
+                        size: order_size,
+                        placed_at: Instant::now(),
+                    });
+                    let oms = Arc::clone(&self.oms);
+                    tokio::spawn(async move {
+                        oms.execute_place_order(cid.0, sdk_req).await;
+                    });
                 }
-            });
-            self.ask_quote = Some(LiveQuote {
-                client_id: ClientOrderId(0), // placeholder
-                exchange_id: None,
-                price: desired_ask,
-                size: order_size,
-                placed_at: Instant::now(),
-            });
+                Err(e) => warn!("failed to prepare ask: {e}"),
+            }
         }
     }
 
