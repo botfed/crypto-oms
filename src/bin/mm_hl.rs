@@ -1,11 +1,18 @@
 use anyhow::{Context, Result};
 use crypto_feeds::app_config::{load_perp, load_spot};
+use crypto_feeds::bar_manager::{BarManager, BarSymbol};
+use crypto_feeds::historical_bars::{aggregate_bars, load_1m_bars_with_backfill};
+use crypto_feeds::market_data::{Exchange, InstrumentType};
+use crypto_feeds::symbol_registry::REGISTRY;
+use crypto_feeds::vol_engine::VolEngine;
 use crypto_feeds::AllMarketData;
 use crypto_oms::hyperliquid::HyperliquidOms;
 use crypto_oms::mm::config::{MmConfig, WatchParams};
 use crypto_oms::mm::fair_price::FairPriceEngine;
 use crypto_oms::mm::inventory::start_inventory_manager;
 use crypto_oms::mm::MmEngine;
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -57,7 +64,6 @@ async fn main() -> Result<()> {
         tokio::signal::ctrl_c().await.ok();
         info!("Ctrl-C received, shutting down...");
         sd.notify_waiters();
-        // Force exit after 3s if graceful shutdown is stuck
         tokio::time::sleep(Duration::from_secs(3)).await;
         warn!("graceful shutdown timed out, forcing exit");
         std::process::exit(1);
@@ -80,7 +86,6 @@ async fn main() -> Result<()> {
     fair_price.start(shutdown.clone());
 
     // Start inventory manager
-    // Extract the base asset from the strategy symbol (e.g., "PERP_BTC_USDC" → "BTC")
     let asset = config.strategy.symbol
         .strip_prefix("PERP_")
         .or_else(|| config.strategy.symbol.strip_prefix("SPOT_"))
@@ -95,10 +100,89 @@ async fn main() -> Result<()> {
     // Build params
     let (params, _controller) = WatchParams::new(&config.strategy, target_rx);
 
+    // Initialize vol engine if vol_models is configured
+    let vol_model_name = config.vol_models
+        .as_ref()
+        .map(|v| v.model.clone())
+        .unwrap_or_else(|| "har_qlike".to_string());
+
+    let vol_engine = if let Some(ref vol_cfg) = config.vol_models {
+        info!("initializing vol engine from {}", vol_cfg.params_dir);
+
+        let params_dir = Path::new(&vol_cfg.params_dir);
+        let all_params = crypto_feeds::vol_params::load_all_vol_params(params_dir)
+            .with_context(|| format!("loading vol params from {}", params_dir.display()))?;
+
+        info!("loaded vol params for {} symbols: {:?}",
+            all_params.len(), all_params.keys().collect::<Vec<_>>());
+
+        let target_min = all_params.values().next().map(|p| p.target_min).unwrap_or(5);
+        let max_window = all_params.values()
+            .flat_map(|p| [
+                p.har_ols.as_ref().map(|h| h.max_window()),
+                p.har_qlike.as_ref().map(|h| h.max_window()),
+            ])
+            .flatten()
+            .max()
+            .unwrap_or(288) + 16;
+
+        // Resolve BarSymbol for each vol symbol (Binance perp preferred)
+        let mut bar_symbols = Vec::new();
+        let mut param_map = HashMap::new();
+        for (sym, params) in all_params {
+            let perp_sym = format!("{}_USDT", sym);
+            let spot_sym = format!("{}_USDT", sym);
+            let venue = if let Some(&id) = REGISTRY.lookup(&perp_sym, &InstrumentType::Perp) {
+                Some((Exchange::Binance, id))
+            } else if let Some(&id) = REGISTRY.lookup(&spot_sym, &InstrumentType::Spot) {
+                Some((Exchange::Binance, id))
+            } else {
+                warn!("no Binance venue found for {}, skipping vol", sym);
+                None
+            };
+            if let Some((exchange, symbol_id)) = venue {
+                bar_symbols.push(BarSymbol { name: sym.clone(), exchange, symbol_id });
+                param_map.insert(sym, params);
+            }
+        }
+
+        // Create bar manager
+        let bar_mgr = Arc::new(BarManager::new(bar_symbols, target_min, max_window));
+
+        // Warmup from historical bars
+        let bar_data_dir = Path::new(&vol_cfg.bar_data_dir);
+        for sym in bar_mgr.symbols() {
+            match load_1m_bars_with_backfill(bar_data_dir, &sym, vol_cfg.warmup_days).await {
+                Ok(bars_1m) => {
+                    let target_bars = aggregate_bars(&bars_1m, target_min);
+                    bar_mgr.warmup(&sym, target_bars, &bars_1m);
+                    info!("vol warmup: {} bars for {}", bar_mgr.symbols().len(), sym);
+                }
+                Err(e) => warn!("vol warmup failed for {}: {}", sym, e),
+            }
+        }
+
+        // Spawn bar maintenance (converts live ticks → bars)
+        handles.push(bar_mgr.spawn_maintenance(Arc::clone(&market_data), Arc::clone(&shutdown)));
+
+        // Create vol engine
+        let engine = Arc::new(VolEngine::new(param_map, Arc::clone(&bar_mgr)));
+        engine.replay_history();
+        info!("vol engine ready (model={})", vol_model_name);
+
+        Some(engine)
+    } else {
+        info!("no vol_models configured, vol_mult=1.0");
+        None
+    };
+
     // Run engine
     let mut engine = MmEngine::new(
         oms,
         fair_price,
+        vol_engine,
+        market_data,
+        vol_model_name,
         Box::new(params),
         config.strategy,
         ghost,

@@ -44,6 +44,9 @@ enum EngineState {
 pub struct MmEngine {
     oms: Arc<HyperliquidOms>,
     fair_price: Arc<FairPriceEngine>,
+    vol_engine: Option<Arc<crypto_feeds::vol_engine::VolEngine>>,
+    market_data: Arc<crypto_feeds::AllMarketData>,
+    vol_model_name: String,
     params: Box<dyn MmParamSource>,
     config: StrategyConfig,
     shutdown: Arc<Notify>,
@@ -67,6 +70,9 @@ impl MmEngine {
     pub fn new(
         oms: Arc<HyperliquidOms>,
         fair_price: Arc<FairPriceEngine>,
+        vol_engine: Option<Arc<crypto_feeds::vol_engine::VolEngine>>,
+        market_data: Arc<crypto_feeds::AllMarketData>,
+        vol_model_name: String,
         params: Box<dyn MmParamSource>,
         config: StrategyConfig,
         ghost: bool,
@@ -92,6 +98,9 @@ impl MmEngine {
         Ok(Self {
             oms,
             fair_price,
+            vol_engine,
+            market_data,
+            vol_model_name,
             params,
             config,
             shutdown,
@@ -304,31 +313,25 @@ impl MmEngine {
             return;
         };
 
-        let position = self.get_position();
-        let target = self.params.target_position_usd() / fair;
-        let max_pos = self.params.max_position_usd() / fair;
-        let half_spread = self.params.half_spread_bps() * fair / 10_000.0;
-        let cancel_thresh = self.config.cancel_threshold_bps * fair / 10_000.0;
+        let vol_mult = self.get_vol_multiplier();
+        let min_edge = self.config.min_edge_bps * fair / 10_000.0;
+        let min_spread = (self.config.ref_min_spread_bps * vol_mult * fair / 10_000.0).max(min_edge);
 
-        let skewed_mid = self.compute_skewed_mid(fair, position, target, max_pos);
-        let (desired_bid, desired_ask) = Self::clamp_to_fair(
-            fair,
-            skewed_mid - half_spread,
-            skewed_mid + half_spread,
-            self.config.min_edge_bps,
-        );
+        // Fast cancel: quote inside min_spread from fair → cancel
+        // bid cancel if: bid_price > fair - min_spread
+        // ask cancel if: ask_price < fair + min_spread
 
-        // Check bid: is it TOO HIGH (inner side = adverse)?
+        // Check bid: is it too close to fair?
         if let Some(ref q) = self.bid_quote {
             let already_cancelling = self.oms.get_order(&q.client_id)
                 .map(|h| matches!(h.state, OrderState::Cancelling))
                 .unwrap_or(false);
-            if !already_cancelling && q.price > desired_bid + cancel_thresh {
-                let drift_bps = (q.price - desired_bid) / fair * 10_000.0;
+            if !already_cancelling && q.price > fair - min_spread {
+                let drift_bps = (q.price - (fair - min_spread)) / fair * 10_000.0;
                 if self.ghost {
                     info!(
-                        "[GHOST] would CANCEL bid cid={} price={:.6} (inner drift {:.1}bps, desired={:.6})",
-                        q.client_id.0, q.price, drift_bps, desired_bid,
+                        "[GHOST] would CANCEL bid cid={} price={:.6} (inside min_spread {:.1}bps, limit={:.6})",
+                        q.client_id.0, q.price, drift_bps, fair - min_spread,
                     );
                 } else {
                     info!(
@@ -343,17 +346,17 @@ impl MmEngine {
             }
         }
 
-        // Check ask: is it TOO LOW (inner side = adverse)?
+        // Check ask: is it too close to fair?
         if let Some(ref q) = self.ask_quote {
             let already_cancelling = self.oms.get_order(&q.client_id)
                 .map(|h| matches!(h.state, OrderState::Cancelling))
                 .unwrap_or(false);
-            if !already_cancelling && q.price < desired_ask - cancel_thresh {
-                let drift_bps = (desired_ask - q.price) / fair * 10_000.0;
+            if !already_cancelling && q.price < fair + min_spread {
+                let drift_bps = ((fair + min_spread) - q.price) / fair * 10_000.0;
                 if self.ghost {
                     info!(
-                        "[GHOST] would CANCEL ask cid={} price={:.6} (inner drift {:.1}bps, desired={:.6})",
-                        q.client_id.0, q.price, drift_bps, desired_ask,
+                        "[GHOST] would CANCEL ask cid={} price={:.6} (inside min_spread {:.1}bps, limit={:.6})",
+                        q.client_id.0, q.price, drift_bps, fair + min_spread,
                     );
                 } else {
                     info!(
@@ -388,11 +391,14 @@ impl MmEngine {
 
         let position = self.get_position();
         let target = self.params.target_position_usd() / fair;
-        let half_spread = self.params.half_spread_bps() * fair / 10_000.0;
         let notional = self.params.order_notional_usd();
         let order_size = notional / fair;
         let max_pos = self.params.max_position_usd() / fair;
-        let requote_thresh = self.config.requote_tolerance_bps * fair / 10_000.0;
+
+        let vol_mult = self.get_vol_multiplier();
+        let min_edge = self.config.min_edge_bps * fair / 10_000.0;
+        let half_spread = (self.config.ref_half_spread_bps * vol_mult * fair / 10_000.0).max(min_edge);
+        let requote_thresh = self.config.ref_requote_tolerance_bps * vol_mult * fair / 10_000.0;
 
         let skewed_mid = self.compute_skewed_mid(fair, position, target, max_pos);
         let (desired_bid, desired_ask) = Self::clamp_to_fair(
@@ -464,10 +470,7 @@ impl MmEngine {
         if self.bid_quote.is_none() && want_bid {
             let tif = if self.config.post_only { TimeInForce::PostOnly } else { TimeInForce::GTC };
             if self.ghost {
-                info!(
-                    "[GHOST] would PLACE bid price={:.6} size={:.4} (skewed_mid={:.6} spread={:.2}bps pos={:.6} target={:.6})",
-                    desired_bid, order_size, skewed_mid, self.params.half_spread_bps(), position, target,
-                );
+                // status log already shows all quoting params
             } else {
                 let req = OrderRequest {
                     symbol: self.config.symbol.clone(),
@@ -498,10 +501,7 @@ impl MmEngine {
         if self.ask_quote.is_none() && want_ask {
             let tif = if self.config.post_only { TimeInForce::PostOnly } else { TimeInForce::GTC };
             if self.ghost {
-                info!(
-                    "[GHOST] would PLACE ask price={:.6} size={:.4} (skewed_mid={:.6} spread={:.2}bps pos={:.6} target={:.6})",
-                    desired_ask, order_size, skewed_mid, self.params.half_spread_bps(), position, target,
-                );
+                // status log already shows all quoting params
             } else {
                 let req = OrderRequest {
                     symbol: self.config.symbol.clone(),
@@ -551,6 +551,26 @@ impl MmEngine {
     }
 
     /// Clamp desired bid/ask so quotes never cross fair value.
+    /// Get the vol multiplier from the vol engine. Returns 1.0 if no vol engine.
+    fn get_vol_multiplier(&self) -> f64 {
+        let Some(ref ve) = self.vol_engine else { return 1.0; };
+        let preds = match ve.predict_now(&self.config.vol_symbol, &self.market_data) {
+            Ok(p) => p,
+            Err(_) => return 1.0,
+        };
+        let predicted = match self.vol_model_name.as_str() {
+            "har_ols" => preds.har_ols,
+            "har_qlike" => preds.har_qlike,
+            "garch" => preds.garch,
+            "ewma" => preds.ewma,
+            _ => preds.har_qlike,
+        };
+        if self.config.ref_vol <= 0.0 || predicted <= 0.0 {
+            return 1.0;
+        }
+        (predicted / self.config.ref_vol).clamp(self.config.vol_mult_floor, self.config.vol_mult_cap)
+    }
+
     fn clamp_to_fair(fair_value: f64, desired_bid: f64, desired_ask: f64, min_edge_bps: f64) -> (f64, f64) {
         let min_edge = min_edge_bps * fair_value / 10_000.0;
         (
@@ -601,13 +621,30 @@ impl MmEngine {
             _ => 0.0,
         };
 
+        let vol_mult = self.get_vol_multiplier();
+        let adj_spread_bps = (self.config.ref_half_spread_bps * vol_mult).max(self.config.min_edge_bps);
+
+        // Get raw vol prediction for logging
+        let pred_vol_ann = self.vol_engine.as_ref().and_then(|ve| {
+            ve.predict_now(&self.config.vol_symbol, &self.market_data).ok()
+        }).map(|p| match self.vol_model_name.as_str() {
+            "har_ols" => p.har_ols,
+            "har_qlike" => p.har_qlike,
+            "garch" => p.garch,
+            "ewma" => p.ewma,
+            _ => p.har_qlike,
+        }).unwrap_or(0.0);
+
         info!(
-            "status: fair={:.6} hl_mid={:.6} resid={:+.2}bps basis={:+.2}bps skew={:+.2}bps pos={:+.6} target={:+.6} bid={} ask={} ref={}@{}ms",
+            "status: fair={:.6} hl_mid={:.6} resid={:+.2}bps basis={:+.2}bps skew={:+.2}bps vol={:.1}% vmult={:.2} spread={:.1}bps pos={:+.6} target={:+.6} bid={} ask={} ref={}@{}ms",
             fair.unwrap_or(0.0),
             hl_mid.unwrap_or(0.0),
             residual_bps,
             basis_bps,
             skew_bps,
+            pred_vol_ann * 100.0,
+            vol_mult,
+            adj_spread_bps,
             position,
             target,
             bid_str,

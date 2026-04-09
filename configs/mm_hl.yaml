@@ -41,16 +41,26 @@ inventory:
       AIXBT:
         - "0x4F9Fd6Be4a90f2620860d680c0d4d5Fb53d1A825"
 
+vol_models:
+  params_dir: "../botfed-params/vol"
+  bar_data_dir: "../data/binance_ohlcv/perps/1m"
+  model: "har_qlike"
+  warmup_days: 2
+
 strategy:
   symbol: PERP_AIXBT_USDC
   max_stale_ms: 2000
   order_notional_usd: 100.0
   max_position_usd: 10000.0
-  half_spread_bps: 20.0
-  cancel_threshold_bps: 15.0
-  requote_tolerance_bps: 10.0
+  ref_half_spread_bps: 20.0
+  ref_min_spread_bps: 9.0
+  ref_requote_tolerance_bps: 10.0
   max_skew_bps: 10.0
   min_edge_bps: 2.0
+  ref_vol: 1.20
+  vol_mult_floor: 0.3
+  vol_mult_cap: 5.0
+  vol_symbol: "AIXBT"
   quote_interval_ms: 150
   post_only: false
   warmup_secs: 10

@@ -25,6 +25,10 @@ pub struct MmConfig {
     pub fair_price: FairPriceConfig,
     pub inventory: InventoryConfig,
     pub strategy: StrategyConfig,
+
+    /// Optional vol model config for vol-adjusted spreads
+    #[serde(default)]
+    pub vol_models: Option<crypto_feeds::app_config::VolModelConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -144,8 +148,6 @@ fn default_hedge_poll() -> u64 { 100 }
 pub struct StrategyConfig {
     /// HL symbol to market-make, e.g. "PERP_BTC_USDC"
     pub symbol: String,
-    /// Half-spread in basis points from skewed mid to each side
-    pub half_spread_bps: f64,
     /// Order size per side in USD notional (engine computes qty from notional / fair_price)
     pub order_notional_usd: f64,
     /// Max absolute position before hard pause
@@ -153,15 +155,29 @@ pub struct StrategyConfig {
     /// Max inventory skew in bps (log formula, capped at this value)
     #[serde(default = "default_max_skew")]
     pub max_skew_bps: f64,
-    /// Minimum edge from fair price in bps — quotes are clamped to not cross this
+    /// Absolute minimum edge from fair in bps — hard floor, never quotes closer
     #[serde(default = "default_min_edge_bps")]
     pub min_edge_bps: f64,
-    /// Inner-side (adverse) drift in bps before fast-path cancel
-    #[serde(default = "default_cancel_threshold")]
-    pub cancel_threshold_bps: f64,
-    /// Outer-side drift in bps before slow-path requote
+    /// Quote placement distance from skewed mid in bps (at ref_vol)
+    pub ref_half_spread_bps: f64,
+    /// Cancel line: min distance from fair in bps (at ref_vol). Fast cancel fires inside this.
+    pub ref_min_spread_bps: f64,
+    /// Outer-side drift in bps before slow-path requote (at ref_vol, scaled by vol_mult)
     #[serde(default = "default_requote_tolerance")]
-    pub requote_tolerance_bps: f64,
+    pub ref_requote_tolerance_bps: f64,
+    // -- Vol adjustment --
+    /// Mean annualized vol — calibration anchor for spread scaling
+    #[serde(default = "default_ref_vol")]
+    pub ref_vol: f64,
+    /// Min vol multiplier (default 0.3)
+    #[serde(default = "default_vol_mult_floor")]
+    pub vol_mult_floor: f64,
+    /// Max vol multiplier (default 5.0)
+    #[serde(default = "default_vol_mult_cap")]
+    pub vol_mult_cap: f64,
+    /// Symbol in the vol engine (e.g., "AIXBT")
+    #[serde(default)]
+    pub vol_symbol: String,
     /// Slow-path cadence for quote evaluation (ms)
     #[serde(default = "default_quote_interval")]
     pub quote_interval_ms: u64,
@@ -184,8 +200,10 @@ pub struct StrategyConfig {
 
 fn default_max_skew() -> f64 { 5.0 }
 fn default_min_edge_bps() -> f64 { 0.1 }
-fn default_cancel_threshold() -> f64 { 0.5 }
 fn default_requote_tolerance() -> f64 { 1.5 }
+fn default_ref_vol() -> f64 { 1.0 }
+fn default_vol_mult_floor() -> f64 { 0.3 }
+fn default_vol_mult_cap() -> f64 { 5.0 }
 fn default_quote_interval() -> u64 { 150 }
 fn default_max_feed_age() -> u64 { 5_000 }
 fn default_max_stale() -> u64 { 500 }
@@ -199,7 +217,6 @@ fn default_warmup_secs() -> u64 { 10 }
 
 pub trait MmParamSource: Send + Sync {
     fn target_position_usd(&self) -> f64;
-    fn half_spread_bps(&self) -> f64;
     fn order_notional_usd(&self) -> f64;
     fn max_position_usd(&self) -> f64;
     fn enabled(&self) -> bool;
@@ -211,7 +228,6 @@ pub trait MmParamSource: Send + Sync {
 
 pub struct WatchParams {
     target_position_usd: watch::Receiver<f64>,
-    half_spread_bps: watch::Receiver<f64>,
     order_notional_usd: watch::Receiver<f64>,
     max_position_usd: watch::Receiver<f64>,
     enabled: watch::Receiver<bool>,
@@ -220,7 +236,6 @@ pub struct WatchParams {
 /// Controller side — hand this to external tasks to update params at runtime.
 pub struct WatchParamController {
     pub target_position_usd: watch::Sender<f64>,
-    pub half_spread_bps: watch::Sender<f64>,
     pub order_notional_usd: watch::Sender<f64>,
     pub max_position_usd: watch::Sender<f64>,
     pub enabled: watch::Sender<bool>,
@@ -233,20 +248,14 @@ impl WatchParams {
         config: &StrategyConfig,
         target_rx: watch::Receiver<f64>,
     ) -> (Self, WatchParamController) {
-        let (spread_tx, spread_rx) = watch::channel(config.half_spread_bps);
         let (size_tx, size_rx) = watch::channel(config.order_notional_usd);
         let (max_tx, max_rx) = watch::channel(config.max_position_usd);
         let (en_tx, en_rx) = watch::channel(true);
 
-        // We need a sender for target_position too, so the controller is complete.
-        // But the *real* driver is the inventory manager which owns the original sender.
-        // We just expose a dummy sender here that's not connected to the rx.
-        // Instead, the controller's target_position sender is separate.
         let (target_tx, _) = watch::channel(0.0);
 
         let params = WatchParams {
             target_position_usd: target_rx,
-            half_spread_bps: spread_rx,
             order_notional_usd: size_rx,
             max_position_usd: max_rx,
             enabled: en_rx,
@@ -254,7 +263,6 @@ impl WatchParams {
 
         let controller = WatchParamController {
             target_position_usd: target_tx,
-            half_spread_bps: spread_tx,
             order_notional_usd: size_tx,
             max_position_usd: max_tx,
             enabled: en_tx,
@@ -267,10 +275,6 @@ impl WatchParams {
 impl MmParamSource for WatchParams {
     fn target_position_usd(&self) -> f64 {
         *self.target_position_usd.borrow()
-    }
-
-    fn half_spread_bps(&self) -> f64 {
-        *self.half_spread_bps.borrow()
     }
 
     fn order_notional_usd(&self) -> f64 {
