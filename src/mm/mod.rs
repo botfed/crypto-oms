@@ -287,6 +287,12 @@ impl MmEngine {
                         .map(|t| t.elapsed() >= Duration::from_secs(self.config.warmup_secs))
                         .unwrap_or(false);
 
+                    // ── STATUS LOG (checked every spin, not just on new data) ──
+                    if self.last_status_log.elapsed() >= Duration::from_secs(1) {
+                        self.log_status();
+                        self.last_status_log = Instant::now();
+                    }
+
                     // ── CHECK FOR NEW DATA: skip if ref feed hasn't updated ──
                     let wc = self.fair_price.ref_write_count(ExchangeId::Hyperliquid, self.hl_symbol_id);
                     if wc == self.last_ref_wc {
@@ -357,11 +363,6 @@ impl MmEngine {
                         self.latency.record(latency::METRIC_TICK_FAST, tick_start.elapsed().as_nanos() as u64);
                     }
 
-                    // ── STATUS LOG (1/sec) ──
-                    if self.last_status_log.elapsed() >= Duration::from_secs(1) {
-                        self.log_status();
-                        self.last_status_log = Instant::now();
-                    }
                 }
             }
         }
