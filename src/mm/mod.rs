@@ -31,6 +31,7 @@ pub mod latency {
     pub const METRIC_VOL: u8 = 3;
     pub const METRIC_TICK_SLOW: u8 = 4;
     pub const METRIC_T2T: u8 = 5;
+    pub const METRIC_SIGN: u8 = 6;
 
     // File layout
     pub const HEADER_SIZE: usize = 64;
@@ -525,8 +526,12 @@ impl MmEngine {
                     "fast cancel bid cid={} price={:.6} ({:.1}bps inside)",
                     q.client_id.0, q.price, drift_bps
                 );
+                #[cfg(feature = "profiling")]
+                let sign_start = Instant::now();
                 match self.oms.sign_cancel_order(&q.client_id) {
                     Ok(signed) => {
+                        #[cfg(feature = "profiling")]
+                        self.latency.record(latency::METRIC_SIGN, sign_start.elapsed().as_nanos() as u64);
                         let oms = Arc::clone(&self.oms);
                         let cid = q.client_id;
                         #[cfg(feature = "profiling")]
@@ -557,8 +562,12 @@ impl MmEngine {
                     "fast cancel ask cid={} price={:.6} ({:.1}bps inside)",
                     q.client_id.0, q.price, drift_bps
                 );
+                #[cfg(feature = "profiling")]
+                let sign_start = Instant::now();
                 match self.oms.sign_cancel_order(&q.client_id) {
                     Ok(signed) => {
+                        #[cfg(feature = "profiling")]
+                        self.latency.record(latency::METRIC_SIGN, sign_start.elapsed().as_nanos() as u64);
                         let oms = Arc::clone(&self.oms);
                         let cid = q.client_id;
                         #[cfg(feature = "profiling")]
