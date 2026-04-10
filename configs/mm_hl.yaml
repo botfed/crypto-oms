@@ -67,7 +67,7 @@ strategy:
   max_feed_age_ms: 10000
   stray_order_age_ms: 6000
   factor_model:
-    enabled: false
+    enabled: true
     factors:
       - symbol: PERP_ETH_USDT
         exchanges: [binance]
