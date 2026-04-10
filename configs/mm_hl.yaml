@@ -4,6 +4,8 @@ hyperliquid:
 
 perp:
   binance: [BTC_USDT, AIXBT_USDT]
+  okx: [BTC_USDT, AIXBT_USDT]
+  bybit: [BTC_USDT, AIXBT_USDT]
   hyperliquid: [BTC_USDC, AIXBT_USDC]
 
 sample_interval_ms: 10
