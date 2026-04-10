@@ -56,7 +56,7 @@ strategy:
   ref_min_spread_bps: 6
   ref_requote_tolerance_bps: 10.0
   max_skew_bps: 10.0
-  min_edge_bps: 3
+  min_edge_bps: 3.5
   ref_vol: 1.00
   vol_mult_floor: 0.3
   vol_mult_cap: 5.0
