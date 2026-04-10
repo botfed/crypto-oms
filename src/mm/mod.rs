@@ -522,7 +522,7 @@ impl MmEngine {
             );
             if can_cancel && q.price > fair - min_spread {
                 let drift_bps = (q.price - (fair - min_spread)) / fair * 10_000.0;
-                info!(
+                debug!(
                     "fast cancel bid cid={} price={:.6} ({:.1}bps inside)",
                     q.client_id.0, q.price, drift_bps
                 );
@@ -558,7 +558,7 @@ impl MmEngine {
             );
             if can_cancel && q.price < fair + min_spread {
                 let drift_bps = ((fair + min_spread) - q.price) / fair * 10_000.0;
-                info!(
+                debug!(
                     "fast cancel ask cid={} price={:.6} ({:.1}bps inside)",
                     q.client_id.0, q.price, drift_bps
                 );
