@@ -52,11 +52,11 @@ strategy:
   max_stale_ms: 2000
   order_notional_usd: 100.0
   max_position_usd: 10000.0
-  ref_half_spread_bps: 10
-  ref_min_spread_bps: 5
+  ref_half_spread_bps: 12
+  ref_min_spread_bps: 6
   ref_requote_tolerance_bps: 10.0
   max_skew_bps: 10.0
-  min_edge_bps: 2.5
+  min_edge_bps: 3
   ref_vol: 1.40
   vol_mult_floor: 0.3
   vol_mult_cap: 5.0
