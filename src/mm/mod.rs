@@ -532,11 +532,6 @@ impl MmEngine {
                         #[cfg(feature = "profiling")]
                         self.record_t2t();
                         if self.ghost {
-                            #[cfg(feature = "profiling")]
-                            info!(
-                                "[GHOST] would CANCEL bid cid={} price={:.6} (inside min_spread {:.1}bps)",
-                                q.client_id.0, q.price, drift_bps,
-                            );
                             self.bid_quote = None;
                         } else {
                             tokio::spawn(async move {
@@ -558,31 +553,25 @@ impl MmEngine {
             );
             if can_cancel && q.price < fair + min_spread {
                 let drift_bps = ((fair + min_spread) - q.price) / fair * 10_000.0;
-                if self.ghost {
-                    #[cfg(feature = "profiling")]
-                    self.record_t2t();
-                    info!(
-                        "[GHOST] would CANCEL ask cid={} price={:.6} (inside min_spread {:.1}bps)",
-                        q.client_id.0, q.price, drift_bps,
-                    );
-                    self.ask_quote = None;
-                } else {
-                    info!(
-                        "fast cancel ask cid={} price={:.6} ({:.1}bps inside)",
-                        q.client_id.0, q.price, drift_bps
-                    );
-                    match self.oms.sign_cancel_order(&q.client_id) {
-                        Ok(signed) => {
-                            #[cfg(feature = "profiling")]
-                            self.record_t2t();
-                            let oms = Arc::clone(&self.oms);
-                            let cid = q.client_id;
+                info!(
+                    "fast cancel ask cid={} price={:.6} ({:.1}bps inside)",
+                    q.client_id.0, q.price, drift_bps
+                );
+                match self.oms.sign_cancel_order(&q.client_id) {
+                    Ok(signed) => {
+                        let oms = Arc::clone(&self.oms);
+                        let cid = q.client_id;
+                        #[cfg(feature = "profiling")]
+                        self.record_t2t();
+                        if self.ghost {
+                            self.ask_quote = None;
+                        } else {
                             tokio::spawn(async move {
                                 oms.post_cancel_order(&cid, signed).await;
                             });
                         }
-                        Err(e) => warn!("failed to sign cancel ask {}: {e}", q.client_id.0),
                     }
+                    Err(e) => warn!("failed to sign cancel ask {}: {e}", q.client_id.0),
                 }
             }
         }
