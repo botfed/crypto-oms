@@ -196,6 +196,30 @@ pub struct StrategyConfig {
     /// Warmup period in seconds before placing first quotes (let EWMA settle)
     #[serde(default = "default_warmup_secs")]
     pub warmup_secs: u64,
+    /// Optional multi-factor correlation model for fair price adjustment
+    #[serde(default)]
+    pub factor_model: Option<FactorModelConfig>,
+}
+
+// ---------------------------------------------------------------------------
+// Factor model config (cross-instrument correlation)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FactorModelConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub factors: Vec<FactorConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FactorConfig {
+    /// Factor symbol, e.g. "PERP_ETH_USDC"
+    pub symbol: String,
+    /// Exchanges to listen for this factor (picks freshest mid)
+    pub exchanges: Vec<String>,
+    /// Beta coefficient from regression
+    pub beta: f64,
 }
 
 fn default_max_skew() -> f64 { 5.0 }

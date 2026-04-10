@@ -3,10 +3,10 @@ hyperliquid:
   inflight_timeout_ms: 5000
 
 perp:
-  binance: [BTC_USDT, AIXBT_USDT]
-  okx: [BTC_USDT, AIXBT_USDT]
-  bybit: [BTC_USDT, AIXBT_USDT]
-  hyperliquid: [BTC_USDC, AIXBT_USDC]
+  binance: [ETH_USDT, AIXBT_USDT]
+  okx: [AIXBT_USDT]
+  bybit: [AIXBT_USDT]
+  hyperliquid: [AIXBT_USDC]
 
 sample_interval_ms: 10
 
@@ -66,3 +66,9 @@ strategy:
   warmup_secs: 10
   max_feed_age_ms: 10000
   stray_order_age_ms: 6000
+  factor_model:
+    enabled: false
+    factors:
+      - symbol: PERP_ETH_USDT
+        exchanges: [binance]
+        beta: 0.97

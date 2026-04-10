@@ -350,7 +350,7 @@ impl FairPriceEngine {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn parse_exchange_id(s: &str) -> anyhow::Result<ExchangeId> {
+pub(crate) fn parse_exchange_id(s: &str) -> anyhow::Result<ExchangeId> {
     match s.to_lowercase().as_str() {
         "binance" => Ok(ExchangeId::Binance),
         "bybit" => Ok(ExchangeId::Bybit),
