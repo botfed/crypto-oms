@@ -8,18 +8,17 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use oms_core::*;
 use tokio::sync::{Notify, broadcast};
-use tracing::{info, warn, debug};
+use tracing::{debug, info, warn};
 
 use crate::hyperliquid::HyperliquidOms;
 use config::{MmParamSource, StrategyConfig};
-use fair_price::{ExchangeId, FairPriceEngine};
-use crypto_feeds::symbol_registry::{REGISTRY, SymbolId};
 use crypto_feeds::market_data::InstrumentType;
+use crypto_feeds::symbol_registry::{REGISTRY, SymbolId};
+use fair_price::{ExchangeId, FairPriceEngine};
 
 // ---------------------------------------------------------------------------
 // Latency profiling (compiled in with --features profiling)
 // ---------------------------------------------------------------------------
-
 
 #[cfg(feature = "profiling")]
 pub mod latency {
@@ -58,18 +57,22 @@ pub mod latency {
     /// Spawns a background task that flushes samples to mmap every 10s.
     pub fn init(shutdown: Arc<tokio::sync::Notify>) -> LatencyRecorder {
         let buf: Arc<Mutex<Vec<(u8, u64)>>> = Arc::new(Mutex::new(Vec::with_capacity(500_000)));
-        let recorder = LatencyRecorder { buf: Arc::clone(&buf) };
+        let recorder = LatencyRecorder {
+            buf: Arc::clone(&buf),
+        };
 
         // Create/open the mmap file
         let file = std::fs::OpenOptions::new()
-            .read(true).write(true).create(true)
+            .read(true)
+            .write(true)
+            .create(true)
             .open(LATENCY_PATH)
             .expect("failed to open latency mmap file");
-        file.set_len(FILE_SIZE as u64).expect("failed to set latency file size");
+        file.set_len(FILE_SIZE as u64)
+            .expect("failed to set latency file size");
 
-        let mut mmap = unsafe {
-            memmap2::MmapMut::map_mut(&file).expect("failed to mmap latency file")
-        };
+        let mut mmap =
+            unsafe { memmap2::MmapMut::map_mut(&file).expect("failed to mmap latency file") };
 
         // Reset file on startup — fresh session
         mmap.fill(0);
@@ -99,17 +102,15 @@ pub mod latency {
         recorder
     }
 
-    fn flush(
-        buf: &Mutex<Vec<(u8, u64)>>,
-        mmap: &mut memmap2::MmapMut,
-        write_pos: &mut u64,
-    ) {
+    fn flush(buf: &Mutex<Vec<(u8, u64)>>, mmap: &mut memmap2::MmapMut, write_pos: &mut u64) {
         let samples = {
             let mut guard = buf.lock();
             std::mem::replace(&mut *guard, Vec::with_capacity(500_000))
         };
 
-        if samples.is_empty() { return; }
+        if samples.is_empty() {
+            return;
+        }
 
         let cap = CAPACITY as u64;
         for (metric, value) in &samples {
@@ -174,8 +175,8 @@ pub struct MmEngine {
     last_status_log: Instant,
     running_since: Option<Instant>,
     consecutive_rejects: u32,
-    last_ref_wc: u64,            // track seqlock write count to detect new ticks
-    last_exchange_ts_ms: i64,    // skip ticks with older exchange_ts
+    last_ref_wc: u64,         // track seqlock write count to detect new ticks
+    last_exchange_ts_ms: i64, // skip ticks with older exchange_ts
     #[cfg(feature = "profiling")]
     latency: latency::LatencyRecorder,
 }
@@ -200,7 +201,8 @@ impl MmEngine {
         } else {
             InstrumentType::Spot
         };
-        let base = config.symbol
+        let base = config
+            .symbol
             .strip_prefix("PERP_")
             .or_else(|| config.symbol.strip_prefix("SPOT_"))
             .unwrap_or(&config.symbol);
@@ -394,10 +396,14 @@ impl MmEngine {
         }
 
         // Check fair price is available
-        let fp = self.fair_price.get_fair_price(ExchangeId::Hyperliquid, self.hl_symbol_id);
+        let fp = self
+            .fair_price
+            .get_fair_price(ExchangeId::Hyperliquid, self.hl_symbol_id);
         if fp.is_none() {
             if should_log {
-                let basis = self.fair_price.get_basis(ExchangeId::Hyperliquid, self.hl_symbol_id);
+                let basis = self
+                    .fair_price
+                    .get_basis(ExchangeId::Hyperliquid, self.hl_symbol_id);
                 warn!(
                     "waiting: no fair price (basis={:?}, check feeds for ref symbol)",
                     basis,
@@ -408,10 +414,16 @@ impl MmEngine {
         }
 
         // Check feed is alive (engine-level — feed completely dead)
-        if let Some(age_ms) = self.fair_price.get_ref_age_ms(ExchangeId::Hyperliquid, self.hl_symbol_id) {
+        if let Some(age_ms) = self
+            .fair_price
+            .get_ref_age_ms(ExchangeId::Hyperliquid, self.hl_symbol_id)
+        {
             if age_ms > self.config.max_feed_age_ms as i64 {
                 if should_log {
-                    warn!("paused: reference feed dead (age={}ms > {}ms)", age_ms, self.config.max_feed_age_ms);
+                    warn!(
+                        "paused: reference feed dead (age={}ms > {}ms)",
+                        age_ms, self.config.max_feed_age_ms
+                    );
                     self.last_status_log = Instant::now();
                 }
                 return false;
@@ -428,10 +440,15 @@ impl MmEngine {
     fn sync_quote_state(&mut self) {
         if let Some(ref mut q) = self.bid_quote {
             match self.oms.get_order(&q.client_id) {
-                Some(h) if matches!(
-                    h.state,
-                    OrderState::Accepted | OrderState::PartiallyFilled | OrderState::Inflight | OrderState::Cancelling
-                ) => {
+                Some(h)
+                    if matches!(
+                        h.state,
+                        OrderState::Accepted
+                            | OrderState::PartiallyFilled
+                            | OrderState::Inflight
+                            | OrderState::Cancelling
+                    ) =>
+                {
                     if q.exchange_id.is_none() && h.exchange_id.is_some() {
                         q.exchange_id = h.exchange_id.clone();
                     }
@@ -439,24 +456,35 @@ impl MmEngine {
                     q.size = h.size - h.filled_size;
                 }
                 _ => {
-                    debug!("bid quote {} no longer active, clearing tracker", q.client_id.0);
+                    debug!(
+                        "bid quote {} no longer active, clearing tracker",
+                        q.client_id.0
+                    );
                     self.bid_quote = None;
                 }
             }
         }
         if let Some(ref mut q) = self.ask_quote {
             match self.oms.get_order(&q.client_id) {
-                Some(h) if matches!(
-                    h.state,
-                    OrderState::Accepted | OrderState::PartiallyFilled | OrderState::Inflight | OrderState::Cancelling
-                ) => {
+                Some(h)
+                    if matches!(
+                        h.state,
+                        OrderState::Accepted
+                            | OrderState::PartiallyFilled
+                            | OrderState::Inflight
+                            | OrderState::Cancelling
+                    ) =>
+                {
                     if q.exchange_id.is_none() && h.exchange_id.is_some() {
                         q.exchange_id = h.exchange_id.clone();
                     }
                     q.size = h.size - h.filled_size;
                 }
                 _ => {
-                    debug!("ask quote {} no longer active, clearing tracker", q.client_id.0);
+                    debug!(
+                        "ask quote {} no longer active, clearing tracker",
+                        q.client_id.0
+                    );
                     self.ask_quote = None;
                 }
             }
@@ -472,39 +500,51 @@ impl MmEngine {
             return;
         }
 
-        let Some(fair) = self.fair_price.get_fair_price(ExchangeId::Hyperliquid, self.hl_symbol_id) else {
+        let Some(fair) = self
+            .fair_price
+            .get_fair_price(ExchangeId::Hyperliquid, self.hl_symbol_id)
+        else {
             return;
         };
 
         let vol_mult = self.get_vol_multiplier();
         let min_edge = self.config.min_edge_bps * fair / 10_000.0;
-        let min_spread = (self.config.ref_min_spread_bps * vol_mult * fair / 10_000.0).max(min_edge);
+        let min_spread =
+            (self.config.ref_min_spread_bps * vol_mult * fair / 10_000.0).max(min_edge);
 
         // Check bid: inside min_spread from fair?
         if let Some(ref q) = self.bid_quote {
             let state = self.oms.get_order(&q.client_id).map(|h| h.state);
-            let can_cancel = matches!(state, Some(OrderState::Accepted) | Some(OrderState::PartiallyFilled));
+            let can_cancel = matches!(
+                state,
+                Some(OrderState::Accepted) | Some(OrderState::PartiallyFilled)
+            );
             if can_cancel && q.price > fair - min_spread {
                 let drift_bps = (q.price - (fair - min_spread)) / fair * 10_000.0;
-                #[cfg(feature = "profiling")]
-                self.record_t2t();
-                if self.ghost {
-                    info!(
-                        "[GHOST] would CANCEL bid cid={} price={:.6} (inside min_spread {:.1}bps)",
-                        q.client_id.0, q.price, drift_bps,
-                    );
-                    self.bid_quote = None;
-                } else {
-                    info!("fast cancel bid cid={} price={:.6} ({:.1}bps inside)", q.client_id.0, q.price, drift_bps);
-                    let oms = Arc::clone(&self.oms);
-                    let cid = q.client_id;
-                    tokio::spawn(async move {
-                        if let Err(e) = oms.cancel_order(&cid).await {
-                            warn!("failed to cancel bid {}: {e}", cid.0);
+                info!(
+                    "fast cancel bid cid={} price={:.6} ({:.1}bps inside)",
+                    q.client_id.0, q.price, drift_bps
+                );
+                match self.oms.sign_cancel_order(&q.client_id) {
+                    Ok(signed) => {
+                        let oms = Arc::clone(&self.oms);
+                        let cid = q.client_id;
+                        #[cfg(feature = "profiling")]
+                        self.record_t2t();
+                        if self.ghost {
+                            #[cfg(feature = "profiling")]
+                            info!(
+                                "[GHOST] would CANCEL bid cid={} price={:.6} (inside min_spread {:.1}bps)",
+                                q.client_id.0, q.price, drift_bps,
+                            );
+                            self.bid_quote = None;
+                        } else {
+                            tokio::spawn(async move {
+                                oms.post_cancel_order(&cid, signed).await;
+                            });
                         }
-                    });
-                    // OMS marks Cancelling synchronously inside cancel_order before the HTTP call
-                    // sync_quote_state will see Cancelling → keeps tracker → no new place until confirmed
+                    }
+                    Err(e) => warn!("failed to sign cancel bid {}: {e}", q.client_id.0),
                 }
             }
         }
@@ -512,26 +552,37 @@ impl MmEngine {
         // Check ask: inside min_spread from fair?
         if let Some(ref q) = self.ask_quote {
             let state = self.oms.get_order(&q.client_id).map(|h| h.state);
-            let can_cancel = matches!(state, Some(OrderState::Accepted) | Some(OrderState::PartiallyFilled));
+            let can_cancel = matches!(
+                state,
+                Some(OrderState::Accepted) | Some(OrderState::PartiallyFilled)
+            );
             if can_cancel && q.price < fair + min_spread {
                 let drift_bps = ((fair + min_spread) - q.price) / fair * 10_000.0;
-                #[cfg(feature = "profiling")]
-                self.record_t2t();
                 if self.ghost {
+                    #[cfg(feature = "profiling")]
+                    self.record_t2t();
                     info!(
                         "[GHOST] would CANCEL ask cid={} price={:.6} (inside min_spread {:.1}bps)",
                         q.client_id.0, q.price, drift_bps,
                     );
                     self.ask_quote = None;
                 } else {
-                    info!("fast cancel ask cid={} price={:.6} ({:.1}bps inside)", q.client_id.0, q.price, drift_bps);
-                    let oms = Arc::clone(&self.oms);
-                    let cid = q.client_id;
-                    tokio::spawn(async move {
-                        if let Err(e) = oms.cancel_order(&cid).await {
-                            warn!("failed to cancel ask {}: {e}", cid.0);
+                    info!(
+                        "fast cancel ask cid={} price={:.6} ({:.1}bps inside)",
+                        q.client_id.0, q.price, drift_bps
+                    );
+                    match self.oms.sign_cancel_order(&q.client_id) {
+                        Ok(signed) => {
+                            #[cfg(feature = "profiling")]
+                            self.record_t2t();
+                            let oms = Arc::clone(&self.oms);
+                            let cid = q.client_id;
+                            tokio::spawn(async move {
+                                oms.post_cancel_order(&cid, signed).await;
+                            });
                         }
-                    });
+                        Err(e) => warn!("failed to sign cancel ask {}: {e}", q.client_id.0),
+                    }
                 }
             }
         }
@@ -546,7 +597,10 @@ impl MmEngine {
         self.cancel_stray_orders();
 
         // Staleness check — don't place on stale data
-        let Some((fair, _, recv_age_ns, _)) = self.fair_price.get_fair_price_with_age(ExchangeId::Hyperliquid, self.hl_symbol_id) else {
+        let Some((fair, _, recv_age_ns, _)) = self
+            .fair_price
+            .get_fair_price_with_age(ExchangeId::Hyperliquid, self.hl_symbol_id)
+        else {
             return;
         };
         if (recv_age_ns / 1_000_000) as i64 > self.config.max_stale_ms as i64 {
@@ -561,7 +615,8 @@ impl MmEngine {
 
         let vol_mult = self.get_vol_multiplier();
         let min_edge = self.config.min_edge_bps * fair / 10_000.0;
-        let half_spread = (self.config.ref_half_spread_bps * vol_mult * fair / 10_000.0).max(min_edge);
+        let half_spread =
+            (self.config.ref_half_spread_bps * vol_mult * fair / 10_000.0).max(min_edge);
         let requote_thresh = self.config.ref_requote_tolerance_bps * vol_mult * fair / 10_000.0;
 
         let skewed_mid = self.compute_skewed_mid(fair, position, target, max_pos);
@@ -580,20 +635,22 @@ impl MmEngine {
 
         // Bid: cancel if too passive (outer side) or shouldn't quote
         if let Some(ref q) = self.bid_quote {
-            let should_cancel = !want_bid
-                || (desired_bid - q.price) > requote_thresh; // bid too LOW = too passive
+            let should_cancel = !want_bid || (desired_bid - q.price) > requote_thresh; // bid too LOW = too passive
 
             if should_cancel {
                 // Don't cancel inflight (no exchange OID yet)
-                let skip_cancel = self.oms.get_order(&q.client_id)
+                let skip_cancel = self
+                    .oms
+                    .get_order(&q.client_id)
                     .map(|h| matches!(h.state, OrderState::Inflight | OrderState::Cancelling))
                     .unwrap_or(false);
 
                 if !skip_cancel {
-                    #[cfg(feature = "profiling")]
-                    self.record_t2t();
                     if self.ghost {
-                        info!("[GHOST] would CANCEL bid cid={} price={:.6} (slow path requote)", q.client_id.0, q.price);
+                        info!(
+                            "[GHOST] would CANCEL bid cid={} price={:.6} (slow path requote)",
+                            q.client_id.0, q.price
+                        );
                         self.bid_quote = None;
                     } else {
                         debug!("slow cancel bid cid={} price={:.6}", q.client_id.0, q.price);
@@ -611,19 +668,21 @@ impl MmEngine {
 
         // Ask: cancel if too passive or shouldn't quote
         if let Some(ref q) = self.ask_quote {
-            let should_cancel = !want_ask
-                || (q.price - desired_ask) > requote_thresh; // ask too HIGH = too passive
+            let should_cancel = !want_ask || (q.price - desired_ask) > requote_thresh; // ask too HIGH = too passive
 
             if should_cancel {
-                let skip_cancel = self.oms.get_order(&q.client_id)
+                let skip_cancel = self
+                    .oms
+                    .get_order(&q.client_id)
                     .map(|h| matches!(h.state, OrderState::Inflight | OrderState::Cancelling))
                     .unwrap_or(false);
 
                 if !skip_cancel {
-                    #[cfg(feature = "profiling")]
-                    self.record_t2t();
                     if self.ghost {
-                        info!("[GHOST] would CANCEL ask cid={} price={:.6} (slow path requote)", q.client_id.0, q.price);
+                        info!(
+                            "[GHOST] would CANCEL ask cid={} price={:.6} (slow path requote)",
+                            q.client_id.0, q.price
+                        );
                         self.ask_quote = None;
                     } else {
                         debug!("slow cancel ask cid={} price={:.6}", q.client_id.0, q.price);
@@ -644,76 +703,79 @@ impl MmEngine {
         // before the HTTP call, so we can grab the cid and set the tracker immediately.
         // sync_quote_state sees Inflight → keeps tracker alive until Accepted/Rejected.
 
-        if self.bid_quote.is_none() && want_bid && self.ghost {
-            #[cfg(feature = "profiling")]
-            self.record_t2t();
-        }
+        if self.bid_quote.is_none() && want_bid && self.ghost {}
         if self.bid_quote.is_none() && want_bid && !self.ghost {
-            let tif = if self.config.post_only { TimeInForce::PostOnly } else { TimeInForce::GTC };
+            let tif = if self.config.post_only {
+                TimeInForce::PostOnly
+            } else {
+                TimeInForce::GTC
+            };
             let req = OrderRequest {
                 symbol: self.config.symbol.clone(),
                 side: Side::Buy,
-                order_type: OrderType::Limit { price: desired_bid, tif },
+                order_type: OrderType::Limit {
+                    price: desired_bid,
+                    tif,
+                },
                 size: order_size,
                 reduce_only: false,
             };
             match self.oms.prepare_place_order(&req) {
-                Ok((cid, sdk_req)) => {
-                    match self.oms.sign_place_order(sdk_req) {
-                        Ok(signed) => {
-                            info!("placing bid cid={} price={:.6}", cid.0, desired_bid);
-                            self.bid_quote = Some(LiveQuote {
-                                client_id: cid,
-                                exchange_id: None,
-                                price: desired_bid,
-                                size: order_size,
-                                placed_at: Instant::now(),
-                            });
-                            #[cfg(feature = "profiling")]
-                            self.record_t2t();
-                            let oms = Arc::clone(&self.oms);
-                            tokio::spawn(async move {
-                                oms.post_place_order(cid.0, signed).await;
-                            });
-                        }
-                        Err(e) => warn!("failed to sign bid: {e}"),
+                Ok((cid, sdk_req)) => match self.oms.sign_place_order(sdk_req) {
+                    Ok(signed) => {
+                        info!("placing bid cid={} price={:.6}", cid.0, desired_bid);
+                        self.bid_quote = Some(LiveQuote {
+                            client_id: cid,
+                            exchange_id: None,
+                            price: desired_bid,
+                            size: order_size,
+                            placed_at: Instant::now(),
+                        });
+                        let oms = Arc::clone(&self.oms);
+                        tokio::spawn(async move {
+                            oms.post_place_order(cid.0, signed).await;
+                        });
                     }
-                }
+                    Err(e) => warn!("failed to sign bid: {e}"),
+                },
                 Err(e) => warn!("failed to prepare bid: {e}"),
             }
         }
 
         if self.ask_quote.is_none() && want_ask && !self.ghost {
-            let tif = if self.config.post_only { TimeInForce::PostOnly } else { TimeInForce::GTC };
+            let tif = if self.config.post_only {
+                TimeInForce::PostOnly
+            } else {
+                TimeInForce::GTC
+            };
             let req = OrderRequest {
                 symbol: self.config.symbol.clone(),
                 side: Side::Sell,
-                order_type: OrderType::Limit { price: desired_ask, tif },
+                order_type: OrderType::Limit {
+                    price: desired_ask,
+                    tif,
+                },
                 size: order_size,
                 reduce_only: false,
             };
             match self.oms.prepare_place_order(&req) {
-                Ok((cid, sdk_req)) => {
-                    match self.oms.sign_place_order(sdk_req) {
-                        Ok(signed) => {
-                            info!("placing ask cid={} price={:.6}", cid.0, desired_ask);
-                            self.ask_quote = Some(LiveQuote {
-                                client_id: cid,
-                                exchange_id: None,
-                                price: desired_ask,
-                                size: order_size,
-                                placed_at: Instant::now(),
-                            });
-                            #[cfg(feature = "profiling")]
-                            self.record_t2t();
-                            let oms = Arc::clone(&self.oms);
-                            tokio::spawn(async move {
-                                oms.post_place_order(cid.0, signed).await;
-                            });
-                        }
-                        Err(e) => warn!("failed to sign ask: {e}"),
+                Ok((cid, sdk_req)) => match self.oms.sign_place_order(sdk_req) {
+                    Ok(signed) => {
+                        info!("placing ask cid={} price={:.6}", cid.0, desired_ask);
+                        self.ask_quote = Some(LiveQuote {
+                            client_id: cid,
+                            exchange_id: None,
+                            price: desired_ask,
+                            size: order_size,
+                            placed_at: Instant::now(),
+                        });
+                        let oms = Arc::clone(&self.oms);
+                        tokio::spawn(async move {
+                            oms.post_place_order(cid.0, signed).await;
+                        });
                     }
-                }
+                    Err(e) => warn!("failed to sign ask: {e}"),
+                },
                 Err(e) => warn!("failed to prepare ask: {e}"),
             }
         }
@@ -729,7 +791,11 @@ impl MmEngine {
         if diff.abs() < 1e-12 {
             return fair_value;
         }
-        let denom = if target.abs() > 1e-12 { target.abs() } else { max_pos };
+        let denom = if target.abs() > 1e-12 {
+            target.abs()
+        } else {
+            max_pos
+        };
         // raw ∈ [-ln(2), ln(2)] when diff ∈ [-denom, denom]
         // Normalize to [-1, 1] then scale by max_skew_bps
         let raw = diff.signum() * (1.0 + diff.abs() / denom).ln();
@@ -744,15 +810,18 @@ impl MmEngine {
     /// Record t2t: Utc::now() - received_ts of the winning feed, measured right now.
     #[cfg(feature = "profiling")]
     fn record_t2t(&self) {
-        if let Some((_, _, recv_age_ns, _)) = self.fair_price.get_fair_price_with_age(
-            ExchangeId::Hyperliquid, self.hl_symbol_id
-        ) {
+        if let Some((_, _, recv_age_ns, _)) = self
+            .fair_price
+            .get_fair_price_with_age(ExchangeId::Hyperliquid, self.hl_symbol_id)
+        {
             self.latency.record(latency::METRIC_T2T, recv_age_ns);
         }
     }
 
     fn get_vol_multiplier(&self) -> f64 {
-        let Some(ref ve) = self.vol_engine else { return 1.0; };
+        let Some(ref ve) = self.vol_engine else {
+            return 1.0;
+        };
         let preds = match ve.predict_now(&self.config.vol_symbol, &self.market_data) {
             Ok(p) => p,
             Err(_) => return 1.0,
@@ -767,10 +836,16 @@ impl MmEngine {
         if self.config.ref_vol <= 0.0 || predicted <= 0.0 {
             return 1.0;
         }
-        (predicted / self.config.ref_vol).clamp(self.config.vol_mult_floor, self.config.vol_mult_cap)
+        (predicted / self.config.ref_vol)
+            .clamp(self.config.vol_mult_floor, self.config.vol_mult_cap)
     }
 
-    fn clamp_to_fair(fair_value: f64, desired_bid: f64, desired_ask: f64, min_edge_bps: f64) -> (f64, f64) {
+    fn clamp_to_fair(
+        fair_value: f64,
+        desired_bid: f64,
+        desired_ask: f64,
+        min_edge_bps: f64,
+    ) -> (f64, f64) {
         let min_edge = min_edge_bps * fair_value / 10_000.0;
         (
             desired_bid.min(fair_value - min_edge),
@@ -783,11 +858,19 @@ impl MmEngine {
     // -----------------------------------------------------------------------
 
     fn log_status(&mut self) {
-        let fair = self.fair_price.get_fair_price(ExchangeId::Hyperliquid, self.hl_symbol_id);
-        let basis = self.fair_price.get_basis(ExchangeId::Hyperliquid, self.hl_symbol_id);
+        let fair = self
+            .fair_price
+            .get_fair_price(ExchangeId::Hyperliquid, self.hl_symbol_id);
+        let basis = self
+            .fair_price
+            .get_basis(ExchangeId::Hyperliquid, self.hl_symbol_id);
         let position = self.get_position();
-        let target = fair.map(|f| self.params.target_position_usd() / f).unwrap_or(0.0);
-        let max_pos = fair.map(|f| self.params.max_position_usd() / f).unwrap_or(0.0);
+        let target = fair
+            .map(|f| self.params.target_position_usd() / f)
+            .unwrap_or(0.0);
+        let max_pos = fair
+            .map(|f| self.params.max_position_usd() / f)
+            .unwrap_or(0.0);
 
         let basis_bps = match (basis, fair) {
             (Some(b), Some(f)) if f != 0.0 => b / f * 10_000.0,
@@ -802,19 +885,26 @@ impl MmEngine {
             0.0
         };
 
-        let bid_str = self.bid_quote.as_ref()
+        let bid_str = self
+            .bid_quote
+            .as_ref()
             .map(|q| format!("{:.6}", q.price))
             .unwrap_or_else(|| "-".into());
-        let ask_str = self.ask_quote.as_ref()
+        let ask_str = self
+            .ask_quote
+            .as_ref()
             .map(|q| format!("{:.6}", q.price))
             .unwrap_or_else(|| "-".into());
 
-        let (recv_age_ms, ref_feed) = self.fair_price
+        let (recv_age_ms, ref_feed) = self
+            .fair_price
             .get_fair_price_with_age(ExchangeId::Hyperliquid, self.hl_symbol_id)
             .map(|(_, _, recv_ns, feed)| ((recv_ns / 1_000_000) as i64, feed))
             .unwrap_or((-1, "none"));
 
-        let hl_mid = self.fair_price.get_mid(ExchangeId::Hyperliquid, self.hl_symbol_id);
+        let hl_mid = self
+            .fair_price
+            .get_mid(ExchangeId::Hyperliquid, self.hl_symbol_id);
         let residual_bps = match (hl_mid, fair) {
             (Some(hl), Some(f)) if f != 0.0 => (hl - f) / f * 10_000.0,
             _ => 0.0,
@@ -822,19 +912,26 @@ impl MmEngine {
 
         let vol_mult = self.get_vol_multiplier();
         let adj_min_bps = (self.config.ref_min_spread_bps * vol_mult).max(self.config.min_edge_bps);
-        let adj_spread_bps = (self.config.ref_half_spread_bps * vol_mult).max(self.config.min_edge_bps);
+        let adj_spread_bps =
+            (self.config.ref_half_spread_bps * vol_mult).max(self.config.min_edge_bps);
         let adj_requote_bps = self.config.ref_requote_tolerance_bps * vol_mult;
 
         // Get raw vol prediction for logging
-        let pred_vol_ann = self.vol_engine.as_ref().and_then(|ve| {
-            ve.predict_now(&self.config.vol_symbol, &self.market_data).ok()
-        }).map(|p| match self.vol_model_name.as_str() {
-            "har_ols" => p.har_ols,
-            "har_qlike" => p.har_qlike,
-            "garch" => p.garch,
-            "ewma" => p.ewma,
-            _ => p.har_qlike,
-        }).unwrap_or(0.0);
+        let pred_vol_ann = self
+            .vol_engine
+            .as_ref()
+            .and_then(|ve| {
+                ve.predict_now(&self.config.vol_symbol, &self.market_data)
+                    .ok()
+            })
+            .map(|p| match self.vol_model_name.as_str() {
+                "har_ols" => p.har_ols,
+                "har_qlike" => p.har_qlike,
+                "garch" => p.garch,
+                "ewma" => p.ewma,
+                _ => p.har_qlike,
+            })
+            .unwrap_or(0.0);
 
         info!(
             "status: fair={:.6} hl_mid={:.6} resid={:+.2}bps basis={:+.2}bps skew={:+.2}bps vol={:.1}% vmult={:.2} band=[{:.1},{:.1},{:.1}]bps pos={:+.6} target={:+.6} bid={} ask={} ref={}@{}ms",
@@ -963,10 +1060,20 @@ impl MmEngine {
     }
 
     fn clear_tracker(&mut self, cid: &ClientOrderId) {
-        if self.bid_quote.as_ref().map(|q| q.client_id == *cid).unwrap_or(false) {
+        if self
+            .bid_quote
+            .as_ref()
+            .map(|q| q.client_id == *cid)
+            .unwrap_or(false)
+        {
             self.bid_quote = None;
         }
-        if self.ask_quote.as_ref().map(|q| q.client_id == *cid).unwrap_or(false) {
+        if self
+            .ask_quote
+            .as_ref()
+            .map(|q| q.client_id == *cid)
+            .unwrap_or(false)
+        {
             self.ask_quote = None;
         }
     }
@@ -989,7 +1096,9 @@ impl MmEngine {
         let open = self.oms.open_orders(Some(&self.config.symbol));
         let min_age = Duration::from_millis(self.config.stray_order_age_ms);
 
-        let fair = self.fair_price.get_fair_price(ExchangeId::Hyperliquid, self.hl_symbol_id)
+        let fair = self
+            .fair_price
+            .get_fair_price(ExchangeId::Hyperliquid, self.hl_symbol_id)
             .unwrap_or(0.0);
 
         // Separate strays by side
@@ -1006,7 +1115,8 @@ impl MmEngine {
                 continue;
             }
             // Skip orders that are too recent
-            let old_enough = o.last_modified
+            let old_enough = o
+                .last_modified
                 .map(|t| t.elapsed() >= min_age)
                 .unwrap_or(true);
             if !old_enough {
@@ -1023,7 +1133,10 @@ impl MmEngine {
         if !stray_bids.is_empty() {
             if self.bid_quote.is_some() {
                 for o in &stray_bids {
-                    warn!("cancelling stray bid cid={} price={:?}", o.client_id.0, o.order_type);
+                    warn!(
+                        "cancelling stray bid cid={} price={:?}",
+                        o.client_id.0, o.order_type
+                    );
                     let oms = Arc::clone(&self.oms);
                     let cid = o.client_id;
                     tokio::spawn(async move {
@@ -1041,7 +1154,10 @@ impl MmEngine {
         if !stray_asks.is_empty() {
             if self.ask_quote.is_some() {
                 for o in &stray_asks {
-                    warn!("cancelling stray ask cid={} price={:?}", o.client_id.0, o.order_type);
+                    warn!(
+                        "cancelling stray ask cid={} price={:?}",
+                        o.client_id.0, o.order_type
+                    );
                     let oms = Arc::clone(&self.oms);
                     let cid = o.client_id;
                     tokio::spawn(async move {
@@ -1064,13 +1180,23 @@ impl MmEngine {
         }
 
         // Find the one closest to fair
-        let best_idx = strays.iter().enumerate()
+        let best_idx = strays
+            .iter()
+            .enumerate()
             .min_by(|(_, a), (_, b)| {
-                let price_a = match a.order_type { OrderType::Limit { price, .. } => price, _ => 0.0 };
-                let price_b = match b.order_type { OrderType::Limit { price, .. } => price, _ => 0.0 };
+                let price_a = match a.order_type {
+                    OrderType::Limit { price, .. } => price,
+                    _ => 0.0,
+                };
+                let price_b = match b.order_type {
+                    OrderType::Limit { price, .. } => price,
+                    _ => 0.0,
+                };
                 let dist_a = (price_a - fair).abs();
                 let dist_b = (price_b - fair).abs();
-                dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Equal)
+                dist_a
+                    .partial_cmp(&dist_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|(i, _)| i)
             .unwrap_or(0);
@@ -1078,9 +1204,14 @@ impl MmEngine {
         for (i, o) in strays.iter().enumerate() {
             if i == best_idx {
                 // Adopt this one
-                let price = match o.order_type { OrderType::Limit { price, .. } => price, _ => 0.0 };
-                info!("adopting stray {:?} cid={} price={:.6} as tracked quote",
-                    side, o.client_id.0, price);
+                let price = match o.order_type {
+                    OrderType::Limit { price, .. } => price,
+                    _ => 0.0,
+                };
+                info!(
+                    "adopting stray {:?} cid={} price={:.6} as tracked quote",
+                    side, o.client_id.0, price
+                );
                 let quote = LiveQuote {
                     client_id: o.client_id,
                     exchange_id: o.exchange_id.clone(),
@@ -1093,8 +1224,10 @@ impl MmEngine {
                     Side::Sell => self.ask_quote = Some(quote),
                 }
             } else {
-                warn!("cancelling duplicate {:?} cid={} price={:?}",
-                    side, o.client_id.0, o.order_type);
+                warn!(
+                    "cancelling duplicate {:?} cid={} price={:?}",
+                    side, o.client_id.0, o.order_type
+                );
                 let oms = Arc::clone(&self.oms);
                 let cid = o.client_id;
                 tokio::spawn(async move {

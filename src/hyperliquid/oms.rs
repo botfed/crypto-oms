@@ -989,6 +989,79 @@ impl HyperliquidOms {
             }
         }
     }
+    /// Sync: prepare + sign a cancel order. Marks Cancelling before returning.
+    pub fn sign_cancel_order(&self, id: &ClientOrderId) -> Result<SignedPayload> {
+        self.check_ready()?;
+
+        let handle = self.state.orders.get(&id.0)
+            .ok_or(OmsError::OrderNotFound(id.0))?;
+        let exchange_id = handle.exchange_id.as_ref()
+            .ok_or_else(|| OmsError::Internal("no exchange oid yet (still inflight)".into()))?;
+        let (asset_idx, _) = self.resolve_asset(&handle.symbol)?;
+        let oid: u64 = exchange_id.parse().unwrap_or(0);
+        drop(handle);
+
+        // Mark Cancelling immediately so the engine sees it
+        if let Some(mut h) = self.state.orders.get_mut(&id.0) {
+            h.state = OrderState::Cancelling;
+            h.last_modified = Some(Instant::now());
+        }
+
+        let ex = self.client.exchange();
+        let timestamp = hyperliquid_rust_sdk::next_nonce();
+
+        let action = hyperliquid_rust_sdk::Actions::Cancel(
+            hyperliquid_rust_sdk::BulkCancel {
+                cancels: vec![hyperliquid_rust_sdk::CancelRequest { asset: asset_idx, oid }],
+            }
+        );
+
+        let connection_id = action.hash(timestamp, ex.vault_address)
+            .map_err(|e| anyhow::anyhow!("action hash failed: {e}"))?;
+        let is_mainnet = ex.http_client.is_mainnet();
+        let signature = hyperliquid_rust_sdk::sign_l1_action(&ex.wallet, connection_id, is_mainnet)
+            .map_err(|e| anyhow::anyhow!("signing failed: {e}"))?;
+
+        Ok(SignedPayload { action, signature, timestamp })
+    }
+
+    /// Async: post a signed cancel and handle the response.
+    pub async fn post_cancel_order(&self, id: &ClientOrderId, signed: SignedPayload) {
+        let action_json = match serde_json::to_value(&signed.action) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("JSON serialize failed for cancel {}: {e}", id.0);
+                return;
+            }
+        };
+
+        let resp = match self.client.exchange()
+            .post(action_json, signed.signature, signed.timestamp).await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("cancel HTTP failed for {}: {e}, restoring to Accepted", id.0);
+                if let Some(mut h) = self.state.orders.get_mut(&id.0) {
+                    h.state = OrderState::Accepted;
+                    h.last_modified = Some(Instant::now());
+                }
+                return;
+            }
+        };
+
+        match resp {
+            hyperliquid_rust_sdk::ExchangeResponseStatus::Ok(_) => {
+                // Cancelling already set. REST poll will confirm.
+            }
+            hyperliquid_rust_sdk::ExchangeResponseStatus::Err(msg) => {
+                warn!("cancel rejected for {}: {msg}, restoring to Accepted", id.0);
+                if let Some(mut h) = self.state.orders.get_mut(&id.0) {
+                    h.state = OrderState::Accepted;
+                    h.last_modified = Some(Instant::now());
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1018,51 +1091,8 @@ impl ExchangeOms for HyperliquidOms {
 
 
     async fn cancel_order(&self, id: &ClientOrderId) -> Result<()> {
-        self.check_ready()?;
-
-        let handle = self
-            .state
-            .orders
-            .get(&id.0)
-            .ok_or(OmsError::OrderNotFound(id.0))?;
-
-        let exchange_id = handle
-            .exchange_id
-            .as_ref()
-            .ok_or_else(|| OmsError::Internal("no exchange oid yet (still inflight)".into()))?;
-
-        let (_asset_idx, asset_name) = self.resolve_asset(&handle.symbol)?;
-        let oid: u64 = exchange_id.parse().unwrap_or(0);
-        drop(handle);
-
-        // Mark Cancelling BEFORE the HTTP call so the engine sees it immediately
-        if let Some(mut h) = self.state.orders.get_mut(&id.0) {
-            h.state = OrderState::Cancelling;
-            h.last_modified = Some(Instant::now());
-        }
-
-        let cancel_req = ClientCancelRequest {
-            asset: asset_name,
-            oid,
-        };
-        let resp = self.client.exchange().cancel(cancel_req, None)
-            .await
-            .map_err(|e| anyhow::anyhow!("SDK cancel failed: {e}"))?;
-
-        match resp {
-            hyperliquid_rust_sdk::ExchangeResponseStatus::Ok(_) => {
-                // Already marked Cancelling above. REST poll will confirm.
-                // Don't emit OrderCancelled yet — wait for REST poll or WS confirmation
-            }
-            hyperliquid_rust_sdk::ExchangeResponseStatus::Err(msg) => {
-                warn!("cancel rejected for {}: {msg}, restoring to Accepted", id.0);
-                if let Some(mut h) = self.state.orders.get_mut(&id.0) {
-                    h.state = OrderState::Accepted;
-                    h.last_modified = Some(Instant::now());
-                }
-            }
-        }
-
+        let signed = self.sign_cancel_order(id)?;
+        self.post_cancel_order(id, signed).await;
         Ok(())
     }
 
