@@ -645,7 +645,7 @@ impl MmEngine {
 
                 if !skip_cancel {
                     if self.ghost {
-                        info!(
+                        debug!(
                             "[GHOST] would CANCEL bid cid={} price={:.6} (slow path requote)",
                             q.client_id.0, q.price
                         );
@@ -677,7 +677,7 @@ impl MmEngine {
 
                 if !skip_cancel {
                     if self.ghost {
-                        info!(
+                        debug!(
                             "[GHOST] would CANCEL ask cid={} price={:.6} (slow path requote)",
                             q.client_id.0, q.price
                         );
@@ -721,7 +721,7 @@ impl MmEngine {
             match self.oms.prepare_place_order(&req) {
                 Ok((cid, sdk_req)) => match self.oms.sign_place_order(sdk_req) {
                     Ok(signed) => {
-                        info!("placing bid cid={} price={:.6}", cid.0, desired_bid);
+                        debug!("placing bid cid={} price={:.6}", cid.0, desired_bid);
                         self.bid_quote = Some(LiveQuote {
                             client_id: cid,
                             exchange_id: None,
@@ -759,7 +759,7 @@ impl MmEngine {
             match self.oms.prepare_place_order(&req) {
                 Ok((cid, sdk_req)) => match self.oms.sign_place_order(sdk_req) {
                     Ok(signed) => {
-                        info!("placing ask cid={} price={:.6}", cid.0, desired_ask);
+                        debug!("placing ask cid={} price={:.6}", cid.0, desired_ask);
                         self.ask_quote = Some(LiveQuote {
                             client_id: cid,
                             exchange_id: None,
