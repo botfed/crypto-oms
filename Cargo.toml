@@ -8,6 +8,7 @@ edition = "2024"
 
 [features]
 profiling = []
+fast-sign = ["hyperliquid_rust_sdk/fast-sign"]
 
 [dependencies]
 oms-core = { path = "crates/oms-core" }
