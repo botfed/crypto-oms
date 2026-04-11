@@ -12,9 +12,9 @@ use tracing::{debug, info, warn};
 
 use crate::hyperliquid::HyperliquidOms;
 use config::{MmParamSource, StrategyConfig};
+use crypto_feeds::MarketDataCollection;
 use crypto_feeds::market_data::InstrumentType;
 use crypto_feeds::symbol_registry::{REGISTRY, SymbolId};
-use crypto_feeds::MarketDataCollection;
 use fair_price::{ExchangeId, FairPriceEngine, parse_exchange_id};
 
 // ---------------------------------------------------------------------------
@@ -177,7 +177,10 @@ struct TickSource {
     is_direct: bool,
 }
 
-fn collection_for(market_data: &crypto_feeds::AllMarketData, exchange: ExchangeId) -> &MarketDataCollection {
+fn collection_for(
+    market_data: &crypto_feeds::AllMarketData,
+    exchange: ExchangeId,
+) -> &MarketDataCollection {
     match exchange {
         ExchangeId::Binance => &market_data.binance,
         ExchangeId::Bybit => &market_data.bybit,
@@ -198,14 +201,19 @@ fn total_factor_wc(market_data: &crypto_feeds::AllMarketData, fm: &FactorModelSt
 }
 
 /// Get freshest mid across exchanges for a factor. Returns (mid, received_age_ns).
-fn factor_mid(market_data: &crypto_feeds::AllMarketData, factor: &FactorState) -> Option<(f64, u64)> {
+fn factor_mid(
+    market_data: &crypto_feeds::AllMarketData,
+    factor: &FactorState,
+) -> Option<(f64, u64)> {
     let now = chrono::Utc::now();
     let mut best: Option<(f64, u64)> = None;
     let mut best_recv_age = u64::MAX;
 
     for &ex in &factor.exchanges {
         let coll = collection_for(market_data, ex);
-        let Some(md) = coll.latest(&factor.symbol_id) else { continue };
+        let Some(md) = coll.latest(&factor.symbol_id) else {
+            continue;
+        };
         let Some(mid) = md.midquote() else { continue };
 
         let recv_age_ns = md
@@ -235,6 +243,7 @@ pub struct MmEngine {
     config: StrategyConfig,
     shutdown: Arc<Notify>,
     ghost: bool,
+    warmed_up: bool,
 
     bid_quote: Option<LiveQuote>,
     ask_quote: Option<LiveQuote>,
@@ -309,9 +318,9 @@ impl MmEngine {
                         .strip_prefix("PERP_")
                         .or_else(|| fc.symbol.strip_prefix("SPOT_"))
                         .unwrap_or(&fc.symbol);
-                    let symbol_id = *REGISTRY
-                        .lookup(base, &itype)
-                        .ok_or_else(|| anyhow::anyhow!("factor symbol not in registry: {}", fc.symbol))?;
+                    let symbol_id = *REGISTRY.lookup(base, &itype).ok_or_else(|| {
+                        anyhow::anyhow!("factor symbol not in registry: {}", fc.symbol)
+                    })?;
 
                     factors.push(FactorState {
                         symbol_id,
@@ -323,7 +332,12 @@ impl MmEngine {
                 info!(
                     "factor model enabled: {} factor(s) [{}]",
                     factors.len(),
-                    fm_cfg.factors.iter().map(|f| format!("{}@{:.3}", f.symbol, f.beta)).collect::<Vec<_>>().join(", "),
+                    fm_cfg
+                        .factors
+                        .iter()
+                        .map(|f| format!("{}@{:.3}", f.symbol, f.beta))
+                        .collect::<Vec<_>>()
+                        .join(", "),
                 );
                 Some(FactorModelState {
                     factors,
@@ -348,6 +362,7 @@ impl MmEngine {
             config,
             shutdown,
             ghost,
+            warmed_up: false,
             bid_quote: None,
             ask_quote: None,
             state: EngineState::Initializing,
@@ -490,15 +505,10 @@ impl MmEngine {
                         self.running_since = Some(Instant::now());
                     }
 
-                    let warmed_up = self.running_since
+                    self.warmed_up = self.running_since
                         .map(|t| t.elapsed() >= Duration::from_secs(self.config.warmup_secs))
                         .unwrap_or(false);
 
-                    // ── STATUS LOG (checked every spin, not just on new data) ──
-                    if self.last_status_log.elapsed() >= Duration::from_secs(1) {
-                        self.log_status();
-                        self.last_status_log = Instant::now();
-                    }
 
                     // ── CHECK FOR NEW DATA ──
                     #[cfg(feature = "profiling")]
@@ -518,7 +528,7 @@ impl MmEngine {
                     #[cfg(feature = "profiling")]
                     let tick_start = Instant::now();
                     #[cfg(feature = "profiling")]
-                    if warmed_up {
+                    if self.warmed_up {
                         self.latency.record(latency::METRIC_FAIR, fair_start.elapsed().as_nanos() as u64);
                         self.latency.record(latency::METRIC_T2D, tick.recv_age_ns);
                     }
@@ -540,16 +550,21 @@ impl MmEngine {
                     // ── FAST PATH: adverse cancel guard ──
                     self.fast_cancel_check(tick.fair);
 
+                    #[cfg(feature = "profiling")]
+                    if self.warmed_up {
+                        self.latency.record(latency::METRIC_TICK_FAST, tick_start.elapsed().as_nanos() as u64);
+                    }
+
                     // ── SLOW PATH (~quote_interval_ms): quote placement ──
                     let interval = Duration::from_millis(self.config.quote_interval_ms);
-                    if warmed_up && self.last_quote_eval.elapsed() >= interval {
+                    if self.warmed_up && self.last_quote_eval.elapsed() >= interval {
                         #[cfg(feature = "profiling")]
                         let vol_start = Instant::now();
 
                         self.evaluate_and_place_quotes(tick.fair);
 
                         #[cfg(feature = "profiling")]
-                        if warmed_up {
+                        if self.warmed_up {
                             self.latency.record(latency::METRIC_VOL, vol_start.elapsed().as_nanos() as u64);
                             self.latency.record(latency::METRIC_TICK_SLOW, tick_start.elapsed().as_nanos() as u64);
                         }
@@ -557,9 +572,10 @@ impl MmEngine {
                         self.last_quote_eval = Instant::now();
                     }
 
-                    #[cfg(feature = "profiling")]
-                    if warmed_up {
-                        self.latency.record(latency::METRIC_TICK_FAST, tick_start.elapsed().as_nanos() as u64);
+                    // ── STATUS LOG (checked every spin, not just on new data) ──
+                    if self.last_status_log.elapsed() >= Duration::from_secs(1) {
+                        self.log_status();
+                        self.last_status_log = Instant::now();
                     }
 
                 }
@@ -724,7 +740,8 @@ impl MmEngine {
                 match self.oms.sign_cancel_order(&q.client_id) {
                     Ok(signed) => {
                         #[cfg(feature = "profiling")]
-                        self.latency.record(latency::METRIC_SIGN, sign_start.elapsed().as_nanos() as u64);
+                        self.latency
+                            .record(latency::METRIC_SIGN, sign_start.elapsed().as_nanos() as u64);
                         let oms = Arc::clone(&self.oms);
                         let cid = q.client_id;
                         #[cfg(feature = "profiling")]
@@ -760,7 +777,8 @@ impl MmEngine {
                 match self.oms.sign_cancel_order(&q.client_id) {
                     Ok(signed) => {
                         #[cfg(feature = "profiling")]
-                        self.latency.record(latency::METRIC_SIGN, sign_start.elapsed().as_nanos() as u64);
+                        self.latency
+                            .record(latency::METRIC_SIGN, sign_start.elapsed().as_nanos() as u64);
                         let oms = Arc::clone(&self.oms);
                         let cid = q.client_id;
                         #[cfg(feature = "profiling")]
@@ -990,11 +1008,13 @@ impl MmEngine {
     /// Record t2t: Utc::now() - received_ts of the winning feed, measured right now.
     #[cfg(feature = "profiling")]
     fn record_t2t(&self) {
-        if let Some((_, _, recv_age_ns, _)) = self
-            .fair_price
-            .get_fair_price_with_age(ExchangeId::Hyperliquid, self.hl_symbol_id)
-        {
-            self.latency.record(latency::METRIC_T2T, recv_age_ns);
+        if self.warmed_up {
+            if let Some((_, _, recv_age_ns, _)) = self
+                .fair_price
+                .get_fair_price_with_age(ExchangeId::Hyperliquid, self.hl_symbol_id)
+            {
+                self.latency.record(latency::METRIC_T2T, recv_age_ns);
+            }
         }
     }
 
@@ -1478,8 +1498,8 @@ impl MmEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crypto_feeds::market_data::MarketData;
     use crypto_feeds::AllMarketData;
+    use crypto_feeds::market_data::MarketData;
 
     fn push_quote(
         md: &AllMarketData,
@@ -1553,12 +1573,16 @@ mod tests {
 
         // Snapshot: ETH at 2000
         push_quote(&md, ExchangeId::Binance, eth_id, 1999.5, 2000.5);
-        let (snapshot_mid, _) = factor_mid(&md, &FactorState {
-            symbol_id: eth_id,
-            exchanges: vec![ExchangeId::Binance],
-            beta,
-            snapshot_log_mid: 0.0,
-        }).unwrap();
+        let (snapshot_mid, _) = factor_mid(
+            &md,
+            &FactorState {
+                symbol_id: eth_id,
+                exchanges: vec![ExchangeId::Binance],
+                beta,
+                snapshot_log_mid: 0.0,
+            },
+        )
+        .unwrap();
 
         let snapshot_log_mid = snapshot_mid.ln();
         let direct_fair = 0.15; // AIXBT fair price at snapshot time
@@ -1610,23 +1634,35 @@ mod tests {
             symbol_id: eth_id,
             exchanges: vec![ExchangeId::Binance],
             beta: beta_eth,
-            snapshot_log_mid: factor_mid(&md, &FactorState {
-                symbol_id: eth_id,
-                exchanges: vec![ExchangeId::Binance],
-                beta: beta_eth,
-                snapshot_log_mid: 0.0,
-            }).unwrap().0.ln(),
+            snapshot_log_mid: factor_mid(
+                &md,
+                &FactorState {
+                    symbol_id: eth_id,
+                    exchanges: vec![ExchangeId::Binance],
+                    beta: beta_eth,
+                    snapshot_log_mid: 0.0,
+                },
+            )
+            .unwrap()
+            .0
+            .ln(),
         };
         let btc_factor = FactorState {
             symbol_id: btc_id,
             exchanges: vec![ExchangeId::Binance],
             beta: beta_btc,
-            snapshot_log_mid: factor_mid(&md, &FactorState {
-                symbol_id: btc_id,
-                exchanges: vec![ExchangeId::Binance],
-                beta: beta_btc,
-                snapshot_log_mid: 0.0,
-            }).unwrap().0.ln(),
+            snapshot_log_mid: factor_mid(
+                &md,
+                &FactorState {
+                    symbol_id: btc_id,
+                    exchanges: vec![ExchangeId::Binance],
+                    beta: beta_btc,
+                    snapshot_log_mid: 0.0,
+                },
+            )
+            .unwrap()
+            .0
+            .ln(),
         };
 
         let direct_fair = 0.15;
@@ -1678,12 +1714,16 @@ mod tests {
 
         push_quote(&md, ExchangeId::Binance, eth_id, 1999.5, 2000.5);
 
-        let (mid, _) = factor_mid(&md, &FactorState {
-            symbol_id: eth_id,
-            exchanges: vec![ExchangeId::Binance],
-            beta: 0.97,
-            snapshot_log_mid: 0.0,
-        }).unwrap();
+        let (mid, _) = factor_mid(
+            &md,
+            &FactorState {
+                symbol_id: eth_id,
+                exchanges: vec![ExchangeId::Binance],
+                beta: 0.97,
+                snapshot_log_mid: 0.0,
+            },
+        )
+        .unwrap();
 
         let snapshot_log = mid.ln();
 
