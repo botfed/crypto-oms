@@ -271,6 +271,7 @@ pub struct MmEngine {
     trigger_received_ts: Option<chrono::DateTime<chrono::Utc>>, // received_ts of the feed that triggered the current tick
     last_exchange_ts_ms: i64, // skip ticks with older exchange_ts
     factor_model: Option<FactorModelState>,
+    cached_vol_mult: f64,
     presigned_cancels: HashMap<ClientOrderId, SignedPayload>,
     #[cfg(feature = "profiling")]
     latency: latency::LatencyRecorder,
@@ -392,6 +393,7 @@ impl MmEngine {
             trigger_received_ts: None,
             last_exchange_ts_ms: 0,
             factor_model,
+            cached_vol_mult: 1.0,
             presigned_cancels: HashMap::new(),
             #[cfg(feature = "profiling")]
             latency,
@@ -769,10 +771,9 @@ impl MmEngine {
             return;
         }
 
-        let vol_mult = self.get_vol_multiplier();
         let min_edge = self.config.min_edge_bps * fair / 10_000.0;
         let min_spread =
-            (self.config.ref_min_spread_bps * vol_mult * fair / 10_000.0).max(min_edge);
+            (self.config.ref_min_spread_bps * self.cached_vol_mult * fair / 10_000.0).max(min_edge);
 
         // Check bid: inside min_spread from fair?
         if let Some(ref q) = self.bid_quote {
@@ -875,11 +876,11 @@ impl MmEngine {
         let order_size = notional / fair;
         let max_pos = self.params.max_position_usd() / fair;
 
-        let vol_mult = self.get_vol_multiplier();
+        self.cached_vol_mult = self.get_vol_multiplier();
         let min_edge = self.config.min_edge_bps * fair / 10_000.0;
         let half_spread =
-            (self.config.ref_half_spread_bps * vol_mult * fair / 10_000.0).max(min_edge);
-        let requote_thresh = self.config.ref_requote_tolerance_bps * vol_mult * fair / 10_000.0;
+            (self.config.ref_half_spread_bps * self.cached_vol_mult * fair / 10_000.0).max(min_edge);
+        let requote_thresh = self.config.ref_requote_tolerance_bps * self.cached_vol_mult * fair / 10_000.0;
 
         let skewed_mid = self.compute_skewed_mid(fair, position, target, max_pos);
         let (desired_bid, desired_ask) = Self::clamp_to_fair(
