@@ -14,6 +14,7 @@ use crypto_oms::mm::MmEngine;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Notify;
 use tracing::{info, warn};
@@ -57,12 +58,15 @@ async fn main() -> Result<()> {
         .context("HL_ACCOUNT_ADDRESS env var not set")?;
 
     let shutdown = Arc::new(Notify::new());
+    let engine_shutdown = Arc::new(AtomicBool::new(false));
 
     // Ctrl-C handler
     let sd = shutdown.clone();
+    let esd = engine_shutdown.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
         info!("Ctrl-C received, shutting down...");
+        esd.store(true, Ordering::Relaxed);
         sd.notify_waiters();
         tokio::time::sleep(Duration::from_secs(3)).await;
         warn!("graceful shutdown timed out, forcing exit");
@@ -177,7 +181,7 @@ async fn main() -> Result<()> {
     };
 
     // Run engine
-    let mut engine = MmEngine::new(
+    let engine = MmEngine::new(
         oms,
         fair_price,
         vol_engine,
@@ -186,7 +190,7 @@ async fn main() -> Result<()> {
         Box::new(params),
         config.strategy,
         ghost,
-        shutdown,
+        engine_shutdown,
     )?;
 
     engine.run().await?;

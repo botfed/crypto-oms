@@ -4,11 +4,12 @@ pub mod inventory;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use oms_core::*;
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use crate::hyperliquid::{HyperliquidOms, SignedPayload};
@@ -252,7 +253,7 @@ pub struct MmEngine {
     vol_model_name: String,
     params: Box<dyn MmParamSource>,
     config: StrategyConfig,
-    shutdown: Arc<Notify>,
+    shutdown: Arc<AtomicBool>,
     ghost: bool,
     warmed_up: bool,
 
@@ -290,7 +291,7 @@ impl MmEngine {
         params: Box<dyn MmParamSource>,
         config: StrategyConfig,
         ghost: bool,
-        shutdown: Arc<Notify>,
+        shutdown: Arc<AtomicBool>,
     ) -> Result<Self> {
         // Resolve the HL symbol to a SymbolId for fair price lookups
         let itype = if config.symbol.starts_with("PERP_") {
@@ -494,128 +495,130 @@ impl MmEngine {
     // Main loop — two cadences
     // -----------------------------------------------------------------------
 
-    pub async fn run(&mut self) -> Result<()> {
+    pub async fn run(mut self) -> Result<()> {
         info!(
             "MM engine starting: symbol={} ghost={} post_only={}",
             self.config.symbol, self.ghost, self.config.post_only,
         );
 
         self.oms.wait_ready().await?;
-        info!("OMS ready, entering main loop");
+        info!("OMS ready, entering main loop (dedicated thread)");
 
-        let shutdown = Arc::clone(&self.shutdown);
-        let shutdown_fut = shutdown.notified();
-        tokio::pin!(shutdown_fut);
+        tokio::task::spawn_blocking(move || self.spin_loop())
+            .await
+            .map_err(|e| anyhow::anyhow!("engine thread panicked: {e}"))?;
+        Ok(())
+    }
 
+    /// Hot loop on a dedicated OS thread — no tokio scheduling jitter.
+    fn spin_loop(&mut self) {
         loop {
-            tokio::select! {
-                _ = &mut shutdown_fut => {
-                    info!("MM engine shutting down");
-                    self.cancel_all_quotes();
-                    return Ok(());
-                }
-                _ = tokio::task::yield_now() => {
-                    self.drain_oms_events();
+            if self.shutdown.load(Ordering::Relaxed) {
+                info!("MM engine shutting down");
+                self.cancel_all_quotes();
+                return;
+            }
 
-                    if !self.check_preconditions() {
-                        if self.state == EngineState::Running {
-                            self.transition_to_paused();
+            self.drain_oms_events();
+
+            if !self.check_preconditions() {
+                if self.state == EngineState::Running {
+                    self.transition_to_paused();
+                }
+                // Brief sleep to avoid burning CPU when paused/waiting
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+
+            if self.state != EngineState::Running {
+                info!("MM engine entering Running state (warmup={}s)", self.config.warmup_secs);
+                self.state = EngineState::Running;
+                self.running_since = Some(Instant::now());
+            }
+
+            self.warmed_up = self.running_since
+                .map(|t| t.elapsed() >= Duration::from_secs(self.config.warmup_secs))
+                .unwrap_or(false);
+
+
+            // ── CHECK FOR NEW DATA ──
+            #[cfg(feature = "profiling")]
+            let fair_start = Instant::now();
+
+            let Some(tick) = self.resolve_tick() else { continue; };
+
+            // Exchange_ts dedup (only for direct ticks)
+            if tick.is_direct {
+                if tick.exchange_ts_ms <= self.last_exchange_ts_ms {
+                    continue;
+                }
+                self.last_exchange_ts_ms = tick.exchange_ts_ms;
+            }
+            // ── NEW TICK ──
+            #[cfg(feature = "profiling")]
+            let tick_start = Instant::now();
+            self.trigger_received_ts = tick.trigger_received_ts;
+            #[cfg(feature = "profiling")]
+            if self.warmed_up && tick.is_direct {
+                self.latency.record(latency::METRIC_FAIR, fair_start.elapsed().as_nanos() as u64);
+                if let Some(ts) = tick.trigger_received_ts {
+                    let t2d_ns = (chrono::Utc::now() - ts).num_nanoseconds().unwrap_or(0).max(0) as u64;
+                    self.latency.record(latency::METRIC_T2D, t2d_ns);
+                }
+            }
+
+            // Staleness check — direct feed only
+            if tick.is_direct {
+                if let Some(ts) = tick.trigger_received_ts {
+                    let recv_age_ms = (chrono::Utc::now() - ts).num_milliseconds();
+                    if recv_age_ms > self.config.max_stale_ms as i64 {
+                        if self.bid_quote.is_some() || self.ask_quote.is_some() {
+                            warn!("ref feed stale (recv_age={}ms > {}ms), cancelling all quotes",
+                                recv_age_ms, self.config.max_stale_ms);
+                            self.cancel_all_quotes();
                         }
                         continue;
                     }
-
-                    if self.state != EngineState::Running {
-                        info!("MM engine entering Running state (warmup={}s)", self.config.warmup_secs);
-                        self.state = EngineState::Running;
-                        self.running_since = Some(Instant::now());
-                    }
-
-                    self.warmed_up = self.running_since
-                        .map(|t| t.elapsed() >= Duration::from_secs(self.config.warmup_secs))
-                        .unwrap_or(false);
-
-
-                    // ── CHECK FOR NEW DATA ──
-                    #[cfg(feature = "profiling")]
-                    let fair_start = Instant::now();
-
-                    let Some(tick) = self.resolve_tick() else { continue; };
-
-                    // Exchange_ts dedup (only for direct ticks)
-                    if tick.is_direct {
-                        if tick.exchange_ts_ms <= self.last_exchange_ts_ms {
-                            continue;
-                        }
-                        self.last_exchange_ts_ms = tick.exchange_ts_ms;
-                    }
-                    // ── NEW TICK ──
-                    #[cfg(feature = "profiling")]
-                    let tick_start = Instant::now();
-                    self.trigger_received_ts = tick.trigger_received_ts;
-                    #[cfg(feature = "profiling")]
-                    if self.warmed_up && tick.is_direct {
-                        self.latency.record(latency::METRIC_FAIR, fair_start.elapsed().as_nanos() as u64);
-                        if let Some(ts) = tick.trigger_received_ts {
-                            let t2d_ns = (chrono::Utc::now() - ts).num_nanoseconds().unwrap_or(0).max(0) as u64;
-                            self.latency.record(latency::METRIC_T2D, t2d_ns);
-                        }
-                    }
-
-                    // Staleness check — direct feed only
-                    if tick.is_direct {
-                        if let Some(ts) = tick.trigger_received_ts {
-                            let recv_age_ms = (chrono::Utc::now() - ts).num_milliseconds();
-                            if recv_age_ms > self.config.max_stale_ms as i64 {
-                                if self.bid_quote.is_some() || self.ask_quote.is_some() {
-                                    warn!("ref feed stale (recv_age={}ms > {}ms), cancelling all quotes",
-                                        recv_age_ms, self.config.max_stale_ms);
-                                    self.cancel_all_quotes();
-                                }
-                                continue;
-                            }
-                        }
-                    }
-
-                    // Sync local trackers with OMS reality
-                    self.sync_quote_state();
-
-                    // ── FAST PATH: adverse cancel guard ──
-                    self.fast_cancel_check(tick.fair);
-
-                    #[cfg(feature = "profiling")]
-                    if self.warmed_up {
-                        self.latency.record(latency::METRIC_TICK_FAST, tick_start.elapsed().as_nanos() as u64);
-                    }
-
-                    // ── SLOW PATH (~quote_interval_ms): quote placement ──
-                    let interval = Duration::from_millis(self.config.quote_interval_ms);
-                    if self.warmed_up && self.last_quote_eval.elapsed() >= interval {
-                        #[cfg(feature = "profiling")]
-                        let vol_start = Instant::now();
-
-                        self.evaluate_and_place_quotes(tick.fair);
-
-                        #[cfg(feature = "profiling")]
-                        if self.warmed_up {
-                            self.latency.record(latency::METRIC_VOL, vol_start.elapsed().as_nanos() as u64);
-                            self.latency.record(latency::METRIC_TICK_SLOW, tick_start.elapsed().as_nanos() as u64);
-                        }
-
-                        self.last_quote_eval = Instant::now();
-                    }
-
-                    // ── STATUS LOG (checked every spin, not just on new data) ──
-                    if self.last_status_log.elapsed() >= Duration::from_secs(1) {
-                        self.log_status();
-                        self.last_status_log = Instant::now();
-                    }
-
-                    #[cfg(feature = "profiling")]
-                    if self.warmed_up {
-                        self.latency.record(latency::METRIC_TICK_END, tick_start.elapsed().as_nanos() as u64);
-                    }
-
                 }
+            }
+
+            // Sync local trackers with OMS reality
+            self.sync_quote_state();
+
+            // ── FAST PATH: adverse cancel guard ──
+            self.fast_cancel_check(tick.fair);
+
+            #[cfg(feature = "profiling")]
+            if self.warmed_up {
+                self.latency.record(latency::METRIC_TICK_FAST, tick_start.elapsed().as_nanos() as u64);
+            }
+
+            // ── SLOW PATH (~quote_interval_ms): quote placement ──
+            let interval = Duration::from_millis(self.config.quote_interval_ms);
+            if self.warmed_up && self.last_quote_eval.elapsed() >= interval {
+                #[cfg(feature = "profiling")]
+                let vol_start = Instant::now();
+
+                self.evaluate_and_place_quotes(tick.fair);
+
+                #[cfg(feature = "profiling")]
+                if self.warmed_up {
+                    self.latency.record(latency::METRIC_VOL, vol_start.elapsed().as_nanos() as u64);
+                    self.latency.record(latency::METRIC_TICK_SLOW, tick_start.elapsed().as_nanos() as u64);
+                }
+
+                self.last_quote_eval = Instant::now();
+            }
+
+            // ── STATUS LOG (checked every spin, not just on new data) ──
+            if self.last_status_log.elapsed() >= Duration::from_secs(1) {
+                self.log_status();
+                self.last_status_log = Instant::now();
+            }
+
+            #[cfg(feature = "profiling")]
+            if self.warmed_up {
+                self.latency.record(latency::METRIC_TICK_END, tick_start.elapsed().as_nanos() as u64);
             }
         }
     }
