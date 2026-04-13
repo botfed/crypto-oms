@@ -969,23 +969,23 @@ impl MmEngine {
                 reduce_only: false,
             };
             match self.oms.prepare_place_order(&req) {
-                Ok((cid, sdk_req)) => match self.oms.sign_place_order(sdk_req) {
-                    Ok(signed) => {
-                        debug!("placing bid cid={} price={:.6}", cid.0, desired_bid);
-                        self.bid_quote = Some(LiveQuote {
-                            client_id: cid,
-                            exchange_id: None,
-                            price: desired_bid,
-                            size: order_size,
-                            placed_at: Instant::now(),
-                        });
-                        let oms = Arc::clone(&self.oms);
-                        tokio::spawn(async move {
-                            oms.post_place_order(cid.0, signed).await;
-                        });
-                    }
-                    Err(e) => warn!("failed to sign bid: {e}"),
-                },
+                Ok((cid, sdk_req)) => {
+                    debug!("placing bid cid={} price={:.6}", cid.0, desired_bid);
+                    self.bid_quote = Some(LiveQuote {
+                        client_id: cid,
+                        exchange_id: None,
+                        price: desired_bid,
+                        size: order_size,
+                        placed_at: Instant::now(),
+                    });
+                    let oms = Arc::clone(&self.oms);
+                    tokio::spawn(async move {
+                        match oms.sign_place_order(sdk_req) {
+                            Ok(signed) => oms.post_place_order(cid.0, signed).await,
+                            Err(e) => warn!("failed to sign bid {}: {e}", cid.0),
+                        }
+                    });
+                }
                 Err(e) => warn!("failed to prepare bid: {e}"),
             }
         }
@@ -1007,23 +1007,23 @@ impl MmEngine {
                 reduce_only: false,
             };
             match self.oms.prepare_place_order(&req) {
-                Ok((cid, sdk_req)) => match self.oms.sign_place_order(sdk_req) {
-                    Ok(signed) => {
-                        debug!("placing ask cid={} price={:.6}", cid.0, desired_ask);
-                        self.ask_quote = Some(LiveQuote {
-                            client_id: cid,
-                            exchange_id: None,
-                            price: desired_ask,
-                            size: order_size,
-                            placed_at: Instant::now(),
-                        });
-                        let oms = Arc::clone(&self.oms);
-                        tokio::spawn(async move {
-                            oms.post_place_order(cid.0, signed).await;
-                        });
-                    }
-                    Err(e) => warn!("failed to sign ask: {e}"),
-                },
+                Ok((cid, sdk_req)) => {
+                    debug!("placing ask cid={} price={:.6}", cid.0, desired_ask);
+                    self.ask_quote = Some(LiveQuote {
+                        client_id: cid,
+                        exchange_id: None,
+                        price: desired_ask,
+                        size: order_size,
+                        placed_at: Instant::now(),
+                    });
+                    let oms = Arc::clone(&self.oms);
+                    tokio::spawn(async move {
+                        match oms.sign_place_order(sdk_req) {
+                            Ok(signed) => oms.post_place_order(cid.0, signed).await,
+                            Err(e) => warn!("failed to sign ask {}: {e}", cid.0),
+                        }
+                    });
+                }
                 Err(e) => warn!("failed to prepare ask: {e}"),
             }
         }
