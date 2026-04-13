@@ -15,7 +15,7 @@ const HEADER_SIZE: usize = 64;
 const SAMPLE_SIZE: usize = 16;
 const LATENCY_PATH: &str = "/tmp/mm_latency.bin";
 
-const METRIC_NAMES: &[&str] = &["tick_fast", "t2d", "fair_calc", "vol_calc", "tick_slow", "t2t", "sign"];
+const METRIC_NAMES: &[&str] = &["tick_fast", "t2d", "fair_calc", "vol_calc", "tick_slow", "t2t", "sign", "tick_end"];
 
 const CURSOR_HOME: &str = "\x1B[H";
 const CURSOR_HIDE: &str = "\x1B[?25l";

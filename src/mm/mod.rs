@@ -33,6 +33,7 @@ pub mod latency {
     pub const METRIC_TICK_SLOW: u8 = 4;
     pub const METRIC_T2T: u8 = 5;
     pub const METRIC_SIGN: u8 = 6;
+    pub const METRIC_TICK_END: u8 = 7;
 
     // File layout
     pub const HEADER_SIZE: usize = 64;
@@ -598,6 +599,11 @@ impl MmEngine {
                     if self.last_status_log.elapsed() >= Duration::from_secs(1) {
                         self.log_status();
                         self.last_status_log = Instant::now();
+                    }
+
+                    #[cfg(feature = "profiling")]
+                    if self.warmed_up {
+                        self.latency.record(latency::METRIC_TICK_END, tick_start.elapsed().as_nanos() as u64);
                     }
 
                 }
