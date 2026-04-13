@@ -60,7 +60,7 @@ pub mod latency {
 
     /// Initialize the profiler. Returns a recorder for the hot loop.
     /// Spawns a background task that flushes samples to mmap every 10s.
-    pub fn init(shutdown: Arc<tokio::sync::Notify>) -> LatencyRecorder {
+    pub fn init(shutdown: Arc<std::sync::atomic::AtomicBool>) -> LatencyRecorder {
         let buf: Arc<Mutex<Vec<(u8, u64)>>> = Arc::new(Mutex::new(Vec::with_capacity(500_000)));
         let recorder = LatencyRecorder {
             buf: Arc::clone(&buf),
@@ -88,18 +88,11 @@ pub mod latency {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-            let shutdown_fut = shutdown.notified();
-            tokio::pin!(shutdown_fut);
-
             loop {
-                tokio::select! {
-                    _ = &mut shutdown_fut => {
-                        flush(&buf, &mut mmap, &mut write_pos);
-                        return;
-                    }
-                    _ = interval.tick() => {
-                        flush(&buf, &mut mmap, &mut write_pos);
-                    }
+                interval.tick().await;
+                flush(&buf, &mut mmap, &mut write_pos);
+                if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
                 }
             }
         });
