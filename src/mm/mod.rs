@@ -174,8 +174,7 @@ struct FactorModelState {
 struct TickSource {
     fair: f64,
     exchange_ts_ms: i64,
-    recv_age_ns: u64,
-    /// received_ts of the feed that actually triggered this tick (for t2t measurement).
+    /// received_ts of the feed that actually triggered this tick.
     /// Direct ticks: received_ts of the direct reference feed.
     /// Factor ticks: received_ts of the factor with the newest exchange_ts (the trigger).
     trigger_received_ts: Option<chrono::DateTime<chrono::Utc>>,
@@ -411,7 +410,7 @@ impl MmEngine {
         if wc != self.last_ref_wc {
             self.last_ref_wc = wc;
 
-            let (fair, exchange_ts_ms, recv_age_ns, _, received_ts) = self
+            let (fair, exchange_ts_ms, _, received_ts) = self
                 .fair_price
                 .get_fair_price_with_age(ExchangeId::Hyperliquid, self.hl_symbol_id)?;
 
@@ -430,7 +429,6 @@ impl MmEngine {
             return Some(TickSource {
                 fair,
                 exchange_ts_ms,
-                recv_age_ns,
                 trigger_received_ts: received_ts,
                 is_direct: true,
             });
@@ -450,16 +448,14 @@ impl MmEngine {
 
             // Compute sum of beta_i * r_i
             let mut sum = 0.0f64;
-            let mut worst_recv_age_ns = 0u64;
             // Track the trigger: the factor with the newest exchange_ts
             let mut trigger_received_ts: Option<chrono::DateTime<chrono::Utc>> = None;
             let mut trigger_exchange_ts_ms = i64::MIN;
 
             for f in &fm.factors {
-                if let Some((mid, recv_age_ns, exch_ts_ms, recv_ts)) = factor_mid(&self.market_data, f) {
+                if let Some((mid, _recv_age_ns, exch_ts_ms, recv_ts)) = factor_mid(&self.market_data, f) {
                     let r = mid.ln() - f.snapshot_log_mid;
                     sum += f.beta * r;
-                    worst_recv_age_ns = worst_recv_age_ns.max(recv_age_ns);
                     if exch_ts_ms > trigger_exchange_ts_ms {
                         trigger_exchange_ts_ms = exch_ts_ms;
                         trigger_received_ts = recv_ts;
@@ -481,7 +477,6 @@ impl MmEngine {
             return Some(TickSource {
                 fair: corr_fair,
                 exchange_ts_ms: 0, // not used for dedup on factor ticks
-                recv_age_ns: worst_recv_age_ns,
                 trigger_received_ts,
                 is_direct: false,
             });
@@ -554,20 +549,27 @@ impl MmEngine {
                     #[cfg(feature = "profiling")]
                     let tick_start = Instant::now();
                     #[cfg(feature = "profiling")]
-                    if self.warmed_up {
+                    if self.warmed_up && tick.is_direct {
                         self.latency.record(latency::METRIC_FAIR, fair_start.elapsed().as_nanos() as u64);
-                        self.latency.record(latency::METRIC_T2D, tick.recv_age_ns);
+                        if let Some(ts) = tick.trigger_received_ts {
+                            let t2d_ns = (chrono::Utc::now() - ts).num_nanoseconds().unwrap_or(0).max(0) as u64;
+                            self.latency.record(latency::METRIC_T2D, t2d_ns);
+                        }
                     }
 
-                    // Staleness check uses received_age (in ms)
-                    let recv_age_ms = (tick.recv_age_ns / 1_000_000) as i64;
-                    if recv_age_ms > self.config.max_stale_ms as i64 {
-                        if self.bid_quote.is_some() || self.ask_quote.is_some() {
-                            warn!("ref feed stale (recv_age={}ms > {}ms), cancelling all quotes",
-                                recv_age_ms, self.config.max_stale_ms);
-                            self.cancel_all_quotes().await;
+                    // Staleness check — direct feed only
+                    if tick.is_direct {
+                        if let Some(ts) = tick.trigger_received_ts {
+                            let recv_age_ms = (chrono::Utc::now() - ts).num_milliseconds();
+                            if recv_age_ms > self.config.max_stale_ms as i64 {
+                                if self.bid_quote.is_some() || self.ask_quote.is_some() {
+                                    warn!("ref feed stale (recv_age={}ms > {}ms), cancelling all quotes",
+                                        recv_age_ms, self.config.max_stale_ms);
+                                    self.cancel_all_quotes().await;
+                                }
+                                continue;
+                            }
                         }
-                        continue;
                     }
 
                     // Sync local trackers with OMS reality
@@ -1146,7 +1148,7 @@ impl MmEngine {
         let (exch_age_ms, ref_feed) = self
             .fair_price
             .get_fair_price_with_age(ExchangeId::Hyperliquid, self.hl_symbol_id)
-            .map(|(_, ex_ts_ms, _, feed, _)| {
+            .map(|(_, ex_ts_ms, feed, _)| {
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 (now_ms - ex_ts_ms, feed)
             })

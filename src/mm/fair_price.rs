@@ -130,7 +130,7 @@ impl FairPriceEngine {
 
     /// Returns fair price using the freshest reference feed across all matching pairs.
     pub fn get_fair_price(&self, exchange: ExchangeId, symbol_id: SymbolId) -> Option<f64> {
-        self.get_fair_price_with_age(exchange, symbol_id).map(|(price, _, _, _, _)| price)
+        self.get_fair_price_with_age(exchange, symbol_id).map(|(price, _, _, _)| price)
     }
 
     /// Returns (fair_price, ref_age_ms, ref_exchange_name). Uses the freshest reference feed.
@@ -140,10 +140,10 @@ impl FairPriceEngine {
         &self,
         exchange: ExchangeId,
         symbol_id: SymbolId,
-    ) -> Option<(f64, i64, u64, &str, Option<DateTime<Utc>>)> {
+    ) -> Option<(f64, i64, &str, Option<DateTime<Utc>>)> {
         let now = Utc::now();
-        // (fair, exchange_ts_ms, received_age_ns, pair_idx, received_ts)
-        let mut best: Option<(f64, i64, u64, usize, Option<DateTime<Utc>>)> = None;
+        // Pick the pair with the freshest received_ts
+        let mut best: Option<(f64, i64, usize, Option<DateTime<Utc>>)> = None;
         let mut best_recv_age = u64::MAX;
 
         for (idx, pair) in self.pairs.iter().enumerate() {
@@ -165,19 +165,19 @@ impl FairPriceEngine {
 
             if recv_age_ns < best_recv_age {
                 let basis = self.basis.get(&idx).map(|v| *v).unwrap_or(0.0);
-                best = Some((ref_mid + basis, exchange_ts_ms, recv_age_ns, idx, md.received_ts));
+                best = Some((ref_mid + basis, exchange_ts_ms, idx, md.received_ts));
                 best_recv_age = recv_age_ns;
             }
         }
 
-        best.map(|(price, ex_ts, recv_age, idx, received_ts)| {
+        best.map(|(price, ex_ts, idx, received_ts)| {
             let ref_name = match self.pairs[idx].reference_exchange {
                 ExchangeId::Binance => "binance",
                 ExchangeId::Bybit => "bybit",
                 ExchangeId::Okx => "okx",
                 ExchangeId::Hyperliquid => "hyperliquid",
             };
-            (price, ex_ts, recv_age, ref_name, received_ts)
+            (price, ex_ts, ref_name, received_ts)
         })
     }
 
@@ -185,7 +185,7 @@ impl FairPriceEngine {
     pub fn get_basis(&self, exchange: ExchangeId, symbol_id: SymbolId) -> Option<f64> {
         // Return basis of the freshest pair
         self.get_fair_price_with_age(exchange, symbol_id)
-            .and_then(|(_, _, _, _, _)| {
+            .and_then(|(_, _, _, _)| {
                 // Find the freshest pair index
                 let now = Utc::now();
                 let mut best_idx = None;
