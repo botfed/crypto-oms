@@ -266,6 +266,7 @@ pub struct MmEngine {
     last_status_log: Instant,
     running_since: Option<Instant>,
     consecutive_rejects: u32,
+    reject_pause_until: Option<Instant>,
     last_ref_wc: u64,         // track seqlock write count to detect new ticks
     trigger_recv_age_ns: u64, // age of the feed that triggered the current tick (for t2t)
     last_exchange_ts_ms: i64, // skip ticks with older exchange_ts
@@ -275,6 +276,7 @@ pub struct MmEngine {
 }
 
 const MAX_CONSECUTIVE_REJECTS: u32 = 5;
+const REJECT_COOLDOWN: Duration = Duration::from_secs(30);
 
 impl MmEngine {
     pub fn new(
@@ -384,6 +386,7 @@ impl MmEngine {
             last_status_log: Instant::now(),
             running_since: None,
             consecutive_rejects: 0,
+            reject_pause_until: None,
             last_ref_wc: 0,
             trigger_recv_age_ns: 0,
             last_exchange_ts_ms: 0,
@@ -633,11 +636,28 @@ impl MmEngine {
             return false;
         }
         if self.consecutive_rejects >= MAX_CONSECUTIVE_REJECTS {
-            if should_log {
-                warn!("paused: {} consecutive rejects", self.consecutive_rejects);
+            if let Some(until) = self.reject_pause_until {
+                if Instant::now() >= until {
+                    info!("reject cooldown elapsed, resetting and retrying");
+                    self.consecutive_rejects = 0;
+                    self.reject_pause_until = None;
+                    // fall through to remaining precondition checks
+                } else {
+                    if should_log {
+                        let remaining = until.duration_since(Instant::now());
+                        warn!("paused: {} consecutive rejects (retry in {:.0}s)",
+                            self.consecutive_rejects, remaining.as_secs_f64());
+                        self.last_status_log = Instant::now();
+                    }
+                    return false;
+                }
+            } else {
+                warn!("paused: {} consecutive rejects, cooldown {}s",
+                    self.consecutive_rejects, REJECT_COOLDOWN.as_secs());
+                self.reject_pause_until = Some(Instant::now() + REJECT_COOLDOWN);
                 self.last_status_log = Instant::now();
+                return false;
             }
-            return false;
         }
 
         // Check fair price is available
@@ -1239,12 +1259,20 @@ impl MmEngine {
             OmsEvent::Ready | OmsEvent::Reconnected => {
                 info!("OMS ready/reconnected");
             }
+            OmsEvent::OrderAccepted { client_id, .. } => {
+                if self.is_our_order(&client_id) {
+                    self.consecutive_rejects = 0;
+                    self.reject_pause_until = None;
+                }
+            }
             OmsEvent::OrderFilled(fill) => {
                 if self.is_our_order(&fill.client_id) {
                     info!(
                         "fill: cid={} side={:?} price={:.6} size={:.4}",
                         fill.client_id.0, fill.side, fill.price, fill.size,
                     );
+                    self.consecutive_rejects = 0;
+                    self.reject_pause_until = None;
                     self.clear_tracker(&fill.client_id);
                 }
             }
