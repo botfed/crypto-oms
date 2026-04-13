@@ -511,7 +511,7 @@ impl MmEngine {
             tokio::select! {
                 _ = &mut shutdown_fut => {
                     info!("MM engine shutting down");
-                    self.cancel_all_quotes().await;
+                    self.cancel_all_quotes();
                     return Ok(());
                 }
                 _ = tokio::task::yield_now() => {
@@ -519,7 +519,7 @@ impl MmEngine {
 
                     if !self.check_preconditions() {
                         if self.state == EngineState::Running {
-                            self.transition_to_paused().await;
+                            self.transition_to_paused();
                         }
                         continue;
                     }
@@ -569,7 +569,7 @@ impl MmEngine {
                                 if self.bid_quote.is_some() || self.ask_quote.is_some() {
                                     warn!("ref feed stale (recv_age={}ms > {}ms), cancelling all quotes",
                                         recv_age_ms, self.config.max_stale_ms);
-                                    self.cancel_all_quotes().await;
+                                    self.cancel_all_quotes();
                                 }
                                 continue;
                             }
@@ -1535,7 +1535,7 @@ impl MmEngine {
         }
     }
 
-    async fn cancel_all_quotes(&mut self) {
+    fn cancel_all_quotes(&mut self) {
         if self.ghost {
             if self.bid_quote.is_some() || self.ask_quote.is_some() {
                 info!("[GHOST] would CANCEL ALL quotes");
@@ -1547,24 +1547,32 @@ impl MmEngine {
 
         if let Some(ref q) = self.bid_quote {
             info!("cancelling bid cid={}", q.client_id.0);
-            if let Err(e) = self.oms.cancel_order(&q.client_id).await {
-                warn!("failed to cancel bid {}: {e}", q.client_id.0);
-            }
+            let oms = Arc::clone(&self.oms);
+            let cid = q.client_id;
+            tokio::spawn(async move {
+                if let Err(e) = oms.cancel_order(&cid).await {
+                    warn!("failed to cancel bid {}: {e}", cid.0);
+                }
+            });
         }
         if let Some(ref q) = self.ask_quote {
             info!("cancelling ask cid={}", q.client_id.0);
-            if let Err(e) = self.oms.cancel_order(&q.client_id).await {
-                warn!("failed to cancel ask {}: {e}", q.client_id.0);
-            }
+            let oms = Arc::clone(&self.oms);
+            let cid = q.client_id;
+            tokio::spawn(async move {
+                if let Err(e) = oms.cancel_order(&cid).await {
+                    warn!("failed to cancel ask {}: {e}", cid.0);
+                }
+            });
         }
         self.bid_quote = None;
         self.ask_quote = None;
         self.presigned_cancels.clear();
     }
 
-    async fn transition_to_paused(&mut self) {
+    fn transition_to_paused(&mut self) {
         info!("MM engine entering Paused state");
-        self.cancel_all_quotes().await;
+        self.cancel_all_quotes();
         self.state = EngineState::Paused;
         self.running_since = None;
     }
