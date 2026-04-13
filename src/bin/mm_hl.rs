@@ -19,8 +19,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tracing::{info, warn};
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let _ = dotenv::dotenv();
 
     tracing_subscriber::fmt()
@@ -30,9 +29,10 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // Parse CLI args: mm_hl [--ghost] [--spin-core N] [config_path]
+    // Parse CLI args: mm_hl [--ghost] [--spin-core N] [--tokio-cores 2,3] [config_path]
     let mut ghost = false;
     let mut spin_core: Option<usize> = None;
+    let mut tokio_cores: Option<Vec<usize>> = None;
     let mut config_path = "configs/mm_hl.yaml".to_string();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -43,10 +43,40 @@ async fn main() -> Result<()> {
                 i += 1;
                 spin_core = Some(args[i].parse().expect("--spin-core requires a number"));
             }
+            "--tokio-cores" => {
+                i += 1;
+                tokio_cores = Some(
+                    args[i].split(',')
+                        .map(|s| s.trim().parse().expect("--tokio-cores requires comma-separated numbers"))
+                        .collect()
+                );
+            }
             _ => config_path = args[i].clone(),
         }
         i += 1;
     }
+
+    // Build tokio runtime — pin workers to specific cores if requested
+    let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
+    rt_builder.enable_all();
+    if let Some(ref cores) = tokio_cores {
+        let n = cores.len();
+        rt_builder.worker_threads(n);
+        let core_idx = std::sync::atomic::AtomicUsize::new(0);
+        let cores_clone = cores.clone();
+        rt_builder.on_thread_start(move || {
+            let idx = core_idx.fetch_add(1, Ordering::Relaxed) % cores_clone.len();
+            let core_id = cores_clone[idx];
+            core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
+        });
+        info!("tokio workers pinned to cores {:?}", cores);
+    }
+    let rt = rt_builder.build().context("failed to build tokio runtime")?;
+
+    rt.block_on(async_main(ghost, spin_core, config_path))
+}
+
+async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) -> Result<()> {
 
     if ghost {
         info!("*** GHOST MODE — no orders will be sent ***");
