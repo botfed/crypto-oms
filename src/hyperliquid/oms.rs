@@ -1002,11 +1002,37 @@ impl HyperliquidOms {
         drop(handle);
 
         // Mark Cancelling immediately so the engine sees it
+        self.mark_cancelling(id);
+
+        self.sign_cancel_payload(asset_idx, oid)
+    }
+
+    /// Pre-sign a cancel without changing order state. Used for pre-signing
+    /// cancels at accept time so the fast path can skip signing.
+    pub fn presign_cancel_order(&self, id: &ClientOrderId) -> Result<SignedPayload> {
+        self.check_ready()?;
+
+        let handle = self.state.orders.get(&id.0)
+            .ok_or(OmsError::OrderNotFound(id.0))?;
+        let exchange_id = handle.exchange_id.as_ref()
+            .ok_or_else(|| OmsError::Internal("no exchange oid yet (still inflight)".into()))?;
+        let (asset_idx, _) = self.resolve_asset(&handle.symbol)?;
+        let oid: u64 = exchange_id.parse().unwrap_or(0);
+        drop(handle);
+
+        // No state change — order stays Accepted until fast cancel fires
+        self.sign_cancel_payload(asset_idx, oid)
+    }
+
+    /// Mark an order as Cancelling (state transition only, no signing).
+    pub fn mark_cancelling(&self, id: &ClientOrderId) {
         if let Some(mut h) = self.state.orders.get_mut(&id.0) {
             h.state = OrderState::Cancelling;
             h.last_modified = Some(Instant::now());
         }
+    }
 
+    fn sign_cancel_payload(&self, asset_idx: u32, oid: u64) -> Result<SignedPayload> {
         let ex = self.client.exchange();
         let timestamp = hyperliquid_rust_sdk::next_nonce();
 

@@ -2,6 +2,7 @@ pub mod config;
 pub mod fair_price;
 pub mod inventory;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,7 +11,7 @@ use oms_core::*;
 use tokio::sync::{Notify, broadcast};
 use tracing::{debug, info, warn};
 
-use crate::hyperliquid::HyperliquidOms;
+use crate::hyperliquid::{HyperliquidOms, SignedPayload};
 use config::{MmParamSource, StrategyConfig};
 use crypto_feeds::MarketDataCollection;
 use crypto_feeds::market_data::InstrumentType;
@@ -270,6 +271,7 @@ pub struct MmEngine {
     trigger_received_ts: Option<chrono::DateTime<chrono::Utc>>, // received_ts of the feed that triggered the current tick
     last_exchange_ts_ms: i64, // skip ticks with older exchange_ts
     factor_model: Option<FactorModelState>,
+    presigned_cancels: HashMap<ClientOrderId, SignedPayload>,
     #[cfg(feature = "profiling")]
     latency: latency::LatencyRecorder,
 }
@@ -390,6 +392,7 @@ impl MmEngine {
             trigger_received_ts: None,
             last_exchange_ts_ms: 0,
             factor_model,
+            presigned_cancels: HashMap::new(),
             #[cfg(feature = "profiling")]
             latency,
         })
@@ -787,7 +790,13 @@ impl MmEngine {
                 );
                 #[cfg(feature = "profiling")]
                 let sign_start = Instant::now();
-                match self.oms.sign_cancel_order(&q.client_id) {
+                let signed = if let Some(s) = self.presigned_cancels.remove(&q.client_id) {
+                    self.oms.mark_cancelling(&q.client_id);
+                    Ok(s)
+                } else {
+                    self.oms.sign_cancel_order(&q.client_id)
+                };
+                match signed {
                     Ok(signed) => {
                         #[cfg(feature = "profiling")]
                         self.latency
@@ -824,7 +833,13 @@ impl MmEngine {
                 );
                 #[cfg(feature = "profiling")]
                 let sign_start = Instant::now();
-                match self.oms.sign_cancel_order(&q.client_id) {
+                let signed = if let Some(s) = self.presigned_cancels.remove(&q.client_id) {
+                    self.oms.mark_cancelling(&q.client_id);
+                    Ok(s)
+                } else {
+                    self.oms.sign_cancel_order(&q.client_id)
+                };
+                match signed {
                     Ok(signed) => {
                         #[cfg(feature = "profiling")]
                         self.latency
@@ -1268,6 +1283,11 @@ impl MmEngine {
                 if self.is_our_order(&client_id) {
                     self.consecutive_rejects = 0;
                     self.reject_pause_until = None;
+                    // Pre-sign cancel for fast path
+                    match self.oms.presign_cancel_order(&client_id) {
+                        Ok(signed) => { self.presigned_cancels.insert(client_id, signed); }
+                        Err(e) => debug!("pre-sign cancel failed for {}: {e}", client_id.0),
+                    }
                 }
             }
             OmsEvent::OrderFilled(fill) => {
@@ -1351,6 +1371,7 @@ impl MmEngine {
         {
             self.ask_quote = None;
         }
+        self.presigned_cancels.remove(cid);
     }
 
     // -----------------------------------------------------------------------
@@ -1538,6 +1559,7 @@ impl MmEngine {
         }
         self.bid_quote = None;
         self.ask_quote = None;
+        self.presigned_cancels.clear();
     }
 
     async fn transition_to_paused(&mut self) {
