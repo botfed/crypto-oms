@@ -64,7 +64,15 @@ fn main() -> Result<()> {
         rt_builder.worker_threads(n);
         let core_idx = std::sync::atomic::AtomicUsize::new(0);
         let cores_clone = cores.clone();
+        rt_builder.thread_name("tokio-rt-worker");
         rt_builder.on_thread_start(move || {
+            // Only pin threads named "tokio-rt-worker" (our worker threads),
+            // skip blocking pool threads (named "tokio-runtime-w" by default)
+            let thread = std::thread::current();
+            let name = thread.name().unwrap_or("");
+            if name != "tokio-rt-worker" {
+                return;
+            }
             let idx = core_idx.fetch_add(1, Ordering::Relaxed) % cores_clone.len();
             let core_id = cores_clone[idx];
             core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
