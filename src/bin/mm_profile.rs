@@ -3,7 +3,6 @@
 //!
 //! Usage: cargo run --bin mm_profile
 
-use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 use std::io::{Write, stdout};
 use std::thread;
@@ -11,8 +10,12 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 
-const HEADER_SIZE: usize = 64;
-const SAMPLE_SIZE: usize = 16;
+// Must match the layout in mm/mod.rs latency module
+const GLOBAL_HEADER: usize = 8;
+const METRIC_HEADER: usize = 16;
+const SAMPLE_SIZE: usize = 8;
+const SAMPLES_PER_METRIC: usize = 131_072;
+const METRIC_SECTION: usize = METRIC_HEADER + SAMPLES_PER_METRIC * SAMPLE_SIZE;
 const LATENCY_PATH: &str = "/tmp/mm_latency.bin";
 
 const METRIC_NAMES: &[&str] = &["tick_fast", "t2d", "fair_calc", "vol_calc", "tick_slow", "t2t", "sign", "tick_end"];
@@ -58,7 +61,6 @@ fn term_size() -> (usize, usize) {
     (120, 50)
 }
 
-/// Truncate lines to terminal width and append ERASE_EOL to prevent stale chars.
 fn prepare_frame(raw: &str) -> String {
     let (cols, _) = term_size();
     let mut out = String::with_capacity(raw.len() + raw.lines().count() * 6);
@@ -74,12 +76,11 @@ fn prepare_frame(raw: &str) -> String {
     out
 }
 
-fn render_frame(
-    write_pos: u64,
-    capacity: usize,
-    mmap: &memmap2::Mmap,
-    start_time: Instant,
-) -> String {
+fn metric_offset(metric: usize) -> usize {
+    GLOBAL_HEADER + metric * METRIC_SECTION
+}
+
+fn render_frame(mmap: &memmap2::Mmap, start_time: Instant) -> String {
     let mut buf = String::with_capacity(2048);
 
     // Header
@@ -89,29 +90,26 @@ fn render_frame(
     let s = elapsed % 60;
     let now = Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
     let _ = writeln!(buf, "  MM Latency Profile   uptime: {:02}:{:02}:{:02}   {}", h, m, s, now);
-    let _ = writeln!(buf, "  total samples: {}   file: {}", write_pos, LATENCY_PATH);
-    let _ = writeln!(buf);
 
-    if write_pos == 0 {
+    let num_metrics = u64::from_le_bytes(mmap[0..8].try_into().unwrap()) as usize;
+    if num_metrics == 0 || num_metrics > 64 {
         let _ = writeln!(buf, "  Waiting for samples...");
         return buf;
     }
 
-    // Read all available samples
-    let mut by_metric: HashMap<u8, Vec<u64>> = HashMap::new();
-    let start = if write_pos > capacity as u64 {
-        write_pos - capacity as u64
-    } else {
-        0
-    };
+    // Compute total samples across all metrics
+    let mut total_samples: u64 = 0;
+    for mi in 0..num_metrics.min(METRIC_NAMES.len()) {
+        let off = metric_offset(mi);
+        let wp = u64::from_le_bytes(mmap[off..off + 8].try_into().unwrap());
+        total_samples += wp;
+    }
+    let _ = writeln!(buf, "  total samples: {}   file: {}", total_samples, LATENCY_PATH);
+    let _ = writeln!(buf);
 
-    for pos in start..write_pos {
-        let idx = (pos % capacity as u64) as usize;
-        let offset = HEADER_SIZE + idx * SAMPLE_SIZE;
-        if offset + SAMPLE_SIZE > mmap.len() { break; }
-        let metric = mmap[offset];
-        let value = u64::from_le_bytes(mmap[offset + 8..offset + 16].try_into().unwrap());
-        by_metric.entry(metric).or_default().push(value);
+    if total_samples == 0 {
+        let _ = writeln!(buf, "  Waiting for samples...");
+        return buf;
     }
 
     // Table header
@@ -122,28 +120,47 @@ fn render_frame(
         "  {:-<9}  {:->8}  {:->8}  {:->8}  {:->8}  {:->8}  {:->8}  {:->8}  {:->8}  {:->8}  {:->8}  {:->8}",
         "", "", "", "", "", "", "", "", "", "", "", "");
 
-    // Table rows
-    for (id, name) in METRIC_NAMES.iter().enumerate() {
-        if let Some(samples) = by_metric.get(&(id as u8)) {
-            let mut sorted = samples.clone();
-            sorted.sort_unstable();
-            let n = sorted.len();
-            let _ = writeln!(buf,
-                "  {:<9}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}",
-                name,
-                fmt_ns(sorted[0]),
-                fmt_ns(percentile(&sorted, 1.0)),
-                fmt_ns(percentile(&sorted, 5.0)),
-                fmt_ns(percentile(&sorted, 25.0)),
-                fmt_ns(percentile(&sorted, 50.0)),
-                fmt_ns(percentile(&sorted, 75.0)),
-                fmt_ns(percentile(&sorted, 95.0)),
-                fmt_ns(percentile(&sorted, 99.0)),
-                fmt_ns(percentile(&sorted, 99.9)),
-                fmt_ns(sorted[n - 1]),
-                n,
-            );
+    // Table rows — one per metric
+    for (mi, name) in METRIC_NAMES.iter().enumerate() {
+        if mi >= num_metrics { break; }
+        let off = metric_offset(mi);
+        let write_pos = u64::from_le_bytes(mmap[off..off + 8].try_into().unwrap());
+        let capacity = u64::from_le_bytes(mmap[off + 8..off + 16].try_into().unwrap()) as usize;
+        if write_pos == 0 || capacity == 0 { continue; }
+
+        let n = write_pos.min(capacity as u64) as usize;
+        let start = if write_pos > capacity as u64 { write_pos - capacity as u64 } else { 0 };
+
+        let mut samples = Vec::with_capacity(n);
+        for pos in start..write_pos {
+            let idx = (pos % capacity as u64) as usize;
+            let sample_off = off + METRIC_HEADER + idx * SAMPLE_SIZE;
+            if sample_off + SAMPLE_SIZE > mmap.len() { break; }
+            let value = u64::from_le_bytes(mmap[sample_off..sample_off + 8].try_into().unwrap());
+            if value > 0 {
+                samples.push(value);
+            }
         }
+
+        if samples.is_empty() { continue; }
+        samples.sort_unstable();
+        let sn = samples.len();
+
+        let _ = writeln!(buf,
+            "  {:<9}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}",
+            name,
+            fmt_ns(samples[0]),
+            fmt_ns(percentile(&samples, 1.0)),
+            fmt_ns(percentile(&samples, 5.0)),
+            fmt_ns(percentile(&samples, 25.0)),
+            fmt_ns(percentile(&samples, 50.0)),
+            fmt_ns(percentile(&samples, 75.0)),
+            fmt_ns(percentile(&samples, 95.0)),
+            fmt_ns(percentile(&samples, 99.0)),
+            fmt_ns(percentile(&samples, 99.9)),
+            fmt_ns(samples[sn - 1]),
+            sn,
+        );
     }
 
     let _ = writeln!(buf);
@@ -166,14 +183,13 @@ fn main() {
         memmap2::Mmap::map(&file).expect("failed to mmap")
     };
 
-    // Wait for capacity to be written
+    // Wait for global header to be written
     loop {
-        let capacity = u64::from_le_bytes(mmap[8..16].try_into().unwrap()) as usize;
-        if capacity > 0 { break; }
+        let num_metrics = u64::from_le_bytes(mmap[0..8].try_into().unwrap()) as usize;
+        if num_metrics > 0 && num_metrics <= 64 { break; }
         eprintln!("Waiting for MM process to initialize profiling...");
         thread::sleep(Duration::from_secs(1));
     }
-    let capacity = u64::from_le_bytes(mmap[8..16].try_into().unwrap()) as usize;
 
     let start_time = Instant::now();
 
@@ -186,7 +202,6 @@ fn main() {
 
     // Ctrl-C handler: restore cursor and exit immediately
     ctrlc::set_handler(move || {
-        // Use raw write to avoid deadlock with stdout lock
         use std::os::unix::io::AsRawFd;
         let fd = std::io::stdout().as_raw_fd();
         unsafe { libc::write(fd, CURSOR_SHOW.as_ptr() as *const _, CURSOR_SHOW.len()); }
@@ -194,8 +209,7 @@ fn main() {
     }).ok();
 
     loop {
-        let write_pos = u64::from_le_bytes(mmap[0..8].try_into().unwrap());
-        let raw = render_frame(write_pos, capacity, &mmap, start_time);
+        let raw = render_frame(&mmap, start_time);
         let frame = prepare_frame(&raw);
 
         {

@@ -36,12 +36,17 @@ pub mod latency {
     pub const METRIC_T2T: u8 = 5;
     pub const METRIC_SIGN: u8 = 6;
     pub const METRIC_TICK_END: u8 = 7;
+    pub const NUM_METRICS: usize = 8;
 
-    // File layout
-    pub const HEADER_SIZE: usize = 64;
-    pub const SAMPLE_SIZE: usize = 16; // metric_id(1) + pad(7) + value_ns(8)
-    pub const FILE_SIZE: usize = 16 * 1024 * 1024; // 16 MB (~1M entries)
-    pub const CAPACITY: usize = (FILE_SIZE - HEADER_SIZE) / SAMPLE_SIZE;
+    // File layout: per-metric ring buffers
+    // Global header: 8 bytes (NUM_METRICS as u64)
+    // Per-metric: 16-byte header (write_pos u64 + capacity u64) + samples (8 bytes each, just value_ns)
+    pub const GLOBAL_HEADER: usize = 8;
+    pub const METRIC_HEADER: usize = 16; // write_pos(8) + capacity(8)
+    pub const SAMPLE_SIZE: usize = 8;    // value_ns only (metric is implicit from the ring)
+    pub const SAMPLES_PER_METRIC: usize = 131_072; // 128K samples per metric
+    pub const METRIC_SECTION: usize = METRIC_HEADER + SAMPLES_PER_METRIC * SAMPLE_SIZE; // ~1MB per metric
+    pub const FILE_SIZE: usize = GLOBAL_HEADER + NUM_METRICS * METRIC_SECTION; // ~8MB total
     pub const LATENCY_PATH: &str = "/tmp/mm_latency.bin";
 
     /// Lightweight recorder for the hot loop.
@@ -53,9 +58,13 @@ pub mod latency {
     impl LatencyRecorder {
         #[inline]
         pub fn record(&self, metric: u8, nanos: u64) {
-            // Lock is uncontended 99.99% of the time (only contended during 10s flush swap)
             self.buf.lock().push((metric, nanos));
         }
+    }
+
+    /// Byte offset of a metric's section in the mmap file.
+    fn metric_offset(metric: usize) -> usize {
+        GLOBAL_HEADER + metric * METRIC_SECTION
     }
 
     /// Initialize the profiler. Returns a recorder for the hot loop.
@@ -66,7 +75,6 @@ pub mod latency {
             buf: Arc::clone(&buf),
         };
 
-        // Create/open the mmap file
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -79,10 +87,18 @@ pub mod latency {
         let mut mmap =
             unsafe { memmap2::MmapMut::map_mut(&file).expect("failed to mmap latency file") };
 
-        // Reset file on startup — fresh session
+        // Reset file on startup
         mmap.fill(0);
-        mmap[8..16].copy_from_slice(&(CAPACITY as u64).to_le_bytes());
-        let mut write_pos: u64 = 0;
+        // Write global header: num_metrics
+        mmap[0..8].copy_from_slice(&(NUM_METRICS as u64).to_le_bytes());
+        // Write per-metric capacity
+        for m in 0..NUM_METRICS {
+            let off = metric_offset(m);
+            // write_pos = 0 (already zeroed)
+            mmap[off + 8..off + 16].copy_from_slice(&(SAMPLES_PER_METRIC as u64).to_le_bytes());
+        }
+
+        let mut write_positions = [0u64; NUM_METRICS];
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
@@ -90,7 +106,7 @@ pub mod latency {
 
             loop {
                 interval.tick().await;
-                flush(&buf, &mut mmap, &mut write_pos);
+                flush(&buf, &mut mmap, &mut write_positions);
                 if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
                 }
@@ -100,7 +116,7 @@ pub mod latency {
         recorder
     }
 
-    fn flush(buf: &Mutex<Vec<(u8, u64)>>, mmap: &mut memmap2::MmapMut, write_pos: &mut u64) {
+    fn flush(buf: &Mutex<Vec<(u8, u64)>>, mmap: &mut memmap2::MmapMut, write_positions: &mut [u64; NUM_METRICS]) {
         let samples = {
             let mut guard = buf.lock();
             std::mem::replace(&mut *guard, Vec::with_capacity(500_000))
@@ -110,19 +126,23 @@ pub mod latency {
             return;
         }
 
-        let cap = CAPACITY as u64;
+        let cap = SAMPLES_PER_METRIC as u64;
         for (metric, value) in &samples {
-            let idx = (*write_pos % cap) as usize;
-            let offset = HEADER_SIZE + idx * SAMPLE_SIZE;
-            mmap[offset] = *metric;
-            // bytes 1-7 are padding (zeroed)
-            mmap[offset + 1..offset + 8].fill(0);
-            mmap[offset + 8..offset + 16].copy_from_slice(&value.to_le_bytes());
-            *write_pos += 1;
+            let m = *metric as usize;
+            if m >= NUM_METRICS { continue; }
+            let wp = &mut write_positions[m];
+            let section = metric_offset(m);
+            let idx = (*wp % cap) as usize;
+            let offset = section + METRIC_HEADER + idx * SAMPLE_SIZE;
+            mmap[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+            *wp += 1;
         }
 
-        // Update write_pos in header
-        mmap[0..8].copy_from_slice(&write_pos.to_le_bytes());
+        // Update per-metric write positions in headers
+        for m in 0..NUM_METRICS {
+            let off = metric_offset(m);
+            mmap[off..off + 8].copy_from_slice(&write_positions[m].to_le_bytes());
+        }
         let _ = mmap.flush_async();
     }
 }
