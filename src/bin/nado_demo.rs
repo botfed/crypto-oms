@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use crypto_feeds::app_config::{AppConfig, load_perp, load_spot};
+use crypto_feeds::market_data::ClockCorrectionConfig;
 use crypto_feeds::market_data::AllMarketData;
 use crypto_feeds::symbol_registry::REGISTRY;
 use crypto_oms::nado::{NadoDiagnostics, NadoOms, NadoOmsConfig};
@@ -79,6 +80,9 @@ impl DemoConfig {
             perp: self.perp.clone(),
             sample_interval_ms: self.sample_interval_ms,
             onchain: None,
+            fair_price: Default::default(),
+            vol_models: None,
+            clock_correction: ClockCorrectionConfig::default(),
         }
     }
 }

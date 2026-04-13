@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use crypto_feeds::app_config::{AppConfig, load_perp, load_spot};
+use crypto_feeds::market_data::ClockCorrectionConfig;
 use crypto_feeds::market_data::AllMarketData;
 use crypto_feeds::symbol_registry::REGISTRY;
 use crypto_oms::hyperliquid::{HyperliquidOms, HyperliquidOmsConfig};
@@ -65,6 +66,9 @@ impl DemoConfig {
             perp: self.perp.clone(),
             sample_interval_ms: self.sample_interval_ms,
             onchain: None,
+            fair_price: Default::default(),
+            vol_models: None,
+            clock_correction: ClockCorrectionConfig::default(),
         }
     }
 }
@@ -481,6 +485,7 @@ async fn main() -> Result<()> {
         base_url: config.hyperliquid.base_url,
         poll_interval: Duration::from_millis(config.hyperliquid.poll_interval_ms),
         inflight_timeout: Duration::from_millis(config.hyperliquid.inflight_timeout_ms),
+        stray_order_age: Duration::from_secs(5),
     };
     let oms = HyperliquidOms::new(oms_config)?;
     oms.start();
