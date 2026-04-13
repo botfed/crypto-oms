@@ -546,11 +546,10 @@ impl MmEngine {
                         }
                         self.last_exchange_ts_ms = tick.exchange_ts_ms;
                     }
-
                     // ── NEW TICK ──
-                    self.trigger_received_ts = tick.trigger_received_ts;
                     #[cfg(feature = "profiling")]
                     let tick_start = Instant::now();
+                    self.trigger_received_ts = tick.trigger_received_ts;
                     #[cfg(feature = "profiling")]
                     if self.warmed_up && tick.is_direct {
                         self.latency.record(latency::METRIC_FAIR, fair_start.elapsed().as_nanos() as u64);
