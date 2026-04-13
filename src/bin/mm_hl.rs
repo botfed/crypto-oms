@@ -60,25 +60,31 @@ fn main() -> Result<()> {
     let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
     rt_builder.enable_all();
     if let Some(ref cores) = tokio_cores {
-        let n = cores.len();
-        rt_builder.worker_threads(n);
-        let pinned_count = std::sync::atomic::AtomicUsize::new(0);
-        let cores_clone = cores.clone();
-        let n_workers = n;
-        rt_builder.on_thread_start(move || {
-            // Only pin the first N threads (the actual workers).
-            // Blocking pool threads arrive later and get skipped.
-            let idx = pinned_count.fetch_add(1, Ordering::Relaxed);
-            if idx < n_workers {
-                let core_id = cores_clone[idx % cores_clone.len()];
-                core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
-            }
-        });
-        info!("tokio workers pinned to cores {:?}", cores);
+        rt_builder.worker_threads(cores.len());
     }
     let rt = rt_builder.build().context("failed to build tokio runtime")?;
 
-    rt.block_on(async_main(ghost, spin_core, config_path))
+    rt.block_on(async {
+        // Pin tokio worker threads to specific cores before doing anything else.
+        // Each spawned task runs on a different worker; the task pins that worker's thread.
+        if let Some(ref cores) = tokio_cores {
+            let barrier = Arc::new(tokio::sync::Barrier::new(cores.len()));
+            let mut handles = Vec::new();
+            for &core_id in cores {
+                let b = Arc::clone(&barrier);
+                handles.push(tokio::spawn(async move {
+                    core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
+                    b.wait().await; // ensure all workers are pinned before proceeding
+                }));
+            }
+            for h in handles {
+                h.await.ok();
+            }
+            info!("tokio workers pinned to cores {:?}", cores);
+        }
+
+        async_main(ghost, spin_core, config_path).await
+    })
 }
 
 async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) -> Result<()> {
