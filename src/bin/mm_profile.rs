@@ -14,7 +14,7 @@ use chrono::Utc;
 const GLOBAL_HEADER: usize = 8;
 const METRIC_HEADER: usize = 16;
 const SAMPLE_SIZE: usize = 8;
-const SAMPLES_PER_METRIC: usize = 131_072;
+const SAMPLES_PER_METRIC: usize = 1_048_576;
 const METRIC_SECTION: usize = METRIC_HEADER + SAMPLES_PER_METRIC * SAMPLE_SIZE;
 const LATENCY_PATH: &str = "/tmp/mm_latency.bin";
 

@@ -44,9 +44,9 @@ pub mod latency {
     pub const GLOBAL_HEADER: usize = 8;
     pub const METRIC_HEADER: usize = 16; // write_pos(8) + capacity(8)
     pub const SAMPLE_SIZE: usize = 8;    // value_ns only (metric is implicit from the ring)
-    pub const SAMPLES_PER_METRIC: usize = 131_072; // 128K samples per metric
-    pub const METRIC_SECTION: usize = METRIC_HEADER + SAMPLES_PER_METRIC * SAMPLE_SIZE; // ~1MB per metric
-    pub const FILE_SIZE: usize = GLOBAL_HEADER + NUM_METRICS * METRIC_SECTION; // ~8MB total
+    pub const SAMPLES_PER_METRIC: usize = 1_048_576; // 1M samples per metric
+    pub const METRIC_SECTION: usize = METRIC_HEADER + SAMPLES_PER_METRIC * SAMPLE_SIZE; // 8MB per metric
+    pub const FILE_SIZE: usize = GLOBAL_HEADER + NUM_METRICS * METRIC_SECTION; // 64MB total
     pub const LATENCY_PATH: &str = "/tmp/mm_latency.bin";
 
     /// Lightweight recorder for the hot loop.
