@@ -248,6 +248,7 @@ pub struct MmEngine {
     config: StrategyConfig,
     shutdown: Arc<AtomicBool>,
     ghost: bool,
+    spin_core: Option<usize>,
     warmed_up: bool,
 
     bid_quote: Option<LiveQuote>,
@@ -284,6 +285,7 @@ impl MmEngine {
         params: Box<dyn MmParamSource>,
         config: StrategyConfig,
         ghost: bool,
+        spin_core: Option<usize>,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Self> {
         // Resolve the HL symbol to a SymbolId for fair price lookups
@@ -372,6 +374,7 @@ impl MmEngine {
             config,
             shutdown,
             ghost,
+            spin_core,
             warmed_up: false,
             bid_quote: None,
             ask_quote: None,
@@ -505,6 +508,15 @@ impl MmEngine {
 
     /// Hot loop on a dedicated OS thread — no tokio scheduling jitter.
     fn spin_loop(&mut self) {
+        if let Some(cpu) = self.spin_core {
+            let ok = core_affinity::set_for_current(core_affinity::CoreId { id: cpu });
+            if ok {
+                info!("hot loop pinned to CPU {cpu}");
+            } else {
+                warn!("failed to pin hot loop to CPU {cpu}");
+            }
+        }
+
         loop {
             if self.shutdown.load(Ordering::Relaxed) {
                 info!("MM engine shutting down");

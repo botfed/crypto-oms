@@ -30,15 +30,22 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // Parse CLI args: mm_hl [--ghost] [config_path]
+    // Parse CLI args: mm_hl [--ghost] [--spin-core N] [config_path]
     let mut ghost = false;
+    let mut spin_core: Option<usize> = None;
     let mut config_path = "configs/mm_hl.yaml".to_string();
-    for arg in std::env::args().skip(1) {
-        if arg == "--ghost" {
-            ghost = true;
-        } else {
-            config_path = arg;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--ghost" => ghost = true,
+            "--spin-core" => {
+                i += 1;
+                spin_core = Some(args[i].parse().expect("--spin-core requires a number"));
+            }
+            _ => config_path = args[i].clone(),
         }
+        i += 1;
     }
 
     if ghost {
@@ -190,6 +197,7 @@ async fn main() -> Result<()> {
         Box::new(params),
         config.strategy,
         ghost,
+        spin_core,
         engine_shutdown,
     )?;
 

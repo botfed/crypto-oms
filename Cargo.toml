@@ -37,6 +37,7 @@ memmap2 = "0.9"
 ctrlc = "3"
 libc = "0.2"
 dotenv = "0.15"
+core_affinity = "0.8"
 
 [patch.crates-io]
 tungstenite = { git = "https://github.com/signalapp/tungstenite-rs" }
