@@ -144,7 +144,7 @@ impl FairPriceEngine {
         let now = Utc::now();
         // Pick the pair with the freshest received_ts
         let mut best: Option<(f64, i64, usize, Option<DateTime<Utc>>)> = None;
-        let mut best_recv_age = u64::MAX;
+        let mut best_age = u64::MAX;
 
         for (idx, pair) in self.pairs.iter().enumerate() {
             if pair.target_exchange != exchange || pair.target_symbol_id != symbol_id {
@@ -155,7 +155,7 @@ impl FairPriceEngine {
             let Some(md) = coll.latest(&pair.reference_symbol_id) else { continue };
             let Some(ref_mid) = md.midquote() else { continue };
 
-            let recv_age_ns = md.received_ts
+            let age_ns = md.exchange_ts
                 .map(|ts| (now - ts).num_nanoseconds().unwrap_or(i64::MAX).max(0) as u64)
                 .unwrap_or(u64::MAX);
 
@@ -163,10 +163,10 @@ impl FairPriceEngine {
                 .map(|ts| ts.timestamp_millis())
                 .unwrap_or(0);
 
-            if recv_age_ns < best_recv_age {
+            if age_ns < best_age {
                 let basis = self.basis.get(&idx).map(|v| *v).unwrap_or(0.0);
                 best = Some((ref_mid + basis, exchange_ts_ms, idx, md.received_ts));
-                best_recv_age = recv_age_ns;
+                best_age = age_ns;
             }
         }
 
