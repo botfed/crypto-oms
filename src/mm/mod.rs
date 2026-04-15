@@ -43,7 +43,7 @@ pub mod latency {
     // Per-metric: 16-byte header (write_pos u64 + capacity u64) + samples (8 bytes each, just value_ns)
     pub const GLOBAL_HEADER: usize = 8;
     pub const METRIC_HEADER: usize = 16; // write_pos(8) + capacity(8)
-    pub const SAMPLE_SIZE: usize = 8;    // value_ns only (metric is implicit from the ring)
+    pub const SAMPLE_SIZE: usize = 8; // value_ns only (metric is implicit from the ring)
     pub const SAMPLES_PER_METRIC: usize = 1_048_576; // 1M samples per metric
     pub const METRIC_SECTION: usize = METRIC_HEADER + SAMPLES_PER_METRIC * SAMPLE_SIZE; // 8MB per metric
     pub const FILE_SIZE: usize = GLOBAL_HEADER + NUM_METRICS * METRIC_SECTION; // 64MB total
@@ -116,7 +116,11 @@ pub mod latency {
         recorder
     }
 
-    fn flush(buf: &Mutex<Vec<(u8, u64)>>, mmap: &mut memmap2::MmapMut, write_positions: &mut [u64; NUM_METRICS]) {
+    fn flush(
+        buf: &Mutex<Vec<(u8, u64)>>,
+        mmap: &mut memmap2::MmapMut,
+        write_positions: &mut [u64; NUM_METRICS],
+    ) {
         let samples = {
             let mut guard = buf.lock();
             std::mem::replace(&mut *guard, Vec::with_capacity(500_000))
@@ -129,7 +133,9 @@ pub mod latency {
         let cap = SAMPLES_PER_METRIC as u64;
         for (metric, value) in &samples {
             let m = *metric as usize;
-            if m >= NUM_METRICS { continue; }
+            if m >= NUM_METRICS {
+                continue;
+            }
             let wp = &mut write_positions[m];
             let section = metric_offset(m);
             let idx = (*wp % cap) as usize;
@@ -241,10 +247,7 @@ fn factor_mid(
             .map(|ts| (now - ts).num_nanoseconds().unwrap_or(i64::MAX).max(0) as u64)
             .unwrap_or(u64::MAX);
 
-        let exchange_ts_ms = md
-            .exchange_ts
-            .map(|ts| ts.timestamp_millis())
-            .unwrap_or(0);
+        let exchange_ts_ms = md.exchange_ts.map(|ts| ts.timestamp_millis()).unwrap_or(0);
 
         if recv_age_ns < best_recv_age {
             best = Some((mid, recv_age_ns, exchange_ts_ms, md.received_ts));
@@ -281,9 +284,9 @@ pub struct MmEngine {
     running_since: Option<Instant>,
     consecutive_rejects: u32,
     reject_pause_until: Option<Instant>,
-    last_ref_wc: u64,         // track seqlock write count to detect new ticks
+    last_ref_wc: u64, // track seqlock write count to detect new ticks
     trigger_received_ts: Option<chrono::DateTime<chrono::Utc>>, // received_ts of the feed that triggered the current tick
-    last_exchange_ts_ms: i64, // skip ticks with older exchange_ts
+    last_exchange_ts_ms: i64,                                   // skip ticks with older exchange_ts
     factor_model: Option<FactorModelState>,
     cached_vol_mult: f64,
     presigned_cancels: HashMap<ClientOrderId, SignedPayload>,
@@ -472,7 +475,9 @@ impl MmEngine {
             let mut trigger_exchange_ts_ms = i64::MIN;
 
             for f in &fm.factors {
-                if let Some((mid, _recv_age_ns, exch_ts_ms, recv_ts)) = factor_mid(&self.market_data, f) {
+                if let Some((mid, _recv_age_ns, exch_ts_ms, recv_ts)) =
+                    factor_mid(&self.market_data, f)
+                {
                     let r = mid.ln() - f.snapshot_log_mid;
                     sum += f.beta * r;
                     if exch_ts_ms > trigger_exchange_ts_ms {
@@ -553,21 +558,26 @@ impl MmEngine {
             }
 
             if self.state != EngineState::Running {
-                info!("MM engine entering Running state (warmup={}s)", self.config.warmup_secs);
+                info!(
+                    "MM engine entering Running state (warmup={}s)",
+                    self.config.warmup_secs
+                );
                 self.state = EngineState::Running;
                 self.running_since = Some(Instant::now());
             }
 
-            self.warmed_up = self.running_since
+            self.warmed_up = self
+                .running_since
                 .map(|t| t.elapsed() >= Duration::from_secs(self.config.warmup_secs))
                 .unwrap_or(false);
-
 
             // ── CHECK FOR NEW DATA ──
             #[cfg(feature = "profiling")]
             let fair_start = Instant::now();
 
-            let Some(tick) = self.resolve_tick() else { continue; };
+            let Some(tick) = self.resolve_tick() else {
+                continue;
+            };
 
             // Exchange_ts dedup (only for direct ticks)
             if tick.is_direct {
@@ -582,9 +592,13 @@ impl MmEngine {
             self.trigger_received_ts = tick.trigger_received_ts;
             #[cfg(feature = "profiling")]
             if self.warmed_up && tick.is_direct {
-                self.latency.record(latency::METRIC_FAIR, fair_start.elapsed().as_nanos() as u64);
+                self.latency
+                    .record(latency::METRIC_FAIR, fair_start.elapsed().as_nanos() as u64);
                 if let Some(ts) = tick.trigger_received_ts {
-                    let t2d_ns = (chrono::Utc::now() - ts).num_nanoseconds().unwrap_or(0).max(0) as u64;
+                    let t2d_ns = (chrono::Utc::now() - ts)
+                        .num_nanoseconds()
+                        .unwrap_or(0)
+                        .max(0) as u64;
                     self.latency.record(latency::METRIC_T2D, t2d_ns);
                 }
             }
@@ -595,8 +609,10 @@ impl MmEngine {
                     let recv_age_ms = (chrono::Utc::now() - ts).num_milliseconds();
                     if recv_age_ms > self.config.max_stale_ms as i64 {
                         if self.bid_quote.is_some() || self.ask_quote.is_some() {
-                            warn!("ref feed stale (recv_age={}ms > {}ms), cancelling all quotes",
-                                recv_age_ms, self.config.max_stale_ms);
+                            warn!(
+                                "ref feed stale (recv_age={}ms > {}ms), cancelling all quotes",
+                                recv_age_ms, self.config.max_stale_ms
+                            );
                             self.cancel_all_quotes();
                         }
                         continue;
@@ -612,7 +628,10 @@ impl MmEngine {
 
             #[cfg(feature = "profiling")]
             if self.warmed_up {
-                self.latency.record(latency::METRIC_TICK_FAST, tick_start.elapsed().as_nanos() as u64);
+                self.latency.record(
+                    latency::METRIC_TICK_FAST,
+                    tick_start.elapsed().as_nanos() as u64,
+                );
             }
 
             // ── SLOW PATH (~quote_interval_ms): quote placement ──
@@ -620,13 +639,21 @@ impl MmEngine {
             if self.warmed_up && self.last_quote_eval.elapsed() >= interval {
                 #[cfg(feature = "profiling")]
                 let vol_start = Instant::now();
-
-                self.evaluate_and_place_quotes(tick.fair);
+                self.cached_vol_mult = self.get_vol_multiplier(tick.fair);
 
                 #[cfg(feature = "profiling")]
                 if self.warmed_up {
-                    self.latency.record(latency::METRIC_VOL, vol_start.elapsed().as_nanos() as u64);
-                    self.latency.record(latency::METRIC_TICK_SLOW, tick_start.elapsed().as_nanos() as u64);
+                    self.latency
+                        .record(latency::METRIC_VOL, vol_start.elapsed().as_nanos() as u64);
+                }
+
+                self.evaluate_and_place_quotes(tick.fair);
+                #[cfg(feature = "profiling")]
+                if self.warmed_up {
+                    self.latency.record(
+                        latency::METRIC_TICK_SLOW,
+                        tick_start.elapsed().as_nanos() as u64,
+                    );
                 }
 
                 self.last_quote_eval = Instant::now();
@@ -640,7 +667,10 @@ impl MmEngine {
 
             #[cfg(feature = "profiling")]
             if self.warmed_up {
-                self.latency.record(latency::METRIC_TICK_END, tick_start.elapsed().as_nanos() as u64);
+                self.latency.record(
+                    latency::METRIC_TICK_END,
+                    tick_start.elapsed().as_nanos() as u64,
+                );
             }
         }
     }
@@ -676,15 +706,21 @@ impl MmEngine {
                 } else {
                     if should_log {
                         let remaining = until.duration_since(Instant::now());
-                        warn!("paused: {} consecutive rejects (retry in {:.0}s)",
-                            self.consecutive_rejects, remaining.as_secs_f64());
+                        warn!(
+                            "paused: {} consecutive rejects (retry in {:.0}s)",
+                            self.consecutive_rejects,
+                            remaining.as_secs_f64()
+                        );
                         self.last_status_log = Instant::now();
                     }
                     return false;
                 }
             } else {
-                warn!("paused: {} consecutive rejects, cooldown {}s",
-                    self.consecutive_rejects, REJECT_COOLDOWN.as_secs());
+                warn!(
+                    "paused: {} consecutive rejects, cooldown {}s",
+                    self.consecutive_rejects,
+                    REJECT_COOLDOWN.as_secs()
+                );
                 self.reject_pause_until = Some(Instant::now() + REJECT_COOLDOWN);
                 self.last_status_log = Instant::now();
                 return false;
@@ -796,10 +832,10 @@ impl MmEngine {
             return;
         }
 
-        let rounded_fair = self.oms.round_price(fair);
-        let min_edge = self.config.min_edge_bps * rounded_fair / 10_000.0;
-        let min_spread =
-            (self.config.ref_min_spread_bps * self.cached_vol_mult * rounded_fair / 10_000.0).max(min_edge);
+        let min_edge = self.config.min_edge_bps * fair / 10_000.0;
+        let min_spread = (self.config.ref_min_spread_bps * self.cached_vol_mult * fair
+            / 10_000.0)
+            .max(min_edge);
 
         // Check bid: inside min_spread from fair?
         if let Some(ref q) = self.bid_quote {
@@ -808,12 +844,7 @@ impl MmEngine {
                 state,
                 Some(OrderState::Accepted) | Some(OrderState::PartiallyFilled)
             );
-            if can_cancel && q.price > rounded_fair - min_spread {
-                let drift_bps = (q.price - (rounded_fair - min_spread)) / rounded_fair * 10_000.0;
-                debug!(
-                    "fast cancel bid cid={} price={:.6} ({:.1}bps inside)",
-                    q.client_id.0, q.price, drift_bps
-                );
+            if can_cancel && q.price > self.oms.round_price(fair - min_spread) {
                 #[cfg(feature = "profiling")]
                 let sign_start = Instant::now();
                 let signed = if let Some(s) = self.presigned_cancels.remove(&q.client_id) {
@@ -851,12 +882,7 @@ impl MmEngine {
                 state,
                 Some(OrderState::Accepted) | Some(OrderState::PartiallyFilled)
             );
-            if can_cancel && q.price < rounded_fair + min_spread {
-                let drift_bps = ((rounded_fair + min_spread) - q.price) / rounded_fair * 10_000.0;
-                debug!(
-                    "fast cancel ask cid={} price={:.6} ({:.1}bps inside)",
-                    q.client_id.0, q.price, drift_bps
-                );
+            if can_cancel && q.price < self.oms.round_price(fair + min_spread) {
                 #[cfg(feature = "profiling")]
                 let sign_start = Instant::now();
                 let signed = if let Some(s) = self.presigned_cancels.remove(&q.client_id) {
@@ -902,11 +928,12 @@ impl MmEngine {
         let order_size = notional / fair;
         let max_pos = self.params.max_position_usd() / fair;
 
-        self.cached_vol_mult = self.get_vol_multiplier(fair);
         let min_edge = self.config.min_edge_bps * fair / 10_000.0;
-        let half_spread =
-            (self.config.ref_half_spread_bps * self.cached_vol_mult * fair / 10_000.0).max(min_edge);
-        let requote_thresh = self.config.ref_requote_tolerance_bps * self.cached_vol_mult * fair / 10_000.0;
+        let half_spread = (self.config.ref_half_spread_bps * self.cached_vol_mult * fair
+            / 10_000.0)
+            .max(min_edge);
+        let requote_thresh =
+            self.config.ref_requote_tolerance_bps * self.cached_vol_mult * fair / 10_000.0;
 
         let skewed_mid = self.compute_skewed_mid(fair, position, target, max_pos);
         let rounded_fair = self.oms.round_price(fair);
@@ -1103,7 +1130,10 @@ impl MmEngine {
     fn record_t2t(&self) {
         if self.warmed_up {
             if let Some(ts) = self.trigger_received_ts {
-                let age_ns = (chrono::Utc::now() - ts).num_nanoseconds().unwrap_or(0).max(0) as u64;
+                let age_ns = (chrono::Utc::now() - ts)
+                    .num_nanoseconds()
+                    .unwrap_or(0)
+                    .max(0) as u64;
                 self.latency.record(latency::METRIC_T2T, age_ns);
             }
         }
@@ -1295,7 +1325,9 @@ impl MmEngine {
                     self.reject_pause_until = None;
                     // Pre-sign cancel for fast path
                     match self.oms.presign_cancel_order(&client_id) {
-                        Ok(signed) => { self.presigned_cancels.insert(client_id, signed); }
+                        Ok(signed) => {
+                            self.presigned_cancels.insert(client_id, signed);
+                        }
                         Err(e) => debug!("pre-sign cancel failed for {}: {e}", client_id.0),
                     }
                 }
