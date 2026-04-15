@@ -1,9 +1,6 @@
 use anyhow::{Context, Result};
 use crypto_feeds::app_config::{load_perp, load_spot};
-use crypto_feeds::bar_manager::{BarManager, BarSymbol};
 use crypto_feeds::historical_bars::{aggregate_bars, load_1m_bars_with_backfill};
-use crypto_feeds::market_data::{Exchange, InstrumentType};
-use crypto_feeds::symbol_registry::REGISTRY;
 use crypto_feeds::vol_provider::VolProvider;
 use crypto_feeds::AllMarketData;
 use crypto_oms::hyperliquid::HyperliquidOms;
@@ -160,64 +157,35 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
             all_params.len(), all_params.keys().collect::<Vec<_>>());
 
         let target_min = all_params.values().next().map(|p| p.target_min).unwrap_or(5);
-        let max_window = all_params.values()
-            .flat_map(|p| [
-                p.har_ols.as_ref().map(|h| h.max_window()),
-                p.har_qlike.as_ref().map(|h| h.max_window()),
-            ])
-            .flatten()
-            .max()
-            .unwrap_or(288) + 16;
 
-        // Resolve BarSymbol for each vol symbol (Binance perp preferred)
-        let mut bar_symbols = Vec::new();
+        // Build HAR vol provider: load warmup bars per symbol, pair with HAR params
+        let bar_data_dir = Path::new(&vol_cfg.bar_data_dir);
         let mut har_groups = Vec::new();
         for (sym, params) in all_params {
-            let perp_sym = format!("{}_USDT", sym);
-            let spot_sym = format!("{}_USDT", sym);
-            let venue = if let Some(&id) = REGISTRY.lookup(&perp_sym, &InstrumentType::Perp) {
-                Some((Exchange::Binance, id))
-            } else if let Some(&id) = REGISTRY.lookup(&spot_sym, &InstrumentType::Spot) {
-                Some((Exchange::Binance, id))
-            } else {
-                warn!("no Binance venue found for {}, skipping vol", sym);
-                None
+            let har = match vol_model_name.as_str() {
+                "har_ols" => params.har_ols.clone(),
+                _ => params.har_qlike.clone(),
             };
-            if let Some((exchange, symbol_id)) = venue {
-                bar_symbols.push(BarSymbol { name: sym.clone(), exchange, symbol_id });
-                // Pick har_qlike or har_ols based on config
-                let har = match vol_model_name.as_str() {
-                    "har_ols" => params.har_ols.clone(),
-                    _ => params.har_qlike.clone(),
-                };
-                if let Some(har_params) = har {
-                    har_groups.push((sym, har_params, params.seasonality.clone(), target_min));
-                }
-            }
-        }
+            let Some(har_params) = har else { continue };
 
-        // Create bar manager
-        let bar_mgr = Arc::new(BarManager::new(bar_symbols, target_min, max_window));
-
-        // Warmup from historical bars
-        let bar_data_dir = Path::new(&vol_cfg.bar_data_dir);
-        for sym in bar_mgr.symbols() {
-            match load_1m_bars_with_backfill(bar_data_dir, &sym, vol_cfg.warmup_days).await {
+            // Load historical bars for warmup
+            let warmup_bars = match load_1m_bars_with_backfill(bar_data_dir, &sym, vol_cfg.warmup_days).await {
                 Ok(bars_1m) => {
                     let target_bars = aggregate_bars(&bars_1m, target_min);
-                    bar_mgr.warmup(&sym, target_bars, &bars_1m);
-                    info!("vol warmup: {} bars for {}", bar_mgr.symbols().len(), sym);
+                    info!("vol warmup: {} target bars for {}", target_bars.len(), sym);
+                    target_bars
                 }
-                Err(e) => warn!("vol warmup failed for {}: {}", sym, e),
-            }
+                Err(e) => {
+                    warn!("vol warmup failed for {}: {}", sym, e);
+                    Vec::new()
+                }
+            };
+
+            har_groups.push((har_params, params.seasonality.clone(), target_min, warmup_bars));
         }
 
-        // Spawn bar maintenance (converts live ticks → bars)
-        handles.push(bar_mgr.spawn_maintenance(Arc::clone(&market_data), Arc::clone(&shutdown)));
-
-        // Create vol provider (lock-free HAR)
         let seed_vol = config.strategy.ref_vol;
-        let provider = VolProvider::new_har(har_groups, bar_mgr, seed_vol);
+        let provider = VolProvider::new_har(har_groups, seed_vol);
         info!("vol provider ready (model={}, lock-free HAR)", vol_model_name);
 
         Some(provider)
