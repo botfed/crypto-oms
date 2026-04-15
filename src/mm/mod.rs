@@ -543,6 +543,7 @@ impl MmEngine {
             if self.shutdown.load(Ordering::Relaxed) {
                 info!("MM engine shutting down");
                 self.cancel_all_quotes();
+                std::thread::sleep(Duration::from_secs(1));
                 return;
             }
 
