@@ -285,7 +285,8 @@ pub struct MmEngine {
     reject_pause_until: Option<Instant>,
     last_ref_wc: u64, // track seqlock write count to detect new ticks
     trigger_received_ts: Option<chrono::DateTime<chrono::Utc>>, // received_ts of the feed that triggered the current tick
-    last_exchange_ts_ms: i64,                                   // skip ticks with older exchange_ts
+    last_exchange_ts_ms: i64,        // global freshness watermark
+    last_direct_exchange_ts_ms: i64, // freshest direct tick exchange_ts (for factor snapshot gating)
     factor_model: Option<FactorModelState>,
     cached_vol_mult: f64,
     presigned_cancels: HashMap<ClientOrderId, SignedPayload>,
@@ -408,6 +409,7 @@ impl MmEngine {
             last_ref_wc: 0,
             trigger_received_ts: None,
             last_exchange_ts_ms: 0,
+            last_direct_exchange_ts_ms: 0,
             factor_model,
             cached_vol_mult: 1.0,
             presigned_cancels: HashMap::new(),
@@ -420,89 +422,131 @@ impl MmEngine {
     // Factor model helpers
     // -----------------------------------------------------------------------
 
-    /// Resolve the next tick: direct (from FairPriceEngine) or factor-model-adjusted.
-    /// Direct ticks always take priority. Factor ticks only fire when no direct tick
-    /// and the model has been seeded by at least one direct tick.
+    /// Resolve the next tick. Returns the freshest fair price by exchange_ts,
+    /// either direct or factor-adjusted. Snapshots factor mids only when the
+    /// direct feed genuinely advances. Global exchange_ts watermark prevents
+    /// stale or backwards ticks.
     fn resolve_tick(&mut self) -> Option<TickSource> {
-        // 1. Check direct tick
+        // 1. Check for new direct tick
+        let mut direct_advanced = false;
+        let mut direct_received_ts: Option<chrono::DateTime<chrono::Utc>> = None;
+
         let wc = self
             .fair_price
             .ref_write_count(ExchangeId::Hyperliquid, self.hl_symbol_id);
         if wc != self.last_ref_wc {
             self.last_ref_wc = wc;
 
-            let (fair, exchange_ts_ms, _, received_ts) = self
+            if let Some((fair, exchange_ts_ms, _, received_ts)) = self
                 .fair_price
-                .get_fair_price_with_age(ExchangeId::Hyperliquid, self.hl_symbol_id)?;
-
-            // Snapshot factor mids on direct tick
-            if let Some(ref mut fm) = self.factor_model {
-                fm.last_direct_fair = fair;
-                for f in &mut fm.factors {
-                    if let Some((mid, _, _)) = factor_mid(&self.market_data, f) {
-                        f.snapshot_log_mid = mid.ln();
+                .get_fair_price_with_age(ExchangeId::Hyperliquid, self.hl_symbol_id)
+            {
+                if exchange_ts_ms > self.last_direct_exchange_ts_ms {
+                    self.last_direct_exchange_ts_ms = exchange_ts_ms;
+                    direct_received_ts = received_ts;
+                    direct_advanced = true;
+                    if let Some(ref mut fm) = self.factor_model {
+                        fm.last_direct_fair = fair;
+                        fm.seeded = true;
                     }
                 }
-                fm.last_factor_wc = total_factor_wc(&self.market_data, fm);
-                fm.seeded = true;
             }
-
-            return Some(TickSource {
-                fair,
-                exchange_ts_ms,
-                trigger_received_ts: received_ts,
-                is_direct: true,
-            });
         }
 
-        // 2. Check factor model ticks
+        // 2. Single pass through factors: snapshot on direct advance, compute adjustment
         if let Some(ref mut fm) = self.factor_model {
             if !fm.seeded {
                 return None;
             }
 
-            let current_wc = total_factor_wc(&self.market_data, fm);
-            if current_wc == fm.last_factor_wc {
-                return None;
-            }
-            fm.last_factor_wc = current_wc;
+            let factor_wc_changed = {
+                let current_wc = total_factor_wc(&self.market_data, fm);
+                if current_wc != fm.last_factor_wc {
+                    fm.last_factor_wc = current_wc;
+                    true
+                } else {
+                    false
+                }
+            };
 
-            // Compute sum of beta_i * r_i
-            let mut sum = 0.0f64;
-            // Track the trigger: the factor with the newest exchange_ts
-            let mut trigger_received_ts: Option<chrono::DateTime<chrono::Utc>> = None;
-            let mut trigger_exchange_ts_ms = i64::MIN;
+            if direct_advanced || factor_wc_changed {
+                let mut sum = 0.0f64;
+                let mut best_exchange_ts = i64::MIN;
+                let mut best_received_ts: Option<chrono::DateTime<chrono::Utc>> = None;
 
-            for f in &fm.factors {
-                if let Some((mid, exch_ts_ms, recv_ts)) =
-                    factor_mid(&self.market_data, f)
-                {
-                    let r = mid.ln() - f.snapshot_log_mid;
-                    sum += f.beta * r;
-                    if exch_ts_ms > trigger_exchange_ts_ms {
-                        trigger_exchange_ts_ms = exch_ts_ms;
-                        trigger_received_ts = recv_ts;
+                for f in &mut fm.factors {
+                    let Some((mid, exch_ts_ms, recv_ts)) =
+                        factor_mid(&self.market_data, f)
+                    else {
+                        continue;
+                    };
+
+                    // Snapshot ALL factors unconditionally on direct advance
+                    if direct_advanced {
+                        f.snapshot_log_mid = mid.ln();
+                    }
+
+                    // Only compute returns for factors fresher than the direct tick
+                    if exch_ts_ms > self.last_direct_exchange_ts_ms {
+                        let r = mid.ln() - f.snapshot_log_mid;
+                        sum += f.beta * r;
+                        if exch_ts_ms > best_exchange_ts {
+                            best_exchange_ts = exch_ts_ms;
+                            best_received_ts = recv_ts;
+                        }
                     }
                 }
+
+                // Determine best tick to return
+                let (tick_fair, tick_ts, tick_recv_ts, tick_is_direct) =
+                    if direct_advanced && self.last_direct_exchange_ts_ms >= best_exchange_ts {
+                        // Direct is freshest — factor returns are ~0
+                        (fm.last_direct_fair, self.last_direct_exchange_ts_ms, direct_received_ts, true)
+                    } else if sum.abs() > 1e-15 && best_exchange_ts > i64::MIN {
+                        // Factors are fresher and meaningful
+                        let corr_fair = fm.last_direct_fair * sum.exp();
+                        (corr_fair, best_exchange_ts, best_received_ts, false)
+                    } else if direct_advanced {
+                        // Direct advanced but no meaningful factor move
+                        (fm.last_direct_fair, self.last_direct_exchange_ts_ms, direct_received_ts, true)
+                    } else {
+                        return None;
+                    };
+
+                // Global freshness gate
+                if tick_ts <= self.last_exchange_ts_ms {
+                    return None;
+                }
+                self.last_exchange_ts_ms = tick_ts;
+
+                return Some(TickSource {
+                    fair: tick_fair,
+                    exchange_ts_ms: tick_ts,
+                    trigger_received_ts: tick_recv_ts,
+                    is_direct: tick_is_direct,
+                });
             }
+        }
 
-            if sum.abs() < 1e-15 {
-                return None; // no meaningful move
+        // 3. Direct advanced but no factor model
+        if direct_advanced {
+            if self.last_direct_exchange_ts_ms <= self.last_exchange_ts_ms {
+                return None;
             }
+            self.last_exchange_ts_ms = self.last_direct_exchange_ts_ms;
 
-            let corr_fair = fm.last_direct_fair * sum.exp();
-
-            debug!(
-                "factor model: sum={:.6} corr_fair={:.6} direct_fair={:.6}",
-                sum, corr_fair, fm.last_direct_fair,
-            );
-
-            return Some(TickSource {
-                fair: corr_fair,
-                exchange_ts_ms: trigger_exchange_ts_ms,
-                trigger_received_ts,
-                is_direct: false,
-            });
+            // Need fair price again (no factor model to store it)
+            if let Some((fair, _, _, received_ts)) = self
+                .fair_price
+                .get_fair_price_with_age(ExchangeId::Hyperliquid, self.hl_symbol_id)
+            {
+                return Some(TickSource {
+                    fair,
+                    exchange_ts_ms: self.last_direct_exchange_ts_ms,
+                    trigger_received_ts: received_ts,
+                    is_direct: true,
+                });
+            }
         }
 
         None
@@ -582,17 +626,16 @@ impl MmEngine {
             // ── NEW TICK ──
             #[cfg(feature = "profiling")]
             let tick_start = Instant::now();
-            let now_ms = chrono::Utc::now().timestamp_millis();
 
-            // Exchange_ts dedup — skip stale or future ticks
-            if tick.exchange_ts_ms <= self.last_exchange_ts_ms || tick.exchange_ts_ms >= now_ms {
+            // Future tick guard (exchange clock ahead)
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            if tick.exchange_ts_ms > now_ms {
                 continue;
             }
 
-            self.last_exchange_ts_ms = tick.exchange_ts_ms;
             self.trigger_received_ts = tick.trigger_received_ts;
             #[cfg(feature = "profiling")]
-            if self.warmed_up && tick.is_direct {
+            if self.warmed_up {
                 self.latency
                     .record(latency::METRIC_FAIR, fair_start.elapsed().as_nanos() as u64);
                 if let Some(ts) = tick.trigger_received_ts {
