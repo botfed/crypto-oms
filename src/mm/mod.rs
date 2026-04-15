@@ -261,9 +261,8 @@ fn factor_mid(
 pub struct MmEngine {
     oms: Arc<HyperliquidOms>,
     fair_price: Arc<FairPriceEngine>,
-    vol_engine: Option<Arc<crypto_feeds::vol_engine::VolEngine>>,
+    vol_provider: Option<crypto_feeds::vol_provider::VolProvider>,
     market_data: Arc<crypto_feeds::AllMarketData>,
-    vol_model_name: String,
     params: Box<dyn MmParamSource>,
     config: StrategyConfig,
     shutdown: Arc<AtomicBool>,
@@ -299,9 +298,8 @@ impl MmEngine {
     pub fn new(
         oms: Arc<HyperliquidOms>,
         fair_price: Arc<FairPriceEngine>,
-        vol_engine: Option<Arc<crypto_feeds::vol_engine::VolEngine>>,
+        vol_provider: Option<crypto_feeds::vol_provider::VolProvider>,
         market_data: Arc<crypto_feeds::AllMarketData>,
-        vol_model_name: String,
         params: Box<dyn MmParamSource>,
         config: StrategyConfig,
         ghost: bool,
@@ -387,9 +385,8 @@ impl MmEngine {
         Ok(Self {
             oms,
             fair_price,
-            vol_engine,
+            vol_provider,
             market_data,
-            vol_model_name,
             params,
             config,
             shutdown,
@@ -904,7 +901,7 @@ impl MmEngine {
         let order_size = notional / fair;
         let max_pos = self.params.max_position_usd() / fair;
 
-        self.cached_vol_mult = self.get_vol_multiplier();
+        self.cached_vol_mult = self.get_vol_multiplier(fair);
         let min_edge = self.config.min_edge_bps * fair / 10_000.0;
         let half_spread =
             (self.config.ref_half_spread_bps * self.cached_vol_mult * fair / 10_000.0).max(min_edge);
@@ -1110,22 +1107,15 @@ impl MmEngine {
         }
     }
 
-    fn get_vol_multiplier(&self) -> f64 {
-        let Some(ref ve) = self.vol_engine else {
+    fn get_vol_multiplier(&mut self, fair: f64) -> f64 {
+        let Some(ref mut vp) = self.vol_provider else {
             return 1.0;
         };
-        let preds = match ve.predict_now(&self.config.vol_symbol, &self.market_data) {
-            Ok(p) => p,
-            Err(_) => return 1.0,
-        };
-        let predicted = match self.vol_model_name.as_str() {
-            "har_ols" => preds.har_ols,
-            "har_qlike" => preds.har_qlike,
-            "garch" => preds.garch,
-            "ewma" => preds.ewma,
-            _ => preds.har_qlike,
-        };
-        if self.config.ref_vol <= 0.0 || predicted <= 0.0 {
+        // Update vol provider with current fair price (drives HAR virtual head)
+        let ts_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        vp.update(0, fair, ts_ns);
+        let predicted = vp.ann_vol(0);
+        if self.config.ref_vol <= 0.0 || predicted <= 0.0 || !predicted.is_finite() {
             return 1.0;
         }
         (predicted / self.config.ref_vol)
@@ -1219,7 +1209,7 @@ impl MmEngine {
             _ => 0.0,
         };
 
-        let vol_mult = self.get_vol_multiplier();
+        let vol_mult = self.cached_vol_mult;
         let adj_min_bps = (self.config.ref_min_spread_bps * vol_mult).max(self.config.min_edge_bps);
         let adj_spread_bps =
             (self.config.ref_half_spread_bps * vol_mult).max(self.config.min_edge_bps);
@@ -1227,19 +1217,9 @@ impl MmEngine {
 
         // Get raw vol prediction for logging
         let pred_vol_ann = self
-            .vol_engine
+            .vol_provider
             .as_ref()
-            .and_then(|ve| {
-                ve.predict_now(&self.config.vol_symbol, &self.market_data)
-                    .ok()
-            })
-            .map(|p| match self.vol_model_name.as_str() {
-                "har_ols" => p.har_ols,
-                "har_qlike" => p.har_qlike,
-                "garch" => p.garch,
-                "ewma" => p.ewma,
-                _ => p.har_qlike,
-            })
+            .map(|vp| vp.ann_vol(0))
             .unwrap_or(0.0);
 
         info!(

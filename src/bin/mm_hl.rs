@@ -4,14 +4,13 @@ use crypto_feeds::bar_manager::{BarManager, BarSymbol};
 use crypto_feeds::historical_bars::{aggregate_bars, load_1m_bars_with_backfill};
 use crypto_feeds::market_data::{Exchange, InstrumentType};
 use crypto_feeds::symbol_registry::REGISTRY;
-use crypto_feeds::vol_engine::VolEngine;
+use crypto_feeds::vol_provider::VolProvider;
 use crypto_feeds::AllMarketData;
 use crypto_oms::hyperliquid::HyperliquidOms;
 use crypto_oms::mm::config::{MmConfig, WatchParams};
 use crypto_oms::mm::fair_price::FairPriceEngine;
 use crypto_oms::mm::inventory::start_inventory_manager;
 use crypto_oms::mm::MmEngine;
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -144,14 +143,14 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
     // Build params
     let (params, _controller) = WatchParams::new(&config.strategy, target_rx);
 
-    // Initialize vol engine if vol_models is configured
+    // Initialize vol provider if vol_models is configured
     let vol_model_name = config.vol_models
         .as_ref()
         .map(|v| v.model.clone())
         .unwrap_or_else(|| "har_qlike".to_string());
 
-    let vol_engine = if let Some(ref vol_cfg) = config.vol_models {
-        info!("initializing vol engine from {}", vol_cfg.params_dir);
+    let vol_provider = if let Some(ref vol_cfg) = config.vol_models {
+        info!("initializing vol provider from {}", vol_cfg.params_dir);
 
         let params_dir = Path::new(&vol_cfg.params_dir);
         let all_params = crypto_feeds::vol_params::load_all_vol_params(params_dir)
@@ -172,7 +171,7 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
 
         // Resolve BarSymbol for each vol symbol (Binance perp preferred)
         let mut bar_symbols = Vec::new();
-        let mut param_map = HashMap::new();
+        let mut har_groups = Vec::new();
         for (sym, params) in all_params {
             let perp_sym = format!("{}_USDT", sym);
             let spot_sym = format!("{}_USDT", sym);
@@ -186,7 +185,14 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
             };
             if let Some((exchange, symbol_id)) = venue {
                 bar_symbols.push(BarSymbol { name: sym.clone(), exchange, symbol_id });
-                param_map.insert(sym, params);
+                // Pick har_qlike or har_ols based on config
+                let har = match vol_model_name.as_str() {
+                    "har_ols" => params.har_ols.clone(),
+                    _ => params.har_qlike.clone(),
+                };
+                if let Some(har_params) = har {
+                    har_groups.push((sym, har_params, params.seasonality.clone(), target_min));
+                }
             }
         }
 
@@ -209,12 +215,12 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
         // Spawn bar maintenance (converts live ticks → bars)
         handles.push(bar_mgr.spawn_maintenance(Arc::clone(&market_data), Arc::clone(&shutdown)));
 
-        // Create vol engine
-        let engine = Arc::new(VolEngine::new(param_map, Arc::clone(&bar_mgr)));
-        engine.replay_history();
-        info!("vol engine ready (model={})", vol_model_name);
+        // Create vol provider (lock-free HAR)
+        let seed_vol = config.strategy.ref_vol;
+        let provider = VolProvider::new_har(har_groups, bar_mgr, seed_vol);
+        info!("vol provider ready (model={}, lock-free HAR)", vol_model_name);
 
-        Some(engine)
+        Some(provider)
     } else {
         info!("no vol_models configured, vol_mult=1.0");
         None
@@ -224,9 +230,8 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
     let engine = MmEngine::new(
         oms,
         fair_price,
-        vol_engine,
+        vol_provider,
         market_data,
-        vol_model_name,
         Box::new(params),
         config.strategy,
         ghost,
