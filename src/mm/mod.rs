@@ -625,12 +625,6 @@ impl MmEngine {
             #[cfg(feature = "profiling")]
             let tick_start = Instant::now();
 
-            // // Future tick guard (exchange clock ahead)
-            // let now_ms = chrono::Utc::now().timestamp_millis();
-            // if tick.exchange_ts_ms > now_ms {
-            //     continue;
-            // }
-
             self.trigger_received_instant = tick.trigger_received_instant;
             #[cfg(feature = "profiling")]
             if self.warmed_up {
