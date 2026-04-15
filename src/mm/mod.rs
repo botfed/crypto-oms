@@ -226,7 +226,7 @@ fn total_factor_wc(market_data: &crypto_feeds::AllMarketData, fm: &FactorModelSt
 }
 
 /// Get freshest mid across exchanges for a factor.
-/// Returns (mid, received_age_ns, exchange_ts_ms, received_ts).
+/// Returns (mid, best_age_ns, exchange_ts_ms, received_ts).
 fn factor_mid(
     market_data: &crypto_feeds::AllMarketData,
     factor: &FactorState,
