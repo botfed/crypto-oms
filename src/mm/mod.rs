@@ -937,9 +937,8 @@ impl MmEngine {
             self.config.ref_requote_tolerance_bps * self.cached_vol_mult * fair / 10_000.0;
 
         let skewed_mid = self.compute_skewed_mid(fair, position, target, max_pos);
-        let rounded_fair = self.oms.round_price(fair);
         let (desired_bid, desired_ask) = Self::clamp_to_fair(
-            rounded_fair,
+            fair,
             skewed_mid - half_spread,
             skewed_mid + half_spread,
             self.config.min_edge_bps,
