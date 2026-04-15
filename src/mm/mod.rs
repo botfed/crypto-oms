@@ -285,7 +285,7 @@ pub struct MmEngine {
     reject_pause_until: Option<Instant>,
     last_ref_wc: u64, // track seqlock write count to detect new ticks
     trigger_received_ts: Option<chrono::DateTime<chrono::Utc>>, // received_ts of the feed that triggered the current tick
-    last_exchange_ts_ms: i64,        // global freshness watermark
+    last_exchange_ts_ms: i64,                                   // global freshness watermark
     last_direct_exchange_ts_ms: i64, // freshest direct tick exchange_ts (for factor snapshot gating)
     factor_model: Option<FactorModelState>,
     cached_vol_mult: f64,
@@ -429,7 +429,7 @@ impl MmEngine {
     fn resolve_tick(&mut self) -> Option<TickSource> {
         // 1. Check for new direct tick
         let mut direct_advanced = false;
-        let mut direct_received_ts: Option<chrono::DateTime<chrono::Utc>> = None;
+        let mut best_received_ts: Option<chrono::DateTime<chrono::Utc>> = None;
 
         let wc = self
             .fair_price
@@ -443,7 +443,9 @@ impl MmEngine {
             {
                 if exchange_ts_ms > self.last_direct_exchange_ts_ms {
                     self.last_direct_exchange_ts_ms = exchange_ts_ms;
-                    direct_received_ts = received_ts;
+                    if received_ts > best_received_ts {
+                        best_received_ts = received_ts;
+                    }
                     direct_advanced = true;
                     if let Some(ref mut fm) = self.factor_model {
                         fm.last_direct_fair = fair;
@@ -472,12 +474,9 @@ impl MmEngine {
             if direct_advanced || factor_wc_changed {
                 let mut sum = 0.0f64;
                 let mut best_exchange_ts = i64::MIN;
-                let mut best_received_ts: Option<chrono::DateTime<chrono::Utc>> = None;
 
                 for f in &mut fm.factors {
-                    let Some((mid, exch_ts_ms, recv_ts)) =
-                        factor_mid(&self.market_data, f)
-                    else {
+                    let Some((mid, exch_ts_ms, recv_ts)) = factor_mid(&self.market_data, f) else {
                         continue;
                     };
 
@@ -492,7 +491,9 @@ impl MmEngine {
                         sum += f.beta * r;
                         if exch_ts_ms > best_exchange_ts {
                             best_exchange_ts = exch_ts_ms;
-                            best_received_ts = recv_ts;
+                            if recv_ts > best_received_ts {
+                                best_received_ts = recv_ts;
+                            }
                         }
                     }
                 }
@@ -501,14 +502,24 @@ impl MmEngine {
                 let (tick_fair, tick_ts, tick_recv_ts, tick_is_direct) =
                     if direct_advanced && self.last_direct_exchange_ts_ms >= best_exchange_ts {
                         // Direct is freshest — factor returns are ~0
-                        (fm.last_direct_fair, self.last_direct_exchange_ts_ms, direct_received_ts, true)
+                        (
+                            fm.last_direct_fair,
+                            self.last_direct_exchange_ts_ms,
+                            best_received_ts,
+                            true,
+                        )
                     } else if sum.abs() > 1e-15 && best_exchange_ts > i64::MIN {
                         // Factors are fresher and meaningful
                         let corr_fair = fm.last_direct_fair * sum.exp();
                         (corr_fair, best_exchange_ts, best_received_ts, false)
                     } else if direct_advanced {
                         // Direct advanced but no meaningful factor move
-                        (fm.last_direct_fair, self.last_direct_exchange_ts_ms, direct_received_ts, true)
+                        (
+                            fm.last_direct_fair,
+                            self.last_direct_exchange_ts_ms,
+                            best_received_ts,
+                            true,
+                        )
                     } else {
                         return None;
                     };
@@ -536,14 +547,14 @@ impl MmEngine {
             self.last_exchange_ts_ms = self.last_direct_exchange_ts_ms;
 
             // Need fair price again (no factor model to store it)
-            if let Some((fair, _, _, received_ts)) = self
+            if let Some((fair, _, _, _)) = self
                 .fair_price
                 .get_fair_price_with_age(ExchangeId::Hyperliquid, self.hl_symbol_id)
             {
                 return Some(TickSource {
                     fair,
                     exchange_ts_ms: self.last_direct_exchange_ts_ms,
-                    trigger_received_ts: received_ts,
+                    trigger_received_ts: best_received_ts,
                     is_direct: true,
                 });
             }
@@ -877,9 +888,8 @@ impl MmEngine {
         }
 
         let min_edge = self.config.min_edge_bps * fair / 10_000.0;
-        let min_spread = (self.config.ref_min_spread_bps * self.cached_vol_mult * fair
-            / 10_000.0)
-            .max(min_edge);
+        let min_spread =
+            (self.config.ref_min_spread_bps * self.cached_vol_mult * fair / 10_000.0).max(min_edge);
 
         // Check bid: inside min_spread from fair?
         if let Some(ref q) = self.bid_quote {
