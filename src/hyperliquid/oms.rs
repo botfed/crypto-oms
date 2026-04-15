@@ -1327,6 +1327,10 @@ impl ExchangeOms for HyperliquidOms {
     fn subscribe(&self) -> broadcast::Receiver<OmsEvent> {
         self.event_tx.subscribe()
     }
+
+    fn round_price(&self, price: f64) -> f64 {
+        round_price_for_hl(price)
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -70,4 +70,7 @@ pub trait ExchangeOms: Send + Sync {
 
     /// Subscribe to real-time OMS events.
     fn subscribe(&self) -> broadcast::Receiver<OmsEvent>;
+
+    /// Round a price to the exchange's tick/precision rules.
+    fn round_price(&self, price: f64) -> f64;
 }

@@ -796,9 +796,10 @@ impl MmEngine {
             return;
         }
 
-        let min_edge = self.config.min_edge_bps * fair / 10_000.0;
+        let rounded_fair = self.oms.round_price(fair);
+        let min_edge = self.config.min_edge_bps * rounded_fair / 10_000.0;
         let min_spread =
-            (self.config.ref_min_spread_bps * self.cached_vol_mult * fair / 10_000.0).max(min_edge);
+            (self.config.ref_min_spread_bps * self.cached_vol_mult * rounded_fair / 10_000.0).max(min_edge);
 
         // Check bid: inside min_spread from fair?
         if let Some(ref q) = self.bid_quote {
@@ -807,8 +808,8 @@ impl MmEngine {
                 state,
                 Some(OrderState::Accepted) | Some(OrderState::PartiallyFilled)
             );
-            if can_cancel && q.price > fair - min_spread {
-                let drift_bps = (q.price - (fair - min_spread)) / fair * 10_000.0;
+            if can_cancel && q.price > rounded_fair - min_spread {
+                let drift_bps = (q.price - (rounded_fair - min_spread)) / rounded_fair * 10_000.0;
                 debug!(
                     "fast cancel bid cid={} price={:.6} ({:.1}bps inside)",
                     q.client_id.0, q.price, drift_bps
@@ -850,8 +851,8 @@ impl MmEngine {
                 state,
                 Some(OrderState::Accepted) | Some(OrderState::PartiallyFilled)
             );
-            if can_cancel && q.price < fair + min_spread {
-                let drift_bps = ((fair + min_spread) - q.price) / fair * 10_000.0;
+            if can_cancel && q.price < rounded_fair + min_spread {
+                let drift_bps = ((rounded_fair + min_spread) - q.price) / rounded_fair * 10_000.0;
                 debug!(
                     "fast cancel ask cid={} price={:.6} ({:.1}bps inside)",
                     q.client_id.0, q.price, drift_bps
@@ -908,8 +909,9 @@ impl MmEngine {
         let requote_thresh = self.config.ref_requote_tolerance_bps * self.cached_vol_mult * fair / 10_000.0;
 
         let skewed_mid = self.compute_skewed_mid(fair, position, target, max_pos);
+        let rounded_fair = self.oms.round_price(fair);
         let (desired_bid, desired_ask) = Self::clamp_to_fair(
-            fair,
+            rounded_fair,
             skewed_mid - half_spread,
             skewed_mid + half_spread,
             self.config.min_edge_bps,

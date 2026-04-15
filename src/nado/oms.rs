@@ -1169,6 +1169,11 @@ impl ExchangeOms for NadoOms {
     fn subscribe(&self) -> broadcast::Receiver<OmsEvent> {
         self.event_tx.subscribe()
     }
+
+    fn round_price(&self, price: f64) -> f64 {
+        // TODO: implement Nado-specific price rounding
+        price
+    }
 }
 
 // ---------------------------------------------------------------------------
