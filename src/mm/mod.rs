@@ -225,14 +225,14 @@ fn total_factor_wc(market_data: &crypto_feeds::AllMarketData, fm: &FactorModelSt
     total
 }
 
-/// Get freshest mid across exchanges for a factor.
-/// Returns (mid, best_age_ns, exchange_ts_ms, received_ts).
+/// Get freshest mid across exchanges for a factor (by exchange_ts).
+/// Returns (mid, exchange_ts_ms, received_ts).
 fn factor_mid(
     market_data: &crypto_feeds::AllMarketData,
     factor: &FactorState,
-) -> Option<(f64, u64, i64, Option<chrono::DateTime<chrono::Utc>>)> {
+) -> Option<(f64, i64, Option<chrono::DateTime<chrono::Utc>>)> {
     let now = chrono::Utc::now();
-    let mut best: Option<(f64, u64, i64, Option<chrono::DateTime<chrono::Utc>>)> = None;
+    let mut best: Option<(f64, i64, Option<chrono::DateTime<chrono::Utc>>)> = None;
     let mut best_age = u64::MAX;
 
     for &ex in &factor.exchanges {
@@ -247,10 +247,9 @@ fn factor_mid(
             .map(|ts| (now - ts).num_nanoseconds().unwrap_or(i64::MAX).max(0) as u64)
             .unwrap_or(u64::MAX);
 
-        let exchange_ts_ms = md.exchange_ts.map(|ts| ts.timestamp_millis()).unwrap_or(0);
-
         if age_ns < best_age {
-            best = Some((mid, age_ns, exchange_ts_ms, md.received_ts));
+            let exchange_ts_ms = md.exchange_ts.map(|ts| ts.timestamp_millis()).unwrap_or(0);
+            best = Some((mid, exchange_ts_ms, md.received_ts));
             best_age = age_ns;
         }
     }
@@ -440,7 +439,7 @@ impl MmEngine {
             if let Some(ref mut fm) = self.factor_model {
                 fm.last_direct_fair = fair;
                 for f in &mut fm.factors {
-                    if let Some((mid, _, _, _)) = factor_mid(&self.market_data, f) {
+                    if let Some((mid, _, _)) = factor_mid(&self.market_data, f) {
                         f.snapshot_log_mid = mid.ln();
                     }
                 }
@@ -475,7 +474,7 @@ impl MmEngine {
             let mut trigger_exchange_ts_ms = i64::MIN;
 
             for f in &fm.factors {
-                if let Some((mid, _recv_age_ns, exch_ts_ms, recv_ts)) =
+                if let Some((mid, exch_ts_ms, recv_ts)) =
                     factor_mid(&self.market_data, f)
                 {
                     let r = mid.ln() - f.snapshot_log_mid;
@@ -500,7 +499,7 @@ impl MmEngine {
 
             return Some(TickSource {
                 fair: corr_fair,
-                exchange_ts_ms: 0, // not used for dedup on factor ticks
+                exchange_ts_ms: trigger_exchange_ts_ms,
                 trigger_received_ts,
                 is_direct: false,
             });
@@ -580,13 +579,11 @@ impl MmEngine {
                 continue;
             };
 
-            // Exchange_ts dedup (only for direct ticks)
-            if tick.is_direct {
-                if tick.exchange_ts_ms <= self.last_exchange_ts_ms {
-                    continue;
-                }
-                self.last_exchange_ts_ms = tick.exchange_ts_ms;
+            // Exchange_ts dedup — skip ticks with older exchange_ts than last processed
+            if tick.exchange_ts_ms <= self.last_exchange_ts_ms {
+                continue;
             }
+            self.last_exchange_ts_ms = tick.exchange_ts_ms;
             // ── NEW TICK ──
             #[cfg(feature = "profiling")]
             let tick_start = Instant::now();
@@ -1232,7 +1229,7 @@ impl MmEngine {
             (Some(f), Some(fm)) if fm.seeded && f != 0.0 => {
                 let mut sum = 0.0f64;
                 for fac in &fm.factors {
-                    if let Some((mid, _, _, _)) = factor_mid(&self.market_data, fac) {
+                    if let Some((mid, _, _)) = factor_mid(&self.market_data, fac) {
                         sum += fac.beta * (mid.ln() - fac.snapshot_log_mid);
                     }
                 }
@@ -1682,7 +1679,7 @@ mod tests {
         };
 
         // factor_mid works when data is present
-        let (mid, _age, _, _) = factor_mid(&md, &factor).expect("should find ETH mid");
+        let (mid, _, _) = factor_mid(&md, &factor).expect("should find ETH mid");
         assert!((mid - 2000.5).abs() < 0.01);
 
         // factor_model=None means we never enter factor tick path:
@@ -1702,7 +1699,7 @@ mod tests {
 
         // Snapshot: ETH at 2000
         push_quote(&md, ExchangeId::Binance, eth_id, 1999.5, 2000.5);
-        let (snapshot_mid, _, _, _) = factor_mid(
+        let (snapshot_mid, _, _) = factor_mid(
             &md,
             &FactorState {
                 symbol_id: eth_id,
@@ -1726,7 +1723,7 @@ mod tests {
             snapshot_log_mid,
         };
 
-        let (current_mid, _, _, _) = factor_mid(&md, &factor).unwrap();
+        let (current_mid, _, _) = factor_mid(&md, &factor).unwrap();
         let r = current_mid.ln() - snapshot_log_mid;
         let corr_fair = direct_fair * (beta * r).exp();
 
@@ -1801,8 +1798,8 @@ mod tests {
         push_quote(&md, ExchangeId::Binance, btc_id, 59699.5, 59700.5);
 
         // Compute sum manually
-        let (eth_mid, _, _, _) = factor_mid(&md, &eth_factor).unwrap();
-        let (btc_mid, _, _, _) = factor_mid(&md, &btc_factor).unwrap();
+        let (eth_mid, _, _) = factor_mid(&md, &eth_factor).unwrap();
+        let (btc_mid, _, _) = factor_mid(&md, &btc_factor).unwrap();
 
         let r_eth = eth_mid.ln() - eth_factor.snapshot_log_mid;
         let r_btc = btc_mid.ln() - btc_factor.snapshot_log_mid;
@@ -1843,7 +1840,7 @@ mod tests {
 
         push_quote(&md, ExchangeId::Binance, eth_id, 1999.5, 2000.5);
 
-        let (mid, _, _, _) = factor_mid(
+        let (mid, _, _) = factor_mid(
             &md,
             &FactorState {
                 symbol_id: eth_id,
@@ -1864,7 +1861,7 @@ mod tests {
             snapshot_log_mid: snapshot_log,
         };
 
-        let (current_mid, _, _, _) = factor_mid(&md, &factor).unwrap();
+        let (current_mid, _, _) = factor_mid(&md, &factor).unwrap();
         let r = current_mid.ln() - snapshot_log;
         assert!(r.abs() < 1e-15, "no move should produce zero return");
     }
