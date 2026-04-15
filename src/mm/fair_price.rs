@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -140,10 +140,10 @@ impl FairPriceEngine {
         &self,
         exchange: ExchangeId,
         symbol_id: SymbolId,
-    ) -> Option<(f64, i64, &str, Option<DateTime<Utc>>)> {
+    ) -> Option<(f64, i64, &str, Option<std::time::Instant>)> {
         let now = Utc::now();
-        // Pick the pair with the freshest received_ts
-        let mut best: Option<(f64, i64, usize, Option<DateTime<Utc>>)> = None;
+        // Pick the pair with the freshest exchange_ts
+        let mut best: Option<(f64, i64, usize, Option<std::time::Instant>)> = None;
         let mut best_age = u64::MAX;
 
         for (idx, pair) in self.pairs.iter().enumerate() {
@@ -165,19 +165,19 @@ impl FairPriceEngine {
 
             if age_ns < best_age {
                 let basis = self.basis.get(&idx).map(|v| *v).unwrap_or(0.0);
-                best = Some((ref_mid + basis, exchange_ts_ms, idx, md.received_ts));
+                best = Some((ref_mid + basis, exchange_ts_ms, idx, md.received_instant));
                 best_age = age_ns;
             }
         }
 
-        best.map(|(price, ex_ts, idx, received_ts)| {
+        best.map(|(price, ex_ts, idx, received_instant)| {
             let ref_name = match self.pairs[idx].reference_exchange {
                 ExchangeId::Binance => "binance",
                 ExchangeId::Bybit => "bybit",
                 ExchangeId::Okx => "okx",
                 ExchangeId::Hyperliquid => "hyperliquid",
             };
-            (price, ex_ts, ref_name, received_ts)
+            (price, ex_ts, ref_name, received_instant)
         })
     }
 

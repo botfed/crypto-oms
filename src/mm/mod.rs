@@ -195,10 +195,9 @@ struct FactorModelState {
 struct TickSource {
     fair: f64,
     exchange_ts_ms: i64,
-    /// received_ts of the feed that actually triggered this tick.
-    /// Direct ticks: received_ts of the direct reference feed.
-    /// Factor ticks: received_ts of the factor with the newest exchange_ts (the trigger).
-    trigger_received_ts: Option<chrono::DateTime<chrono::Utc>>,
+    /// Monotonic instant when the trigger feed data was received.
+    /// Used for rt2d/rt2t measurement via .elapsed().
+    trigger_received_instant: Option<Instant>,
     is_direct: bool,
 }
 
@@ -226,13 +225,13 @@ fn total_factor_wc(market_data: &crypto_feeds::AllMarketData, fm: &FactorModelSt
 }
 
 /// Get freshest mid across exchanges for a factor (by exchange_ts).
-/// Returns (mid, exchange_ts_ms, received_ts).
+/// Returns (mid, exchange_ts_ms, received_instant).
 fn factor_mid(
     market_data: &crypto_feeds::AllMarketData,
     factor: &FactorState,
-) -> Option<(f64, i64, Option<chrono::DateTime<chrono::Utc>>)> {
+) -> Option<(f64, i64, Option<Instant>)> {
     let now = chrono::Utc::now();
-    let mut best: Option<(f64, i64, Option<chrono::DateTime<chrono::Utc>>)> = None;
+    let mut best: Option<(f64, i64, Option<Instant>)> = None;
     let mut best_age = u64::MAX;
 
     for &ex in &factor.exchanges {
@@ -249,7 +248,7 @@ fn factor_mid(
 
         if age_ns < best_age {
             let exchange_ts_ms = md.exchange_ts.map(|ts| ts.timestamp_millis()).unwrap_or(0);
-            best = Some((mid, exchange_ts_ms, md.received_ts));
+            best = Some((mid, exchange_ts_ms, md.received_instant));
             best_age = age_ns;
         }
     }
@@ -284,7 +283,7 @@ pub struct MmEngine {
     consecutive_rejects: u32,
     reject_pause_until: Option<Instant>,
     last_ref_wc: u64, // track seqlock write count to detect new ticks
-    trigger_received_ts: Option<chrono::DateTime<chrono::Utc>>, // received_ts of the feed that triggered the current tick
+    trigger_received_instant: Option<Instant>, // monotonic receive time of the feed that triggered the current tick
     last_exchange_ts_ms: i64,                                   // global freshness watermark
     last_direct_exchange_ts_ms: i64, // freshest direct tick exchange_ts (for factor snapshot gating)
     factor_model: Option<FactorModelState>,
@@ -407,7 +406,7 @@ impl MmEngine {
             consecutive_rejects: 0,
             reject_pause_until: None,
             last_ref_wc: 0,
-            trigger_received_ts: None,
+            trigger_received_instant: None,
             last_exchange_ts_ms: 0,
             last_direct_exchange_ts_ms: 0,
             factor_model,
@@ -429,7 +428,7 @@ impl MmEngine {
     fn resolve_tick(&mut self) -> Option<TickSource> {
         // 1. Check for new direct tick
         let mut direct_advanced = false;
-        let mut best_received_ts: Option<chrono::DateTime<chrono::Utc>> = None;
+        let mut best_received_instant: Option<Instant> = None;
 
         let wc = self
             .fair_price
@@ -443,8 +442,8 @@ impl MmEngine {
             {
                 if exchange_ts_ms > self.last_direct_exchange_ts_ms {
                     self.last_direct_exchange_ts_ms = exchange_ts_ms;
-                    if received_ts > best_received_ts {
-                        best_received_ts = received_ts;
+                    if received_ts > best_received_instant {
+                        best_received_instant = received_ts;
                     }
                     direct_advanced = true;
                     if let Some(ref mut fm) = self.factor_model {
@@ -492,8 +491,8 @@ impl MmEngine {
                         if exch_ts_ms > best_exchange_ts {
                             best_exchange_ts = exch_ts_ms;
                         }
-                        if recv_ts > best_received_ts {
-                            best_received_ts = recv_ts;
+                        if recv_ts > best_received_instant {
+                            best_received_instant = recv_ts;
                         }
                     }
                 }
@@ -505,13 +504,13 @@ impl MmEngine {
                         (
                             fm.last_direct_fair,
                             self.last_direct_exchange_ts_ms,
-                            best_received_ts,
+                            best_received_instant,
                             true,
                         )
                     } else if sum.abs() > 1e-15 && best_exchange_ts > i64::MIN {
                         // Factors are fresher and meaningful
                         let corr_fair = fm.last_direct_fair * sum.exp();
-                        (corr_fair, best_exchange_ts, best_received_ts, false)
+                        (corr_fair, best_exchange_ts, best_received_instant, false)
                     } else {
                         return None;
                     };
@@ -525,7 +524,7 @@ impl MmEngine {
                 return Some(TickSource {
                     fair: tick_fair,
                     exchange_ts_ms: tick_ts,
-                    trigger_received_ts: tick_recv_ts,
+                    trigger_received_instant: tick_recv_ts,
                     is_direct: tick_is_direct,
                 });
             }
@@ -546,7 +545,7 @@ impl MmEngine {
                 return Some(TickSource {
                     fair,
                     exchange_ts_ms: self.last_direct_exchange_ts_ms,
-                    trigger_received_ts: best_received_ts,
+                    trigger_received_instant: best_received_instant,
                     is_direct: true,
                 });
             }
@@ -636,24 +635,20 @@ impl MmEngine {
                 continue;
             }
 
-            self.trigger_received_ts = tick.trigger_received_ts;
+            self.trigger_received_instant = tick.trigger_received_instant;
             #[cfg(feature = "profiling")]
             if self.warmed_up {
                 self.latency
                     .record(latency::METRIC_FAIR, fair_start.elapsed().as_nanos() as u64);
-                if let Some(ts) = tick.trigger_received_ts {
-                    let t2d_ns = (chrono::Utc::now() - ts)
-                        .num_nanoseconds()
-                        .unwrap_or(0)
-                        .max(0) as u64;
-                    self.latency.record(latency::METRIC_T2D, t2d_ns);
+                if let Some(inst) = tick.trigger_received_instant {
+                    self.latency.record(latency::METRIC_T2D, inst.elapsed().as_nanos() as u64);
                 }
             }
 
             // Staleness check — direct feed only
             if tick.is_direct {
-                if let Some(ts) = tick.trigger_received_ts {
-                    let recv_age_ms = (chrono::Utc::now() - ts).num_milliseconds();
+                if let Some(inst) = tick.trigger_received_instant {
+                    let recv_age_ms = inst.elapsed().as_millis() as i64;
                     if recv_age_ms > self.config.max_stale_ms as i64 {
                         if self.bid_quote.is_some() || self.ask_quote.is_some() {
                             warn!(
@@ -1174,12 +1169,8 @@ impl MmEngine {
     #[cfg(feature = "profiling")]
     fn record_t2t(&self) {
         if self.warmed_up {
-            if let Some(ts) = self.trigger_received_ts {
-                let age_ns = (chrono::Utc::now() - ts)
-                    .num_nanoseconds()
-                    .unwrap_or(0)
-                    .max(0) as u64;
-                self.latency.record(latency::METRIC_T2T, age_ns);
+            if let Some(inst) = self.trigger_received_instant {
+                self.latency.record(latency::METRIC_T2T, inst.elapsed().as_nanos() as u64);
             }
         }
     }
@@ -1693,6 +1684,7 @@ mod tests {
                 exchange_ts_raw: Some(chrono::Utc::now()),
                 exchange_ts: Some(chrono::Utc::now()),
                 received_ts: Some(chrono::Utc::now()),
+                received_instant: Some(Instant::now()),
             },
         );
     }
