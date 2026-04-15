@@ -692,6 +692,7 @@ impl MmEngine {
             }
 
             // ── STATUS LOG (checked every spin, not just on new data) ──
+            #[cfg(feature = "status_log")]
             if self.last_status_log.elapsed() >= Duration::from_secs(1) {
                 self.log_status();
                 self.last_status_log = Instant::now();
@@ -1197,6 +1198,7 @@ impl MmEngine {
     // Periodic status log
     // -----------------------------------------------------------------------
 
+    #[cfg(feature = "status_log")]
     fn log_status(&mut self) {
         let fair = self
             .fair_price
