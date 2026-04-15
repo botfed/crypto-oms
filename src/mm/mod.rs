@@ -233,7 +233,7 @@ fn factor_mid(
 ) -> Option<(f64, u64, i64, Option<chrono::DateTime<chrono::Utc>>)> {
     let now = chrono::Utc::now();
     let mut best: Option<(f64, u64, i64, Option<chrono::DateTime<chrono::Utc>>)> = None;
-    let mut best_recv_age = u64::MAX;
+    let mut best_age = u64::MAX;
 
     for &ex in &factor.exchanges {
         let coll = collection_for(market_data, ex);
@@ -242,16 +242,16 @@ fn factor_mid(
         };
         let Some(mid) = md.midquote() else { continue };
 
-        let recv_age_ns = md
-            .received_ts
+        let age_ns = md
+            .exchange_ts
             .map(|ts| (now - ts).num_nanoseconds().unwrap_or(i64::MAX).max(0) as u64)
             .unwrap_or(u64::MAX);
 
         let exchange_ts_ms = md.exchange_ts.map(|ts| ts.timestamp_millis()).unwrap_or(0);
 
-        if recv_age_ns < best_recv_age {
-            best = Some((mid, recv_age_ns, exchange_ts_ms, md.received_ts));
-            best_recv_age = recv_age_ns;
+        if age_ns < best_age {
+            best = Some((mid, age_ns, exchange_ts_ms, md.received_ts));
+            best_age = age_ns;
         }
     }
     best
