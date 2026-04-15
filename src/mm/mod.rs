@@ -671,7 +671,7 @@ impl MmEngine {
             if self.warmed_up && self.last_quote_eval.elapsed() >= interval {
                 #[cfg(feature = "profiling")]
                 let vol_start = Instant::now();
-                self.cached_vol_mult = self.get_vol_multiplier(tick.fair);
+                self.cached_vol_mult = self.get_vol_multiplier(tick.fair, tick.exchange_ts_ms);
 
                 #[cfg(feature = "profiling")]
                 if self.warmed_up {
