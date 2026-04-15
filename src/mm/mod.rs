@@ -226,13 +226,13 @@ fn total_factor_wc(market_data: &crypto_feeds::AllMarketData, fm: &FactorModelSt
 
 /// Get freshest mid across exchanges for a factor (by exchange_ts).
 /// Returns (mid, exchange_ts_ms, received_instant).
+/// No Utc::now() — compares exchange_ts directly (largest = freshest).
 fn factor_mid(
     market_data: &crypto_feeds::AllMarketData,
     factor: &FactorState,
 ) -> Option<(f64, i64, Option<Instant>)> {
-    let now = chrono::Utc::now();
     let mut best: Option<(f64, i64, Option<Instant>)> = None;
-    let mut best_age = u64::MAX;
+    let mut best_ts = i64::MIN;
 
     for &ex in &factor.exchanges {
         let coll = collection_for(market_data, ex);
@@ -241,15 +241,11 @@ fn factor_mid(
         };
         let Some(mid) = md.midquote() else { continue };
 
-        let age_ns = md
-            .exchange_ts
-            .map(|ts| (now - ts).num_nanoseconds().unwrap_or(i64::MAX).max(0) as u64)
-            .unwrap_or(u64::MAX);
+        let exchange_ts_ms = md.exchange_ts.map(|ts| ts.timestamp_millis()).unwrap_or(0);
 
-        if age_ns < best_age {
-            let exchange_ts_ms = md.exchange_ts.map(|ts| ts.timestamp_millis()).unwrap_or(0);
+        if exchange_ts_ms > best_ts {
             best = Some((mid, exchange_ts_ms, md.received_instant));
-            best_age = age_ns;
+            best_ts = exchange_ts_ms;
         }
     }
     best
