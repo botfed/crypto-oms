@@ -579,14 +579,17 @@ impl MmEngine {
                 continue;
             };
 
-            // Exchange_ts dedup — skip ticks with older exchange_ts than last processed
-            if tick.exchange_ts_ms <= self.last_exchange_ts_ms {
-                continue;
-            }
-            self.last_exchange_ts_ms = tick.exchange_ts_ms;
             // ── NEW TICK ──
             #[cfg(feature = "profiling")]
             let tick_start = Instant::now();
+            let now_ms = chrono::Utc::now().timestamp_millis();
+
+            // Exchange_ts dedup — skip stale or future ticks
+            if tick.exchange_ts_ms <= self.last_exchange_ts_ms || tick.exchange_ts_ms >= now_ms {
+                continue;
+            }
+
+            self.last_exchange_ts_ms = tick.exchange_ts_ms;
             self.trigger_received_ts = tick.trigger_received_ts;
             #[cfg(feature = "profiling")]
             if self.warmed_up && tick.is_direct {
