@@ -491,9 +491,9 @@ impl MmEngine {
                         sum += f.beta * r;
                         if exch_ts_ms > best_exchange_ts {
                             best_exchange_ts = exch_ts_ms;
-                            if recv_ts > best_received_ts {
-                                best_received_ts = recv_ts;
-                            }
+                        }
+                        if recv_ts > best_received_ts {
+                            best_received_ts = recv_ts;
                         }
                     }
                 }
