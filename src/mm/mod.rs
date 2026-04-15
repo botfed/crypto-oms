@@ -1165,12 +1165,12 @@ impl MmEngine {
         }
     }
 
-    fn get_vol_multiplier(&mut self, fair: f64) -> f64 {
+    fn get_vol_multiplier(&mut self, fair: f64, exchange_ts_ms: i64) -> f64 {
         let Some(ref mut vp) = self.vol_provider else {
             return 1.0;
         };
         // Update vol provider with current fair price (drives HAR virtual head)
-        let ts_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let ts_ns = exchange_ts_ms * 1_000_000;
         vp.update(0, fair, ts_ns);
         let predicted = vp.ann_vol(0);
         if self.config.ref_vol <= 0.0 || predicted <= 0.0 || !predicted.is_finite() {
