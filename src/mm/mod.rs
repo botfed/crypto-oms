@@ -512,14 +512,6 @@ impl MmEngine {
                         // Factors are fresher and meaningful
                         let corr_fair = fm.last_direct_fair * sum.exp();
                         (corr_fair, best_exchange_ts, best_received_ts, false)
-                    } else if direct_advanced {
-                        // Direct advanced but no meaningful factor move
-                        (
-                            fm.last_direct_fair,
-                            self.last_direct_exchange_ts_ms,
-                            best_received_ts,
-                            true,
-                        )
                     } else {
                         return None;
                     };
