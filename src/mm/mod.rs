@@ -556,6 +556,20 @@ impl MmEngine {
             }
         }
 
+        // SCHED_FIFO on engine thread only — feeds/OMS stay on normal scheduling.
+        // Requires CAP_SYS_NICE: sudo setcap cap_sys_nice=eip on the binary.
+        #[cfg(all(target_os = "linux", feature = "sched_fifo"))]
+        unsafe {
+            let param = libc::sched_param { sched_priority: 50 };
+            if libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) == 0 {
+                info!("SCHED_FIFO enabled on engine thread (priority=50)");
+            } else {
+                warn!(
+                    "SCHED_FIFO failed (errno={}). Grant CAP_SYS_NICE to fix.",
+                    *libc::__errno_location()
+                );
+            }
+        }
 
         loop {
             #[cfg(feature = "profiling")]
