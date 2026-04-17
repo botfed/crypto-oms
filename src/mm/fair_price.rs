@@ -157,7 +157,7 @@ impl FairPriceEngine {
             }
 
             let coll = self.collection_for(pair.reference_exchange);
-            let Some(md) = coll.latest_noblock(&pair.reference_symbol_id) else { continue };
+            let Some(md) = coll.latest(&pair.reference_symbol_id) else { continue };
             let Some(ref_mid) = md.midquote() else { continue };
 
             let exchange_ts_ms = md.exchange_ts
@@ -194,7 +194,7 @@ impl FairPriceEngine {
                         continue;
                     }
                     let age = self.collection_for(pair.reference_exchange)
-                        .latest(&pair.reference_symbol_id)
+                        .latest_blocking(&pair.reference_symbol_id)
                         .and_then(|md| md.exchange_ts)
                         .map(|ts| (now - ts).num_milliseconds())
                         .unwrap_or(i64::MAX);
