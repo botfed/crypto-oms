@@ -27,7 +27,8 @@ fn main() -> Result<()> {
 
     // Request real-time scheduling process-wide — eliminates kernel preemption.
     // Requires CAP_SYS_NICE: sudo setcap cap_sys_nice=eip ./target/release/mm_hl
-    #[cfg(target_os = "linux")]
+    // WARNING: only use when engine has its own isolated core, otherwise starves feeds.
+    #[cfg(all(target_os = "linux", feature = "sched_fifo"))]
     unsafe {
         let param = libc::sched_param { sched_priority: 50 };
         if libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) == 0 {

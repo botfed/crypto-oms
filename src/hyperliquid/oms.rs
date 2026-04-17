@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
 
 use super::client::{
@@ -139,7 +139,8 @@ pub struct HyperliquidOms {
     ready: Arc<AtomicBool>,
     ready_notify: Arc<Notify>,
     next_client_id: AtomicU64,
-    event_tx: broadcast::Sender<OmsEvent>,
+    event_tx: crossbeam_channel::Sender<OmsEvent>,
+    event_rx: crossbeam_channel::Receiver<OmsEvent>,
     config: HyperliquidOmsConfig,
     shutdown: Arc<Notify>,
     pub diag: Arc<OmsDiagnostics>,
@@ -153,7 +154,7 @@ impl HyperliquidOms {
             config.base_url.clone(),
         )?;
         let client = Arc::new(client);
-        let (event_tx, _) = broadcast::channel(4096);
+        let (event_tx, event_rx) = crossbeam_channel::bounded(4096);
 
         let oms = Arc::new(Self {
             client,
@@ -163,6 +164,7 @@ impl HyperliquidOms {
             ready_notify: Arc::new(Notify::new()),
             next_client_id: AtomicU64::new(1),
             event_tx,
+            event_rx,
             config,
             shutdown: Arc::new(Notify::new()),
             diag: Arc::new(OmsDiagnostics::new()),
@@ -1344,8 +1346,8 @@ impl ExchangeOms for HyperliquidOms {
             .collect()
     }
 
-    fn subscribe(&self) -> broadcast::Receiver<OmsEvent> {
-        self.event_tx.subscribe()
+    fn event_receiver(&self) -> crossbeam_channel::Receiver<OmsEvent> {
+        self.event_rx.clone()
     }
 
     fn round_price(&self, price: f64) -> f64 {

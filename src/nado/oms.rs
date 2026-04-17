@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
 
 use super::client::NadoClient;
@@ -118,7 +118,8 @@ pub struct NadoOms {
     ready: Arc<AtomicBool>,
     ready_notify: Arc<Notify>,
     next_client_id: AtomicU64,
-    event_tx: broadcast::Sender<OmsEvent>,
+    event_tx: crossbeam_channel::Sender<OmsEvent>,
+    event_rx: crossbeam_channel::Receiver<OmsEvent>,
     config: NadoOmsConfig,
     shutdown: Arc<Notify>,
     pub diag: Arc<NadoDiagnostics>,
@@ -140,7 +141,7 @@ impl NadoOms {
         let sender = client.sender.clone();
         let signer_address = client.signer_address.clone();
         let account_address = client.account_address.clone();
-        let (event_tx, _) = broadcast::channel(4096);
+        let (event_tx, event_rx) = crossbeam_channel::bounded(4096);
 
         let oms = Arc::new(Self {
             client: Arc::new(tokio::sync::RwLock::new(client)),
@@ -150,6 +151,7 @@ impl NadoOms {
             ready_notify: Arc::new(Notify::new()),
             next_client_id: AtomicU64::new(1),
             event_tx,
+            event_rx,
             config,
             shutdown: Arc::new(Notify::new()),
             diag: Arc::new(NadoDiagnostics::new()),
@@ -1168,8 +1170,8 @@ impl ExchangeOms for NadoOms {
             .collect()
     }
 
-    fn subscribe(&self) -> broadcast::Receiver<OmsEvent> {
-        self.event_tx.subscribe()
+    fn event_receiver(&self) -> crossbeam_channel::Receiver<OmsEvent> {
+        self.event_rx.clone()
     }
 
     fn round_price(&self, price: f64) -> f64 {

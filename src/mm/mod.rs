@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use oms_core::state_tracker::{OmsStateTracker, StateTrackerConfig};
 use oms_core::*;
-use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use crate::hyperliquid::{HyperliquidOms, SignedPayload};
@@ -238,7 +237,7 @@ pub struct MmEngine {
     state: EngineState,
 
     hl_symbol_id: SymbolId,
-    oms_events: broadcast::Receiver<OmsEvent>,
+    oms_events: crossbeam_channel::Receiver<OmsEvent>,
     last_quote_eval: Instant,
     last_status_log: Instant,
     running_since: Option<Instant>,
@@ -289,7 +288,7 @@ impl MmEngine {
             .lookup(base, &itype)
             .ok_or_else(|| anyhow::anyhow!("symbol not in registry: {}", config.symbol))?;
 
-        let oms_events = oms.subscribe();
+        let oms_events = oms.event_receiver();
 
         #[cfg(feature = "profiling")]
         let latency = latency::init();
@@ -1384,12 +1383,8 @@ impl MmEngine {
                     self.oms_state.apply_event(&event);
                     self.handle_oms_event(event);
                 }
-                Err(broadcast::error::TryRecvError::Empty) => break,
-                Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                    warn!("OMS event stream lagged by {n} events");
-                    break;
-                }
-                Err(broadcast::error::TryRecvError::Closed) => break,
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
             }
         }
     }

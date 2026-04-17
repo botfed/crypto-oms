@@ -1,6 +1,5 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use tokio::sync::broadcast;
 
 use crate::types::*;
 
@@ -75,8 +74,8 @@ pub trait ExchangeOms: Send + Sync {
     /// Current balances.
     fn balances(&self) -> Vec<Balance>;
 
-    /// Subscribe to real-time OMS events.
-    fn subscribe(&self) -> broadcast::Receiver<OmsEvent>;
+    /// Get the event receiver for OMS events (single consumer).
+    fn event_receiver(&self) -> crossbeam_channel::Receiver<OmsEvent>;
 
     /// Round a price to the exchange's tick/precision rules.
     fn round_price(&self, price: f64) -> f64;
