@@ -216,7 +216,7 @@ impl FairPriceEngine {
                 continue;
             }
             let coll = self.collection_for(pair.reference_exchange);
-            if let Some(md) = coll.latest(&pair.reference_symbol_id) {
+            if let Some(md) = coll.latest_blocking(&pair.reference_symbol_id) {
                 if let Some(ts) = md.exchange_ts {
                     let age = (now - ts).num_milliseconds();
                     if age < best { best = age; }
@@ -237,7 +237,7 @@ impl FairPriceEngine {
                 continue;
             }
             let coll = self.collection_for(pair.reference_exchange);
-            let Some(md) = coll.latest(&pair.reference_symbol_id) else { continue };
+            let Some(md) = coll.latest_blocking(&pair.reference_symbol_id) else { continue };
 
             let ex_age = md.exchange_ts
                 .map(|ts| (now - ts).num_milliseconds())
@@ -286,9 +286,9 @@ impl FairPriceEngine {
     pub fn update_basis(&self) {
         for (idx, pair) in self.pairs.iter().enumerate() {
             let target_mid = self.collection_for(pair.target_exchange)
-                .get_midquote_noblock(&pair.target_symbol_id);
+                .get_midquote(&pair.target_symbol_id);
             let ref_mid = self.collection_for(pair.reference_exchange)
-                .get_midquote_noblock(&pair.reference_symbol_id);
+                .get_midquote(&pair.reference_symbol_id);
 
             let (Some(t_mid), Some(r_mid)) = (target_mid, ref_mid) else {
                 continue;
