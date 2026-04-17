@@ -1211,7 +1211,7 @@ impl MmEngine {
     /// instead of re-querying FairPriceEngine, which could measure a stale direct feed
     /// when the cancel was actually triggered by a fresh factor tick.
     #[cfg(feature = "profiling")]
-    fn record_t2t(&self) {
+    fn record_t2t(&mut self) {
         if self.warmed_up {
             if let Some(inst) = self.trigger_received_instant {
                 self.latency
