@@ -59,8 +59,6 @@ pub struct FairPriceEngine {
     seeded: Box<[Cell<bool>]>,
     /// Pre-computed EWMA alpha
     alpha: f64,
-    /// Monotonic guard: last winning received_instant (best-to-best comparison)
-    last_best_received: Cell<Option<std::time::Instant>>,
     pairs: Vec<ResolvedPair>,
     config: FairPriceConfig,
 }
@@ -129,7 +127,6 @@ impl FairPriceEngine {
             basis,
             seeded,
             alpha,
-            last_best_received: Cell::new(None),
             pairs,
             config,
         })
@@ -174,23 +171,14 @@ impl FairPriceEngine {
             }
         }
 
-        best.and_then(|(price, ex_ts, idx, received_instant, feed_lat)| {
-            // Monotonic guard: received_instant must not go backwards
-            if let Some(recv) = received_instant {
-                if let Some(last) = self.last_best_received.get() {
-                    if recv < last {
-                        return None;
-                    }
-                }
-                self.last_best_received.set(Some(recv));
-            }
+        best.map(|(price, ex_ts, idx, received_instant, feed_lat)| {
             let ref_name = match self.pairs[idx].reference_exchange {
                 ExchangeId::Binance => "binance",
                 ExchangeId::Bybit => "bybit",
                 ExchangeId::Okx => "okx",
                 ExchangeId::Hyperliquid => "hyperliquid",
             };
-            Some((price, ex_ts, ref_name, received_instant, feed_lat))
+            (price, ex_ts, ref_name, received_instant, feed_lat)
         })
     }
 

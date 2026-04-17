@@ -125,12 +125,13 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
     oms.start();
 
     anyhow::ensure!(!config.symbols.is_empty(), "config must have at least one symbol in 'symbols'");
+    let symbols = config.symbols;
 
     // FairPriceEngine — basis updated by engine in slow path, no background task
     let fair_price = Arc::new(FairPriceEngine::new(market_data.clone(), config.fair_price)?);
 
     // Start inventory manager (uses first symbol's asset)
-    let first_symbol = &config.symbols[0].symbol;
+    let first_symbol = &symbols[0].symbol;
     let asset = first_symbol
         .strip_prefix("PERP_")
         .or_else(|| first_symbol.strip_prefix("SPOT_"))
@@ -143,7 +144,7 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
     );
 
     // Build params (uses first symbol's config for defaults)
-    let (params, _controller) = WatchParams::new(&config.symbols[0], target_rx);
+    let (params, _controller) = WatchParams::new(&symbols[0], target_rx);
 
     // Initialize vol provider if vol_models is configured
     let vol_model_name = config.vol_models
@@ -162,36 +163,70 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
             all_params.len(), all_params.keys().collect::<Vec<_>>());
 
         let target_min = all_params.values().next().map(|p| p.target_min).unwrap_or(5);
-
-        // Build HAR vol provider: load warmup bars per symbol, pair with HAR params
         let bar_data_dir = Path::new(&vol_cfg.bar_data_dir);
+
+        // Build HAR groups in config symbol order — group[i] matches symbols[i].vol_group_idx
         let mut har_groups = Vec::new();
-        for (sym, params) in all_params {
-            let har = match vol_model_name.as_str() {
-                "har_ols" => params.har_ols.clone(),
-                _ => params.har_qlike.clone(),
-            };
-            let Some(har_params) = har else { continue };
-
-            // Load historical bars for warmup
-            let warmup_bars = match load_1m_bars_with_backfill(bar_data_dir, &sym, vol_cfg.warmup_days).await {
-                Ok(bars_1m) => {
-                    let target_bars = aggregate_bars(&bars_1m, target_min);
-                    info!("vol warmup: {} target bars for {}", target_bars.len(), sym);
-                    target_bars
+        for sym_cfg in &symbols {
+            let vol_sym = &sym_cfg.vol_symbol;
+            if vol_sym.is_empty() {
+                // No vol symbol configured — placeholder group with seed vol
+                har_groups.push(None);
+                continue;
+            }
+            match all_params.get(vol_sym.as_str()) {
+                Some(params) => {
+                    let har = match vol_model_name.as_str() {
+                        "har_ols" => params.har_ols.clone(),
+                        _ => params.har_qlike.clone(),
+                    };
+                    match har {
+                        Some(har_params) => {
+                            let warmup_bars = match load_1m_bars_with_backfill(bar_data_dir, vol_sym, vol_cfg.warmup_days).await {
+                                Ok(bars_1m) => {
+                                    let target_bars = aggregate_bars(&bars_1m, target_min);
+                                    info!("vol warmup: {} target bars for {}", target_bars.len(), vol_sym);
+                                    target_bars
+                                }
+                                Err(e) => {
+                                    warn!("vol warmup failed for {}: {}", vol_sym, e);
+                                    Vec::new()
+                                }
+                            };
+                            har_groups.push(Some((har_params, params.seasonality.clone(), target_min, warmup_bars, sym_cfg.ref_vol)));
+                        }
+                        None => {
+                            warn!("no HAR params for vol_symbol={}, using vol_mult=1.0", vol_sym);
+                            har_groups.push(None);
+                        }
+                    }
                 }
-                Err(e) => {
-                    warn!("vol warmup failed for {}: {}", sym, e);
-                    Vec::new()
+                None => {
+                    warn!("vol_symbol={} not found in params dir, using vol_mult=1.0", vol_sym);
+                    har_groups.push(None);
                 }
-            };
-
-            har_groups.push((har_params, params.seasonality.clone(), target_min, warmup_bars));
+            }
         }
 
-        let seed_vol = config.symbols[0].ref_vol;
-        let provider = VolProvider::new_har(har_groups, seed_vol);
-        info!("vol provider ready (model={}, lock-free HAR)", vol_model_name);
+        // Build provider with one group per symbol (1:1 with vol_group_idx).
+        // Symbols without HAR params get a seed-vol placeholder.
+        let final_groups: Vec<_> = har_groups.into_iter().enumerate().map(|(_i, g)| {
+            g.unwrap_or_else(|| {
+                // Placeholder: zero-coefficient HAR — predict() returns intercept only
+                let har = crypto_feeds::vol_params::HarParams {
+                    intercept: 0.0,
+                    betas: vec![],
+                    windows: vec![],
+                };
+                let seasonality = crypto_feeds::vol_params::SeasonalFactors {
+                    f_h: [1.0; 24],
+                    f_d: [1.0; 7],
+                };
+                (har, seasonality, target_min, Vec::new(), symbols[_i].ref_vol)
+            })
+        }).collect();
+        let provider = VolProvider::new_har(final_groups);
+        info!("vol provider ready (model={}, {} groups)", vol_model_name, provider.group_count());
 
         Some(provider)
     } else {
@@ -206,7 +241,7 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
         vol_provider,
         market_data,
         Box::new(params),
-        config.symbols.into_boxed_slice(),
+        symbols.into_boxed_slice(),
         ghost,
         spin_core,
         engine_shutdown,

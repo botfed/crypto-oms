@@ -224,6 +224,8 @@ fn factor_mid(
 struct SymbolState {
     config: StrategyConfig,
     symbol_id: SymbolId,
+    /// Index into the vol provider's group array
+    vol_group_idx: usize,
     bid_quote: Option<LiveQuote>,
     ask_quote: Option<LiveQuote>,
     cached_vol_mult: f64,
@@ -239,7 +241,7 @@ struct SymbolState {
     running_since: Option<Instant>,
 }
 
-fn build_symbol_state(config: StrategyConfig) -> Result<SymbolState> {
+fn build_symbol_state(config: StrategyConfig, vol_group_idx: usize) -> Result<SymbolState> {
     let itype = if config.symbol.starts_with("PERP_") {
         InstrumentType::Perp
     } else {
@@ -313,6 +315,7 @@ fn build_symbol_state(config: StrategyConfig) -> Result<SymbolState> {
     Ok(SymbolState {
         config,
         symbol_id,
+        vol_group_idx,
         bid_quote: None,
         ask_quote: None,
         cached_vol_mult: 1.0,
@@ -373,7 +376,8 @@ impl MmEngine {
         let symbols: Box<[SymbolState]> = configs
             .into_vec()
             .into_iter()
-            .map(|c| build_symbol_state(c))
+            .enumerate()
+            .map(|(i, c)| build_symbol_state(c, i))
             .collect::<Result<Vec<_>>>()?
             .into_boxed_slice();
 
@@ -1340,8 +1344,16 @@ impl MmEngine {
         };
         // Update vol provider with current fair price (drives HAR virtual head)
         let ts_ns = exchange_ts_ms * 1_000_000;
-        vp.update(0, fair, ts_ns);
-        let predicted = vp.ann_vol(0);
+        if sym.vol_group_idx >= vp.group_count() {
+            sym.cached_vol_mult = 1.0;
+            return;
+        }
+        vp.update(sym.vol_group_idx, fair, ts_ns);
+        let predicted = vp.ann_vol(sym.vol_group_idx);
+        debug!(
+            "[{}] vol: group={} predicted={:.4} ref_vol={:.4} groups_total={}",
+            sym.config.symbol, sym.vol_group_idx, predicted, sym.config.ref_vol, vp.group_count()
+        );
         if sym.config.ref_vol <= 0.0 || predicted <= 0.0 || !predicted.is_finite() {
             sym.cached_vol_mult = 1.0;
             return;
@@ -1449,7 +1461,8 @@ impl MmEngine {
             let pred_vol_ann = self
                 .vol_provider
                 .as_ref()
-                .map(|vp| vp.ann_vol(0))
+                .filter(|vp| sym.vol_group_idx < vp.group_count())
+                .map(|vp| vp.ann_vol(sym.vol_group_idx))
                 .unwrap_or(0.0);
 
             info!(
@@ -1558,6 +1571,7 @@ impl MmEngine {
                 }
             }
             OmsEvent::OrderFilled(fill) => {
+                debug!("OrderFilled event: cid={}, find_symbol={:?}", fill.client_id.0, self.find_symbol_for_order(&fill.client_id));
                 if let Some(idx) = self.find_symbol_for_order(&fill.client_id) {
                     info!(
                         "[{}] fill: cid={} side={:?} price={:.6} size={:.4}",
@@ -1571,8 +1585,10 @@ impl MmEngine {
             }
             OmsEvent::OrderCancelled(cid) => {
                 if let Some(idx) = self.find_symbol_for_order(&cid) {
-                    debug!("order cancelled: cid={}", cid.0);
+                    debug!("[{}] order cancelled: cid={}", self.symbols[idx].config.symbol, cid.0);
                     Self::clear_tracker_for(&mut self.symbols[idx], &cid, &mut self.presigned_cancels);
+                } else {
+                    debug!("order cancelled but no symbol matched: cid={}", cid.0);
                 }
             }
             OmsEvent::OrderRejected { client_id, reason } => {
