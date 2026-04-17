@@ -25,6 +25,21 @@ fn main() -> Result<()> {
         )
         .init();
 
+    // Request real-time scheduling process-wide — eliminates kernel preemption.
+    // Requires CAP_SYS_NICE: sudo setcap cap_sys_nice=eip ./target/release/mm_hl
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let param = libc::sched_param { sched_priority: 50 };
+        if libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) == 0 {
+            info!("SCHED_FIFO enabled process-wide (priority=50)");
+        } else {
+            warn!(
+                "SCHED_FIFO failed (errno={}), running with default scheduler. Grant CAP_SYS_NICE to fix.",
+                *libc::__errno_location()
+            );
+        }
+    }
+
     // Parse CLI args: mm_hl [--ghost] [--spin-core N] [--tokio-cores 2,3] [config_path]
     let mut ghost = false;
     let mut spin_core: Option<usize> = None;

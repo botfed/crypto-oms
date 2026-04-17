@@ -596,7 +596,11 @@ impl MmEngine {
             }
         }
 
+
         loop {
+            #[cfg(feature = "profiling")]
+            let loop_start = Instant::now();
+
             if self.shutdown.load(Ordering::Relaxed) {
                 info!("MM engine shutting down");
                 self.cancel_all_quotes();
@@ -604,9 +608,6 @@ impl MmEngine {
                 std::thread::sleep(Duration::from_secs(1));
                 return;
             }
-
-            #[cfg(feature = "profiling")]
-            let loop_start = Instant::now();
 
             self.drain_oms_events();
 
@@ -806,7 +807,8 @@ impl MmEngine {
                 if should_log {
                     warn!(
                         "paused: reference feed dead (recv_age={}ms > {}ms)",
-                        recv.elapsed().as_millis(), self.config.max_feed_age_ms
+                        recv.elapsed().as_millis(),
+                        self.config.max_feed_age_ms
                     );
                     self.last_status_log = Instant::now();
                 }
@@ -1744,6 +1746,7 @@ impl MmEngine {
         self.cancel_all_quotes();
         self.state = EngineState::Paused;
         self.running_since = None;
+        self.warmed_up = false;
     }
 }
 
