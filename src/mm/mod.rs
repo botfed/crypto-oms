@@ -406,7 +406,7 @@ impl MmEngine {
 
             if let Some((fair, exchange_ts_ms, _, received_ts, feed_lat)) = self
                 .fair_price
-                .get_fair_price_with_age(ExchangeId::Hyperliquid, self.hl_symbol_id)
+                .get_fair_price_detail(ExchangeId::Hyperliquid, self.hl_symbol_id)
             {
                 if exchange_ts_ms > self.last_direct_exchange_ts_ms {
                     self.last_direct_exchange_ts_ms = exchange_ts_ms;
@@ -510,7 +510,7 @@ impl MmEngine {
             // Need fair price again (no factor model to store it)
             if let Some((fair, _, _, _, _)) = self
                 .fair_price
-                .get_fair_price_with_age(ExchangeId::Hyperliquid, self.hl_symbol_id)
+                .get_fair_price_detail(ExchangeId::Hyperliquid, self.hl_symbol_id)
             {
                 return Some(TickSource {
                     fair,
@@ -1294,7 +1294,7 @@ impl MmEngine {
 
         let (exch_age_ms, ref_feed) = self
             .fair_price
-            .get_fair_price_with_age(ExchangeId::Hyperliquid, self.hl_symbol_id)
+            .get_fair_price_detail(ExchangeId::Hyperliquid, self.hl_symbol_id)
             .map(|(_, ex_ts_ms, feed, _, _)| {
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 (now_ms - ex_ts_ms, feed)
@@ -1744,7 +1744,7 @@ mod tests {
     }
 
     /// With factor_model disabled, resolve_tick() is a transparent wrapper around
-    /// the existing write-count + get_fair_price_with_age logic.
+    /// the existing write-count + get_fair_price_detail logic.
     ///
     /// The ONLY behavioral change vs pre-refactor code is that fast_cancel_check
     /// and evaluate_and_place_quotes now receive `fair` as a parameter instead of

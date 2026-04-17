@@ -141,12 +141,12 @@ impl FairPriceEngine {
 
     /// Returns fair price using the freshest reference feed across all matching pairs.
     pub fn get_fair_price(&self, exchange: ExchangeId, symbol_id: SymbolId) -> Option<f64> {
-        self.get_fair_price_with_age(exchange, symbol_id).map(|(price, _, _, _, _)| price)
+        self.get_fair_price_detail(exchange, symbol_id).map(|(price, _, _, _, _)| price)
     }
 
     /// Returns (fair_price, exchange_ts_ms, ref_exchange_name, received_instant, feed_latency_ns).
     /// Picks the feed with the freshest exchange_ts.
-    pub fn get_fair_price_with_age(
+    pub fn get_fair_price_detail(
         &self,
         exchange: ExchangeId,
         symbol_id: SymbolId,
@@ -196,7 +196,7 @@ impl FairPriceEngine {
 
     /// Get the current basis estimate for the freshest pair (for diagnostics).
     pub fn get_basis(&self, exchange: ExchangeId, symbol_id: SymbolId) -> Option<f64> {
-        self.get_fair_price_with_age(exchange, symbol_id)
+        self.get_fair_price_detail(exchange, symbol_id)
             .and_then(|(_, _, _, _, _)| {
                 let now = Utc::now();
                 let mut best_idx = None;
