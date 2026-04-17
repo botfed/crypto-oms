@@ -565,6 +565,7 @@ impl MmEngine {
         );
 
         self.oms.wait_ready().await?;
+        self.oms_state.apply_event(&OmsEvent::Ready);
         info!("OMS ready, entering main loop (dedicated thread)");
 
         tokio::task::spawn_blocking(move || self.spin_loop())
@@ -696,9 +697,11 @@ impl MmEngine {
             }
 
             // ── STATUS LOG (checked every spin, not just on new data) ──
+            #[cfg(any(feature = "status_log", feature = "state_log"))]
             if self.last_status_log.elapsed() >= Duration::from_secs(1) {
                 #[cfg(feature = "status_log")]
                 self.log_status();
+                #[cfg(feature = "state_log")]
                 self.log_state();
                 self.last_status_log = Instant::now();
             }
@@ -862,6 +865,7 @@ impl MmEngine {
 
     }
 
+    #[cfg(feature = "state_log")]
     fn log_state(&self) {
         let open = self.oms_state.open_orders(None);
         let open_summary: Vec<String> = open.iter()
