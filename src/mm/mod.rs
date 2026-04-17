@@ -559,7 +559,7 @@ impl MmEngine {
 
         loop {
             #[cfg(feature = "profiling")]
-            let loop_start = Instant::now();
+            let t0 = Instant::now();
 
             if self.shutdown.load(Ordering::Relaxed) {
                 info!("MM engine shutting down");
@@ -592,26 +592,15 @@ impl MmEngine {
                 .map(|t| t.elapsed() >= Duration::from_secs(self.config.warmup_secs))
                 .unwrap_or(false);
 
-            // ── CHECK FOR NEW DATA ──
+            // ── DRAIN OMS EVENTS ──
             #[cfg(feature = "profiling")]
-            self.latency.record(
-                latency::METRIC_LOOP_OVERHEAD,
-                loop_start.elapsed().as_nanos() as u64,
-            );
-
-            #[cfg(feature = "profiling")]
-            let drain_start = Instant::now();
+            let t1 = Instant::now(); // after preconditions
 
             self.drain_oms_events();
 
+            // ── CHECK FOR NEW DATA ──
             #[cfg(feature = "profiling")]
-            self.latency.record(
-                latency::METRIC_DRAIN,
-                drain_start.elapsed().as_nanos() as u64,
-            );
-
-            #[cfg(feature = "profiling")]
-            let fair_start = Instant::now();
+            let t2 = Instant::now(); // after drain
 
             let Some(tick) = self.resolve_tick() else {
                 continue;
@@ -619,22 +608,9 @@ impl MmEngine {
 
             // ── NEW TICK ──
             #[cfg(feature = "profiling")]
-            let tick_start = Instant::now();
+            let t3 = Instant::now(); // after resolve_tick
 
             self.trigger_received_instant = tick.trigger_received_instant;
-            #[cfg(feature = "profiling")]
-            if self.warmed_up {
-                self.latency
-                    .record(latency::METRIC_FAIR, fair_start.elapsed().as_nanos() as u64);
-                if let Some(inst) = tick.trigger_received_instant {
-                    self.latency
-                        .record(latency::METRIC_T2D, inst.elapsed().as_nanos() as u64);
-                }
-                if tick.feed_latency_ns > 0 {
-                    self.latency
-                        .record(latency::METRIC_FEED, tick.feed_latency_ns);
-                }
-            }
 
             // Staleness check — direct feed only
             if tick.is_direct {
@@ -659,37 +635,31 @@ impl MmEngine {
             // ── FAST PATH: adverse cancel guard ──
             self.fast_cancel_check(tick.fair);
 
-            #[cfg(feature = "profiling")]
-            if self.warmed_up {
-                self.latency.record(
-                    latency::METRIC_TICK_FAST,
-                    tick_start.elapsed().as_nanos() as u64,
-                );
-            }
-
             // ── SLOW PATH (~quote_interval_ms): quote placement ──
+            #[cfg(feature = "profiling")]
+            let t4 = Instant::now(); // after fast path
+
+            #[cfg(feature = "profiling")]
+            let mut vol_ns: u64 = 0;
+            #[cfg(feature = "profiling")]
+            let mut is_slow = false;
+
             let interval = Duration::from_millis(self.config.quote_interval_ms);
             if self.warmed_up && self.last_quote_eval.elapsed() >= interval {
+                #[cfg(feature = "profiling")]
+                { is_slow = true; }
+
                 self.fair_price.update_basis();
 
                 #[cfg(feature = "profiling")]
                 let vol_start = Instant::now();
+
                 self.cached_vol_mult = self.get_vol_multiplier(tick.fair, tick.exchange_ts_ms);
 
                 #[cfg(feature = "profiling")]
-                if self.warmed_up {
-                    self.latency
-                        .record(latency::METRIC_VOL, vol_start.elapsed().as_nanos() as u64);
-                }
+                { vol_ns = vol_start.elapsed().as_nanos() as u64; }
 
                 self.evaluate_and_place_quotes(tick.fair);
-                #[cfg(feature = "profiling")]
-                if self.warmed_up {
-                    self.latency.record(
-                        latency::METRIC_TICK_SLOW,
-                        tick_start.elapsed().as_nanos() as u64,
-                    );
-                }
 
                 self.last_quote_eval = Instant::now();
 
@@ -709,12 +679,27 @@ impl MmEngine {
                 self.last_status_log = Instant::now();
             }
 
+            // ── FLUSH ALL PROFILING ──
             #[cfg(feature = "profiling")]
             if self.warmed_up {
-                self.latency.record(
-                    latency::METRIC_TICK_END,
-                    tick_start.elapsed().as_nanos() as u64,
-                );
+                let t5 = Instant::now(); // end of tick
+
+                self.latency.record(latency::METRIC_LOOP_OVERHEAD, (t1 - t0).as_nanos() as u64);
+                self.latency.record(latency::METRIC_DRAIN, (t2 - t1).as_nanos() as u64);
+                self.latency.record(latency::METRIC_FAIR, (t3 - t2).as_nanos() as u64);
+                self.latency.record(latency::METRIC_TICK_FAST, (t4 - t3).as_nanos() as u64);
+                self.latency.record(latency::METRIC_TICK_END, (t5 - t3).as_nanos() as u64);
+
+                if let Some(inst) = tick.trigger_received_instant {
+                    self.latency.record(latency::METRIC_T2D, (t3 - inst).as_nanos() as u64);
+                }
+                if tick.feed_latency_ns > 0 {
+                    self.latency.record(latency::METRIC_FEED, tick.feed_latency_ns);
+                }
+                if is_slow {
+                    self.latency.record(latency::METRIC_VOL, vol_ns);
+                    self.latency.record(latency::METRIC_TICK_SLOW, (t5 - t3).as_nanos() as u64);
+                }
             }
         }
     }
