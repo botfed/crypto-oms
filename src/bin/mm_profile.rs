@@ -18,7 +18,7 @@ const SAMPLES_PER_METRIC: usize = 1_048_576;
 const METRIC_SECTION: usize = METRIC_HEADER + SAMPLES_PER_METRIC * SAMPLE_SIZE;
 const LATENCY_PATH: &str = "/tmp/mm_latency.bin";
 
-const METRIC_NAMES: &[&str] = &["tick_fast", "rt2d", "fair_calc", "vol_calc", "tick_slow", "rt2t", "sign", "tick_end", "loop_oh"];
+const METRIC_NAMES: &[&str] = &["tick_fast", "rt2d", "fair_calc", "vol_calc", "tick_slow", "rt2t", "sign", "tick_end", "loop_oh", "feed"];
 
 const CURSOR_HOME: &str = "\x1B[H";
 const CURSOR_HIDE: &str = "\x1B[?25l";

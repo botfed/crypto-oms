@@ -38,7 +38,8 @@ pub mod latency {
     pub const METRIC_SIGN: u8 = 6;
     pub const METRIC_TICK_END: u8 = 7;
     pub const METRIC_LOOP_OVERHEAD: u8 = 8;
-    pub const NUM_METRICS: usize = 9;
+    pub const METRIC_FEED: u8 = 9;
+    pub const NUM_METRICS: usize = 10;
 
     // File layout: per-metric ring buffers
     // Global header: 8 bytes (NUM_METRICS as u64)
@@ -201,6 +202,9 @@ struct TickSource {
     /// Used for rt2d/rt2t measurement via .elapsed().
     trigger_received_instant: Option<Instant>,
     is_direct: bool,
+    /// Feed processing latency (WS recv → ring buffer write) in nanoseconds
+    #[cfg_attr(not(feature = "profiling"), allow(dead_code))]
+    feed_latency_ns: u64,
 }
 
 fn collection_for(
@@ -432,6 +436,7 @@ impl MmEngine {
         // 1. Check for new direct tick
         let mut direct_advanced = false;
         let mut best_received_instant: Option<Instant> = None;
+        let mut best_feed_latency_ns: u64 = 0;
 
         let wc = self
             .fair_price
@@ -439,12 +444,13 @@ impl MmEngine {
         if wc != self.last_ref_wc {
             self.last_ref_wc = wc;
 
-            if let Some((fair, exchange_ts_ms, _, received_ts)) = self
+            if let Some((fair, exchange_ts_ms, _, received_ts, feed_lat)) = self
                 .fair_price
                 .get_fair_price_with_age(ExchangeId::Hyperliquid, self.hl_symbol_id)
             {
                 if exchange_ts_ms > self.last_direct_exchange_ts_ms {
                     self.last_direct_exchange_ts_ms = exchange_ts_ms;
+                    best_feed_latency_ns = feed_lat;
                     if received_ts > best_received_instant {
                         best_received_instant = received_ts;
                     }
@@ -529,6 +535,7 @@ impl MmEngine {
                     exchange_ts_ms: tick_ts,
                     trigger_received_instant: tick_recv_ts,
                     is_direct: tick_is_direct,
+                    feed_latency_ns: best_feed_latency_ns,
                 });
             }
         }
@@ -541,7 +548,7 @@ impl MmEngine {
             self.last_exchange_ts_ms = self.last_direct_exchange_ts_ms;
 
             // Need fair price again (no factor model to store it)
-            if let Some((fair, _, _, _)) = self
+            if let Some((fair, _, _, _, _)) = self
                 .fair_price
                 .get_fair_price_with_age(ExchangeId::Hyperliquid, self.hl_symbol_id)
             {
@@ -550,6 +557,7 @@ impl MmEngine {
                     exchange_ts_ms: self.last_direct_exchange_ts_ms,
                     trigger_received_instant: best_received_instant,
                     is_direct: true,
+                    feed_latency_ns: best_feed_latency_ns,
                 });
             }
         }
@@ -650,6 +658,10 @@ impl MmEngine {
                 if let Some(inst) = tick.trigger_received_instant {
                     self.latency
                         .record(latency::METRIC_T2D, inst.elapsed().as_nanos() as u64);
+                }
+                if tick.feed_latency_ns > 0 {
+                    self.latency
+                        .record(latency::METRIC_FEED, tick.feed_latency_ns);
                 }
             }
 
@@ -1321,7 +1333,7 @@ impl MmEngine {
         let (exch_age_ms, ref_feed) = self
             .fair_price
             .get_fair_price_with_age(ExchangeId::Hyperliquid, self.hl_symbol_id)
-            .map(|(_, ex_ts_ms, feed, _)| {
+            .map(|(_, ex_ts_ms, feed, _, _)| {
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 (now_ms - ex_ts_ms, feed)
             })
