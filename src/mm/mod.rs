@@ -218,6 +218,118 @@ fn factor_mid(
 }
 
 // ---------------------------------------------------------------------------
+// Per-symbol state
+// ---------------------------------------------------------------------------
+
+struct SymbolState {
+    config: StrategyConfig,
+    symbol_id: SymbolId,
+    bid_quote: Option<LiveQuote>,
+    ask_quote: Option<LiveQuote>,
+    cached_vol_mult: f64,
+    last_ref_wc: u64,
+    last_exchange_ts_ms: i64,
+    last_direct_exchange_ts_ms: i64,
+    trigger_received_instant: Option<Instant>,
+    factor_model: Option<FactorModelState>,
+    last_quote_eval: Instant,
+    consecutive_rejects: u32,
+    reject_pause_until: Option<Instant>,
+    warmed_up: bool,
+    running_since: Option<Instant>,
+}
+
+fn build_symbol_state(config: StrategyConfig) -> Result<SymbolState> {
+    let itype = if config.symbol.starts_with("PERP_") {
+        InstrumentType::Perp
+    } else {
+        InstrumentType::Spot
+    };
+    let base = config
+        .symbol
+        .strip_prefix("PERP_")
+        .or_else(|| config.symbol.strip_prefix("SPOT_"))
+        .unwrap_or(&config.symbol);
+
+    let symbol_id = *REGISTRY
+        .lookup(base, &itype)
+        .ok_or_else(|| anyhow::anyhow!("symbol not in registry: {}", config.symbol))?;
+
+    let factor_model = if let Some(ref fm_cfg) = config.factor_model {
+        if fm_cfg.enabled && !fm_cfg.factors.is_empty() {
+            let mut factors = Vec::with_capacity(fm_cfg.factors.len());
+            for fc in &fm_cfg.factors {
+                let exchanges: Vec<ExchangeId> = fc
+                    .exchanges
+                    .iter()
+                    .map(|s| parse_exchange_id(s))
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+
+                let itype = if fc.symbol.starts_with("PERP_") {
+                    InstrumentType::Perp
+                } else {
+                    InstrumentType::Spot
+                };
+                let base = fc
+                    .symbol
+                    .strip_prefix("PERP_")
+                    .or_else(|| fc.symbol.strip_prefix("SPOT_"))
+                    .unwrap_or(&fc.symbol);
+                let sym_id = *REGISTRY.lookup(base, &itype).ok_or_else(|| {
+                    anyhow::anyhow!("factor symbol not in registry: {}", fc.symbol)
+                })?;
+
+                factors.push(FactorState {
+                    symbol_id: sym_id,
+                    exchanges,
+                    beta: fc.beta,
+                    snapshot_log_mid: 0.0,
+                });
+            }
+            info!(
+                "[{}] factor model: {} factor(s) [{}]",
+                config.symbol,
+                factors.len(),
+                fm_cfg
+                    .factors
+                    .iter()
+                    .map(|f| format!("{}@{:.3}", f.symbol, f.beta))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            Some(FactorModelState {
+                factors,
+                last_direct_fair: 0.0,
+                last_factor_wc: 0,
+                seeded: false,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Ok(SymbolState {
+        config,
+        symbol_id,
+        bid_quote: None,
+        ask_quote: None,
+        cached_vol_mult: 1.0,
+        last_ref_wc: 0,
+        last_exchange_ts_ms: 0,
+        last_direct_exchange_ts_ms: 0,
+        trigger_received_instant: None,
+        factor_model,
+        last_quote_eval: Instant::now(),
+        consecutive_rejects: 0,
+        reject_pause_until: None,
+        warmed_up: false,
+        running_since: None,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // MmEngine
 // ---------------------------------------------------------------------------
 
@@ -227,29 +339,14 @@ pub struct MmEngine {
     vol_provider: Option<crypto_feeds::vol_provider::VolProvider>,
     market_data: Arc<crypto_feeds::AllMarketData>,
     params: Box<dyn MmParamSource>,
-    config: StrategyConfig,
     shutdown: Arc<AtomicBool>,
     ghost: bool,
     spin_core: Option<usize>,
-    warmed_up: bool,
-
-    bid_quote: Option<LiveQuote>,
-    ask_quote: Option<LiveQuote>,
     state: EngineState,
 
-    hl_symbol_id: SymbolId,
+    symbols: Box<[SymbolState]>,
     oms_events: crossbeam_channel::Receiver<OmsEvent>,
-    last_quote_eval: Instant,
     last_status_log: Instant,
-    running_since: Option<Instant>,
-    consecutive_rejects: u32,
-    reject_pause_until: Option<Instant>,
-    last_ref_wc: u64, // track seqlock write count to detect new ticks
-    trigger_received_instant: Option<Instant>, // monotonic receive time of the feed that triggered the current tick
-    last_exchange_ts_ms: i64,                  // global freshness watermark
-    last_direct_exchange_ts_ms: i64, // freshest direct tick exchange_ts (for factor snapshot gating)
-    factor_model: Option<FactorModelState>,
-    cached_vol_mult: f64,
     presigned_cancels: HashMap<ClientOrderId, SignedPayload>,
     /// Local OMS state — single-threaded, event-sourced from gateway channel.
     oms_state: OmsStateTracker,
@@ -268,86 +365,27 @@ impl MmEngine {
         vol_provider: Option<crypto_feeds::vol_provider::VolProvider>,
         market_data: Arc<crypto_feeds::AllMarketData>,
         params: Box<dyn MmParamSource>,
-        config: StrategyConfig,
+        configs: Box<[StrategyConfig]>,
         ghost: bool,
         spin_core: Option<usize>,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Self> {
-        // Resolve the HL symbol to a SymbolId for fair price lookups
-        let itype = if config.symbol.starts_with("PERP_") {
-            InstrumentType::Perp
-        } else {
-            InstrumentType::Spot
-        };
-        let base = config
-            .symbol
-            .strip_prefix("PERP_")
-            .or_else(|| config.symbol.strip_prefix("SPOT_"))
-            .unwrap_or(&config.symbol);
+        let symbols: Box<[SymbolState]> = configs
+            .into_vec()
+            .into_iter()
+            .map(|c| build_symbol_state(c))
+            .collect::<Result<Vec<_>>>()?
+            .into_boxed_slice();
 
-        let hl_symbol_id = *REGISTRY
-            .lookup(base, &itype)
-            .ok_or_else(|| anyhow::anyhow!("symbol not in registry: {}", config.symbol))?;
+        info!("MmEngine: {} symbol(s): [{}]",
+            symbols.len(),
+            symbols.iter().map(|s| s.config.symbol.as_str()).collect::<Vec<_>>().join(", "),
+        );
 
         let oms_events = oms.event_receiver();
 
         #[cfg(feature = "profiling")]
         let latency = latency::init();
-
-        // Initialize factor model if configured
-        let factor_model = if let Some(ref fm_cfg) = config.factor_model {
-            if fm_cfg.enabled && !fm_cfg.factors.is_empty() {
-                let mut factors = Vec::with_capacity(fm_cfg.factors.len());
-                for fc in &fm_cfg.factors {
-                    let exchanges: Vec<ExchangeId> = fc
-                        .exchanges
-                        .iter()
-                        .map(|s| parse_exchange_id(s))
-                        .collect::<anyhow::Result<Vec<_>>>()?;
-
-                    let itype = if fc.symbol.starts_with("PERP_") {
-                        InstrumentType::Perp
-                    } else {
-                        InstrumentType::Spot
-                    };
-                    let base = fc
-                        .symbol
-                        .strip_prefix("PERP_")
-                        .or_else(|| fc.symbol.strip_prefix("SPOT_"))
-                        .unwrap_or(&fc.symbol);
-                    let symbol_id = *REGISTRY.lookup(base, &itype).ok_or_else(|| {
-                        anyhow::anyhow!("factor symbol not in registry: {}", fc.symbol)
-                    })?;
-
-                    factors.push(FactorState {
-                        symbol_id,
-                        exchanges,
-                        beta: fc.beta,
-                        snapshot_log_mid: 0.0,
-                    });
-                }
-                info!(
-                    "factor model enabled: {} factor(s) [{}]",
-                    factors.len(),
-                    fm_cfg
-                        .factors
-                        .iter()
-                        .map(|f| format!("{}@{:.3}", f.symbol, f.beta))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                );
-                Some(FactorModelState {
-                    factors,
-                    last_direct_fair: 0.0,
-                    last_factor_wc: 0,
-                    seeded: false,
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
 
         Ok(Self {
             oms,
@@ -355,27 +393,13 @@ impl MmEngine {
             vol_provider,
             market_data,
             params,
-            config,
             shutdown,
             ghost,
             spin_core,
-            warmed_up: false,
-            bid_quote: None,
-            ask_quote: None,
             state: EngineState::Initializing,
-            hl_symbol_id,
+            symbols,
             oms_events,
-            last_quote_eval: Instant::now(),
             last_status_log: Instant::now(),
-            running_since: None,
-            consecutive_rejects: 0,
-            reject_pause_until: None,
-            last_ref_wc: 0,
-            trigger_received_instant: None,
-            last_exchange_ts_ms: 0,
-            last_direct_exchange_ts_ms: 0,
-            factor_model,
-            cached_vol_mult: 1.0,
             presigned_cancels: HashMap::new(),
             oms_state: OmsStateTracker::new(StateTrackerConfig::default()),
             last_basis_save: Instant::now(),
@@ -388,34 +412,33 @@ impl MmEngine {
     // Factor model helpers
     // -----------------------------------------------------------------------
 
-    /// Resolve the next tick. Returns the freshest fair price by exchange_ts,
-    /// either direct or factor-adjusted. Snapshots factor mids only when the
-    /// direct feed genuinely advances. Global exchange_ts watermark prevents
-    /// stale or backwards ticks.
-    fn resolve_tick(&mut self) -> Option<TickSource> {
+    /// Resolve the next tick for a single symbol. Returns the freshest fair
+    /// price by exchange_ts, either direct or factor-adjusted.
+    fn resolve_tick_for(
+        sym: &mut SymbolState,
+        fair_price: &FairPriceEngine,
+        market_data: &crypto_feeds::AllMarketData,
+    ) -> Option<TickSource> {
         // 1. Check for new direct tick
         let mut direct_advanced = false;
         let mut best_received_instant: Option<Instant> = None;
         let mut best_feed_latency_ns: u64 = 0;
 
-        let wc = self
-            .fair_price
-            .ref_write_count(ExchangeId::Hyperliquid, self.hl_symbol_id);
-        if wc != self.last_ref_wc {
-            self.last_ref_wc = wc;
+        let wc = fair_price.ref_write_count(ExchangeId::Hyperliquid, sym.symbol_id);
+        if wc != sym.last_ref_wc {
+            sym.last_ref_wc = wc;
 
-            if let Some((fair, exchange_ts_ms, _, received_ts, feed_lat)) = self
-                .fair_price
-                .get_fair_price_detail(ExchangeId::Hyperliquid, self.hl_symbol_id)
+            if let Some((fair, exchange_ts_ms, _, received_ts, feed_lat)) =
+                fair_price.get_fair_price_detail(ExchangeId::Hyperliquid, sym.symbol_id)
             {
-                if exchange_ts_ms > self.last_direct_exchange_ts_ms {
-                    self.last_direct_exchange_ts_ms = exchange_ts_ms;
+                if exchange_ts_ms > sym.last_direct_exchange_ts_ms {
+                    sym.last_direct_exchange_ts_ms = exchange_ts_ms;
                     best_feed_latency_ns = feed_lat;
                     if received_ts > best_received_instant {
                         best_received_instant = received_ts;
                     }
                     direct_advanced = true;
-                    if let Some(ref mut fm) = self.factor_model {
+                    if let Some(ref mut fm) = sym.factor_model {
                         fm.last_direct_fair = fair;
                         fm.seeded = true;
                     }
@@ -424,13 +447,13 @@ impl MmEngine {
         }
 
         // 2. Single pass through factors: snapshot on direct advance, compute adjustment
-        if let Some(ref mut fm) = self.factor_model {
+        if let Some(ref mut fm) = sym.factor_model {
             if !fm.seeded {
                 return None;
             }
 
             let factor_wc_changed = {
-                let current_wc = total_factor_wc(&self.market_data, fm);
+                let current_wc = total_factor_wc(market_data, fm);
                 if current_wc != fm.last_factor_wc {
                     fm.last_factor_wc = current_wc;
                     true
@@ -444,7 +467,7 @@ impl MmEngine {
                 let mut best_exchange_ts = i64::MIN;
 
                 for f in &mut fm.factors {
-                    let Some((mid, exch_ts_ms, recv_ts)) = factor_mid(&self.market_data, f) else {
+                    let Some((mid, exch_ts_ms, recv_ts)) = factor_mid(market_data, f) else {
                         continue;
                     };
 
@@ -454,7 +477,7 @@ impl MmEngine {
                     }
 
                     // Only compute returns for factors fresher than the direct tick
-                    if exch_ts_ms > self.last_direct_exchange_ts_ms {
+                    if exch_ts_ms > sym.last_direct_exchange_ts_ms {
                         let r = mid.ln() - f.snapshot_log_mid;
                         sum += f.beta * r;
                         if exch_ts_ms > best_exchange_ts {
@@ -468,11 +491,11 @@ impl MmEngine {
 
                 // Determine best tick to return
                 let (tick_fair, tick_ts, tick_recv_ts, tick_is_direct) =
-                    if direct_advanced && self.last_direct_exchange_ts_ms >= best_exchange_ts {
+                    if direct_advanced && sym.last_direct_exchange_ts_ms >= best_exchange_ts {
                         // Direct is freshest — factor returns are ~0
                         (
                             fm.last_direct_fair,
-                            self.last_direct_exchange_ts_ms,
+                            sym.last_direct_exchange_ts_ms,
                             best_received_instant,
                             true,
                         )
@@ -485,10 +508,10 @@ impl MmEngine {
                     };
 
                 // Global freshness gate
-                if tick_ts <= self.last_exchange_ts_ms {
+                if tick_ts <= sym.last_exchange_ts_ms {
                     return None;
                 }
-                self.last_exchange_ts_ms = tick_ts;
+                sym.last_exchange_ts_ms = tick_ts;
 
                 return Some(TickSource {
                     fair: tick_fair,
@@ -502,19 +525,18 @@ impl MmEngine {
 
         // 3. Direct advanced but no factor model
         if direct_advanced {
-            if self.last_direct_exchange_ts_ms <= self.last_exchange_ts_ms {
+            if sym.last_direct_exchange_ts_ms <= sym.last_exchange_ts_ms {
                 return None;
             }
-            self.last_exchange_ts_ms = self.last_direct_exchange_ts_ms;
+            sym.last_exchange_ts_ms = sym.last_direct_exchange_ts_ms;
 
             // Need fair price again (no factor model to store it)
-            if let Some((fair, _, _, _, _)) = self
-                .fair_price
-                .get_fair_price_detail(ExchangeId::Hyperliquid, self.hl_symbol_id)
+            if let Some((fair, _, _, _, _)) =
+                fair_price.get_fair_price_detail(ExchangeId::Hyperliquid, sym.symbol_id)
             {
                 return Some(TickSource {
                     fair,
-                    exchange_ts_ms: self.last_direct_exchange_ts_ms,
+                    exchange_ts_ms: sym.last_direct_exchange_ts_ms,
                     trigger_received_instant: best_received_instant,
                     is_direct: true,
                     feed_latency_ns: best_feed_latency_ns,
@@ -530,9 +552,10 @@ impl MmEngine {
     // -----------------------------------------------------------------------
 
     pub async fn run(mut self) -> Result<()> {
+        let sym_names: Vec<&str> = self.symbols.iter().map(|s| s.config.symbol.as_str()).collect();
         info!(
-            "MM engine starting: symbol={} ghost={} post_only={}",
-            self.config.symbol, self.ghost, self.config.post_only,
+            "MM engine starting: symbols=[{}] ghost={}",
+            sym_names.join(", "), self.ghost,
         );
 
         self.oms.wait_ready().await?;
@@ -593,18 +616,14 @@ impl MmEngine {
             }
 
             if self.state != EngineState::Running {
-                info!(
-                    "MM engine entering Running state (warmup={}s)",
-                    self.config.warmup_secs
-                );
+                info!("MM engine entering Running state");
                 self.state = EngineState::Running;
-                self.running_since = Some(Instant::now());
+                for sym in self.symbols.iter_mut() {
+                    if sym.running_since.is_none() {
+                        sym.running_since = Some(Instant::now());
+                    }
+                }
             }
-
-            self.warmed_up = self
-                .running_since
-                .map(|t| t.elapsed() >= Duration::from_secs(self.config.warmup_secs))
-                .unwrap_or(false);
 
             // ── DRAIN OMS EVENTS ──
             #[cfg(feature = "profiling")]
@@ -612,78 +631,137 @@ impl MmEngine {
 
             self.drain_oms_events();
 
-            // ── CHECK FOR NEW DATA ──
             #[cfg(feature = "profiling")]
             let t2 = Instant::now(); // after drain
 
-            let Some(tick) = self.resolve_tick() else {
-                continue;
-            };
-
-            // ── NEW TICK ──
+            // ── PER-SYMBOL TICK LOOP ──
             #[cfg(feature = "profiling")]
-            let t3 = Instant::now(); // after resolve_tick
-
-            self.trigger_received_instant = tick.trigger_received_instant;
-
-            // Staleness check — direct feed only
-            if tick.is_direct {
-                if let Some(inst) = tick.trigger_received_instant {
-                    let recv_age_ms = inst.elapsed().as_millis() as i64;
-                    if recv_age_ms > self.config.max_stale_ms as i64 {
-                        if self.bid_quote.is_some() || self.ask_quote.is_some() {
-                            warn!(
-                                "ref feed stale (recv_age={}ms > {}ms), cancelling all quotes",
-                                recv_age_ms, self.config.max_stale_ms
-                            );
-                            self.cancel_all_quotes();
-                        }
-                        continue;
-                    }
-                }
-            }
-
-            // Sync local trackers with OMS reality
-            self.sync_quote_state();
-
-            // ── FAST PATH: adverse cancel guard ──
-            self.fast_cancel_check(tick.fair);
-
-            // ── SLOW PATH (~quote_interval_ms): quote placement ──
+            let mut first_tick: Option<TickSource> = None;
             #[cfg(feature = "profiling")]
-            let t4 = Instant::now(); // after fast path
-
+            let mut t3 = t2; // after resolve_tick (set from first symbol that ticks)
+            #[cfg(feature = "profiling")]
+            let mut t4 = t2; // after fast path
             #[cfg(feature = "profiling")]
             let mut vol_ns: u64 = 0;
             #[cfg(feature = "profiling")]
             let mut is_slow = false;
+            #[cfg(feature = "profiling")]
+            let mut any_warmed_up = false;
 
-            let interval = Duration::from_millis(self.config.quote_interval_ms);
-            if self.warmed_up && self.last_quote_eval.elapsed() >= interval {
+            let mut any_ticked = false;
+            let mut did_basis_update = false;
+
+            for i in 0..self.symbols.len() {
+                // Update per-symbol warmup
+                let sym = &mut self.symbols[i];
+                sym.warmed_up = sym
+                    .running_since
+                    .map(|t| t.elapsed() >= Duration::from_secs(sym.config.warmup_secs))
+                    .unwrap_or(false);
+
+                // Resolve tick for this symbol
+                let Some(tick) = Self::resolve_tick_for(sym, &self.fair_price, &self.market_data)
+                else {
+                    continue;
+                };
+
+                any_ticked = true;
+
                 #[cfg(feature = "profiling")]
-                { is_slow = true; }
+                if first_tick.is_none() {
+                    t3 = Instant::now();
+                }
+                #[cfg(feature = "profiling")]
+                if sym.warmed_up {
+                    any_warmed_up = true;
+                }
 
-                self.fair_price.update_basis();
+                let sym = &mut self.symbols[i];
+                sym.trigger_received_instant = tick.trigger_received_instant;
+
+                // Staleness check — direct feed only
+                if tick.is_direct {
+                    if let Some(inst) = tick.trigger_received_instant {
+                        let recv_age_ms = inst.elapsed().as_millis() as i64;
+                        if recv_age_ms > sym.config.max_stale_ms as i64 {
+                            if sym.bid_quote.is_some() || sym.ask_quote.is_some() {
+                                warn!(
+                                    "[{}] ref feed stale (recv_age={}ms > {}ms), cancelling quotes",
+                                    sym.config.symbol, recv_age_ms, sym.config.max_stale_ms
+                                );
+                                Self::cancel_quotes_for(sym, &self.oms, self.ghost, &mut self.presigned_cancels);
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                // Sync local trackers with OMS reality
+                Self::sync_quote_state_for(sym, &self.oms_state);
+
+                // ── FAST PATH: adverse cancel guard ──
+                Self::fast_cancel_check_for(
+                    sym,
+                    tick.fair,
+                    &self.oms,
+                    &self.oms_state,
+                    &mut self.presigned_cancels,
+                    self.ghost,
+                    #[cfg(feature = "profiling")]
+                    &mut self.latency,
+                );
 
                 #[cfg(feature = "profiling")]
-                let vol_start = Instant::now();
+                { t4 = Instant::now(); }
 
-                self.cached_vol_mult = self.get_vol_multiplier(tick.fair, tick.exchange_ts_ms);
+                // ── SLOW PATH (~quote_interval_ms): quote placement ──
+                let interval = Duration::from_millis(sym.config.quote_interval_ms);
+                if sym.warmed_up && sym.last_quote_eval.elapsed() >= interval {
+                    #[cfg(feature = "profiling")]
+                    { is_slow = true; }
+
+                    if !did_basis_update {
+                        self.fair_price.update_basis();
+                        did_basis_update = true;
+                    }
+
+                    #[cfg(feature = "profiling")]
+                    let vol_start = Instant::now();
+
+                    Self::get_vol_multiplier_for(sym, &mut self.vol_provider, tick.fair, tick.exchange_ts_ms);
+
+                    #[cfg(feature = "profiling")]
+                    { vol_ns = vol_start.elapsed().as_nanos() as u64; }
+
+                    Self::evaluate_and_place_quotes_for(
+                        sym,
+                        tick.fair,
+                        &self.oms,
+                        &mut self.oms_state,
+                        &self.fair_price,
+                        &*self.params,
+                        self.ghost,
+                    );
+
+                    sym.last_quote_eval = Instant::now();
+
+                    if self.last_basis_save.elapsed() >= Duration::from_secs(10) {
+                        self.fair_price.save_basis_cache();
+                        self.last_basis_save = Instant::now();
+                    }
+                }
 
                 #[cfg(feature = "profiling")]
-                { vol_ns = vol_start.elapsed().as_nanos() as u64; }
-
-                self.evaluate_and_place_quotes(tick.fair);
-
-                self.last_quote_eval = Instant::now();
-
-                if self.last_basis_save.elapsed() >= Duration::from_secs(10) {
-                    self.fair_price.save_basis_cache();
-                    self.last_basis_save = Instant::now();
+                if first_tick.is_none() {
+                    first_tick = Some(tick);
                 }
             }
 
-            // ── STATUS LOG (checked every spin, not just on new data) ──
+            if !any_ticked {
+                continue;
+            }
+
+            // ── STATUS LOG ──
             #[cfg(any(feature = "log_status", feature = "log_state"))]
             if self.last_status_log.elapsed() >= Duration::from_secs(1) {
                 #[cfg(feature = "log_status")]
@@ -695,7 +773,7 @@ impl MmEngine {
 
             // ── FLUSH ALL PROFILING ──
             #[cfg(feature = "profiling")]
-            if self.warmed_up {
+            if any_warmed_up {
                 let t5 = Instant::now(); // end of tick
 
                 self.latency.record(latency::METRIC_LOOP_OVERHEAD, (t1 - t0).as_nanos() as u64);
@@ -704,11 +782,13 @@ impl MmEngine {
                 self.latency.record(latency::METRIC_TICK_FAST, (t4 - t3).as_nanos() as u64);
                 self.latency.record(latency::METRIC_TICK_END, (t5 - t3).as_nanos() as u64);
 
-                if let Some(inst) = tick.trigger_received_instant {
-                    self.latency.record(latency::METRIC_T2D, (t3 - inst).as_nanos() as u64);
-                }
-                if tick.feed_latency_ns > 0 {
-                    self.latency.record(latency::METRIC_FEED, tick.feed_latency_ns);
+                if let Some(ref tick) = first_tick {
+                    if let Some(inst) = tick.trigger_received_instant {
+                        self.latency.record(latency::METRIC_T2D, (t3 - inst).as_nanos() as u64);
+                    }
+                    if tick.feed_latency_ns > 0 {
+                        self.latency.record(latency::METRIC_FEED, tick.feed_latency_ns);
+                    }
                 }
                 if is_slow {
                     self.latency.record(latency::METRIC_VOL, vol_ns);
@@ -739,50 +819,60 @@ impl MmEngine {
             }
             return false;
         }
-        if self.consecutive_rejects >= MAX_CONSECUTIVE_REJECTS {
-            if let Some(until) = self.reject_pause_until {
-                if Instant::now() >= until {
-                    info!("reject cooldown elapsed, resetting and retrying");
-                    self.consecutive_rejects = 0;
-                    self.reject_pause_until = None;
-                    // fall through to remaining precondition checks
-                } else {
-                    if should_log {
-                        let remaining = until.duration_since(Instant::now());
-                        warn!(
-                            "paused: {} consecutive rejects (retry in {:.0}s)",
-                            self.consecutive_rejects,
-                            remaining.as_secs_f64()
-                        );
-                        self.last_status_log = Instant::now();
+
+        // Per-symbol reject cooldown: check if ALL symbols are paused
+        let mut all_paused = true;
+        for sym in self.symbols.iter_mut() {
+            if sym.consecutive_rejects >= MAX_CONSECUTIVE_REJECTS {
+                if let Some(until) = sym.reject_pause_until {
+                    if Instant::now() >= until {
+                        info!("[{}] reject cooldown elapsed, resetting", sym.config.symbol);
+                        sym.consecutive_rejects = 0;
+                        sym.reject_pause_until = None;
+                        all_paused = false;
                     }
-                    return false;
+                    // else still paused for this symbol
+                } else {
+                    warn!(
+                        "[{}] paused: {} consecutive rejects, cooldown {}s",
+                        sym.config.symbol, sym.consecutive_rejects, REJECT_COOLDOWN.as_secs()
+                    );
+                    sym.reject_pause_until = Some(Instant::now() + REJECT_COOLDOWN);
                 }
             } else {
-                warn!(
-                    "paused: {} consecutive rejects, cooldown {}s",
-                    self.consecutive_rejects,
-                    REJECT_COOLDOWN.as_secs()
-                );
-                self.reject_pause_until = Some(Instant::now() + REJECT_COOLDOWN);
-                self.last_status_log = Instant::now();
-                return false;
+                all_paused = false;
             }
         }
-
-        // Check feed is alive (monotonic — no Utc::now syscall)
-        if let Some(recv) = self.trigger_received_instant {
-            if recv.elapsed().as_millis() as u64 > self.config.max_feed_age_ms {
-                if should_log {
-                    warn!(
-                        "paused: reference feed dead (recv_age={}ms > {}ms)",
-                        recv.elapsed().as_millis(),
-                        self.config.max_feed_age_ms
-                    );
-                    self.last_status_log = Instant::now();
-                }
-                return false;
+        if all_paused && !self.symbols.is_empty() {
+            if should_log {
+                warn!("paused: all symbols in reject cooldown");
+                self.last_status_log = Instant::now();
             }
+            return false;
+        }
+
+        // Per-symbol feed liveness: check if ALL feeds are dead
+        let mut all_feeds_dead = true;
+        for sym in self.symbols.iter() {
+            if let Some(recv) = sym.trigger_received_instant {
+                if recv.elapsed().as_millis() as u64 <= sym.config.max_feed_age_ms {
+                    all_feeds_dead = false;
+                    break;
+                }
+            } else {
+                // No data received yet — not dead, just not started
+                all_feeds_dead = false;
+                break;
+            }
+        }
+        if all_feeds_dead && !self.symbols.is_empty()
+            && self.symbols.iter().any(|s| s.trigger_received_instant.is_some())
+        {
+            if should_log {
+                warn!("paused: all reference feeds dead");
+                self.last_status_log = Instant::now();
+            }
+            return false;
         }
 
         true
@@ -792,9 +882,9 @@ impl MmEngine {
     // Quote state sync
     // -----------------------------------------------------------------------
 
-    fn sync_quote_state(&mut self) {
-        if let Some(ref mut q) = self.bid_quote {
-            match self.oms_state.get_order(q.client_id) {
+    fn sync_quote_state_for(sym: &mut SymbolState, oms_state: &OmsStateTracker) {
+        if let Some(ref mut q) = sym.bid_quote {
+            match oms_state.get_order(q.client_id) {
                 Some(h)
                     if matches!(
                         h.state,
@@ -815,12 +905,12 @@ impl MmEngine {
                         "bid quote {} no longer active, clearing tracker",
                         q.client_id.0
                     );
-                    self.bid_quote = None;
+                    sym.bid_quote = None;
                 }
             }
         }
-        if let Some(ref mut q) = self.ask_quote {
-            match self.oms_state.get_order(q.client_id) {
+        if let Some(ref mut q) = sym.ask_quote {
+            match oms_state.get_order(q.client_id) {
                 Some(h)
                     if matches!(
                         h.state,
@@ -840,7 +930,7 @@ impl MmEngine {
                         "ask quote {} no longer active, clearing tracker",
                         q.client_id.0
                     );
-                    self.ask_quote = None;
+                    sym.ask_quote = None;
                 }
             }
         }
@@ -876,47 +966,56 @@ impl MmEngine {
     // Fast path: cancel guard (inner-side adverse detection)
     // -----------------------------------------------------------------------
 
-    fn fast_cancel_check(&mut self, fair: f64) {
-        if self.bid_quote.is_none() && self.ask_quote.is_none() {
+    fn fast_cancel_check_for(
+        sym: &mut SymbolState,
+        fair: f64,
+        oms: &Arc<HyperliquidOms>,
+        oms_state: &OmsStateTracker,
+        presigned_cancels: &mut HashMap<ClientOrderId, SignedPayload>,
+        ghost: bool,
+        #[cfg(feature = "profiling")]
+        latency: &mut latency::LatencyRecorder,
+    ) {
+        if sym.bid_quote.is_none() && sym.ask_quote.is_none() {
             return;
         }
 
-        let min_edge = self.config.min_edge_bps * fair / 10_000.0;
+        let min_edge = sym.config.min_edge_bps * fair / 10_000.0;
         let min_spread =
-            (self.config.ref_min_spread_bps * self.cached_vol_mult * fair / 10_000.0).max(min_edge);
+            (sym.config.ref_min_spread_bps * sym.cached_vol_mult * fair / 10_000.0).max(min_edge);
 
         // Check bid: inside min_spread from fair?
-        if let Some(ref q) = self.bid_quote {
-            let state = self.oms_state.get_order(q.client_id).map(|h| h.state);
+        if let Some(ref q) = sym.bid_quote {
+            let state = oms_state.get_order(q.client_id).map(|h| h.state);
             let can_cancel = matches!(
                 state,
                 Some(OrderState::Accepted) | Some(OrderState::PartiallyFilled)
             );
-            if can_cancel && q.price > self.oms.round_price(fair - min_spread) {
+            if can_cancel && q.price > oms.round_price(fair - min_spread) {
                 #[cfg(feature = "profiling")]
                 let sign_start = Instant::now();
-                let signed = if let Some(s) = self.presigned_cancels.remove(&q.client_id) {
-                    self.oms.mark_cancelling(&q.client_id);
+                let signed = if let Some(s) = presigned_cancels.remove(&q.client_id) {
+                    oms.mark_cancelling(&q.client_id);
                     Ok(s)
                 } else {
-                    self.oms.sign_cancel_order(&q.client_id)
+                    oms.sign_cancel_order(&q.client_id)
                 };
                 match signed {
                     Ok(signed) => {
                         // Mark cancelling in local state before async post
-                        self.oms_state.mark_cancelling(q.client_id);
+                        // Note: oms_state is &, so we can't mark here — done via event
                         #[cfg(feature = "profiling")]
-                        self.latency
+                        latency
                             .record(latency::METRIC_SIGN, sign_start.elapsed().as_nanos() as u64);
-                        let oms = Arc::clone(&self.oms);
+                        let oms_clone = Arc::clone(oms);
                         let cid = q.client_id;
                         #[cfg(feature = "profiling")]
-                        self.record_t2t();
-                        if self.ghost {
-                            self.bid_quote = None;
+                        Self::record_t2t_for(sym, latency);
+                        if ghost {
+                            sym.bid_quote = None;
                         } else {
                             tokio::spawn(async move {
-                                oms.post_cancel_order(&cid, signed).await;
+                                oms_clone.post_cancel_order(&cid, signed).await;
                             });
                         }
                     }
@@ -926,37 +1025,35 @@ impl MmEngine {
         }
 
         // Check ask: inside min_spread from fair?
-        if let Some(ref q) = self.ask_quote {
-            let state = self.oms_state.get_order(q.client_id).map(|h| h.state);
+        if let Some(ref q) = sym.ask_quote {
+            let state = oms_state.get_order(q.client_id).map(|h| h.state);
             let can_cancel = matches!(
                 state,
                 Some(OrderState::Accepted) | Some(OrderState::PartiallyFilled)
             );
-            if can_cancel && q.price < self.oms.round_price(fair + min_spread) {
+            if can_cancel && q.price < oms.round_price(fair + min_spread) {
                 #[cfg(feature = "profiling")]
                 let sign_start = Instant::now();
-                let signed = if let Some(s) = self.presigned_cancels.remove(&q.client_id) {
-                    self.oms.mark_cancelling(&q.client_id);
+                let signed = if let Some(s) = presigned_cancels.remove(&q.client_id) {
+                    oms.mark_cancelling(&q.client_id);
                     Ok(s)
                 } else {
-                    self.oms.sign_cancel_order(&q.client_id)
+                    oms.sign_cancel_order(&q.client_id)
                 };
                 match signed {
                     Ok(signed) => {
-                        // Mark cancelling in local state before async post
-                        self.oms_state.mark_cancelling(q.client_id);
                         #[cfg(feature = "profiling")]
-                        self.latency
+                        latency
                             .record(latency::METRIC_SIGN, sign_start.elapsed().as_nanos() as u64);
-                        let oms = Arc::clone(&self.oms);
+                        let oms_clone = Arc::clone(oms);
                         let cid = q.client_id;
                         #[cfg(feature = "profiling")]
-                        self.record_t2t();
-                        if self.ghost {
-                            self.ask_quote = None;
+                        Self::record_t2t_for(sym, latency);
+                        if ghost {
+                            sym.ask_quote = None;
                         } else {
                             tokio::spawn(async move {
-                                oms.post_cancel_order(&cid, signed).await;
+                                oms_clone.post_cancel_order(&cid, signed).await;
                             });
                         }
                     }
@@ -970,29 +1067,37 @@ impl MmEngine {
     // Slow path: evaluate and place quotes
     // -----------------------------------------------------------------------
 
-    fn evaluate_and_place_quotes(&mut self, fair: f64) {
+    fn evaluate_and_place_quotes_for(
+        sym: &mut SymbolState,
+        fair: f64,
+        oms: &Arc<HyperliquidOms>,
+        oms_state: &mut OmsStateTracker,
+        fair_price: &FairPriceEngine,
+        params: &dyn MmParamSource,
+        ghost: bool,
+    ) {
         // Cancel any stray orders on our symbol that we don't own
-        self.cancel_stray_orders();
+        Self::cancel_stray_orders_for(sym, oms, oms_state, fair_price, ghost);
 
-        let position = self.get_position();
-        let target = self.params.target_position_usd() / fair;
-        let notional = self.params.order_notional_usd();
+        let position = Self::get_position_for(&sym.config.symbol, oms_state);
+        let target = params.target_position_usd() / fair;
+        let notional = params.order_notional_usd();
         let order_size = notional / fair;
-        let max_pos = self.params.max_position_usd() / fair;
+        let max_pos = params.max_position_usd() / fair;
 
-        let min_edge = self.config.min_edge_bps * fair / 10_000.0;
-        let half_spread = (self.config.ref_half_spread_bps * self.cached_vol_mult * fair
+        let min_edge = sym.config.min_edge_bps * fair / 10_000.0;
+        let half_spread = (sym.config.ref_half_spread_bps * sym.cached_vol_mult * fair
             / 10_000.0)
             .max(min_edge);
         let requote_thresh =
-            self.config.ref_requote_tolerance_bps * self.cached_vol_mult * fair / 10_000.0;
+            sym.config.ref_requote_tolerance_bps * sym.cached_vol_mult * fair / 10_000.0;
 
-        let skewed_mid = self.compute_skewed_mid(fair, position, target, max_pos);
+        let skewed_mid = Self::compute_skewed_mid_for(&sym.config, fair, position, target, max_pos);
         let (desired_bid, desired_ask) = Self::clamp_to_fair(
             fair,
             skewed_mid - half_spread,
             skewed_mid + half_spread,
-            self.config.min_edge_bps,
+            sym.config.min_edge_bps,
         );
 
         // Determine if we should quote each side (position limits)
@@ -1002,31 +1107,30 @@ impl MmEngine {
         // ── CANCEL stale/outer-side quotes ──
 
         // Bid: cancel if too passive (outer side) or shouldn't quote
-        if let Some(ref q) = self.bid_quote {
+        if let Some(ref q) = sym.bid_quote {
             let should_cancel = !want_bid || (desired_bid - q.price) > requote_thresh; // bid too LOW = too passive
 
             if should_cancel {
                 // Don't cancel inflight (no exchange OID yet)
-                let skip_cancel = self
-                    .oms_state
+                let skip_cancel = oms_state
                     .get_order(q.client_id)
                     .map(|h| matches!(h.state, OrderState::Inflight | OrderState::Cancelling))
                     .unwrap_or(false);
 
                 if !skip_cancel {
-                    if self.ghost {
+                    if ghost {
                         debug!(
                             "[GHOST] would CANCEL bid cid={} price={:.6} (slow path requote)",
                             q.client_id.0, q.price
                         );
-                        self.bid_quote = None;
+                        sym.bid_quote = None;
                     } else {
                         debug!("slow cancel bid cid={} price={:.6}", q.client_id.0, q.price);
-                        self.oms_state.mark_cancelling(q.client_id);
-                        let oms = Arc::clone(&self.oms);
+                        oms_state.mark_cancelling(q.client_id);
+                        let oms_clone = Arc::clone(oms);
                         let cid = q.client_id;
                         tokio::spawn(async move {
-                            if let Err(e) = oms.cancel_order(&cid).await {
+                            if let Err(e) = oms_clone.cancel_order(&cid).await {
                                 warn!("failed to cancel bid {}: {e}", cid.0);
                             }
                         });
@@ -1036,30 +1140,29 @@ impl MmEngine {
         }
 
         // Ask: cancel if too passive or shouldn't quote
-        if let Some(ref q) = self.ask_quote {
+        if let Some(ref q) = sym.ask_quote {
             let should_cancel = !want_ask || (q.price - desired_ask) > requote_thresh; // ask too HIGH = too passive
 
             if should_cancel {
-                let skip_cancel = self
-                    .oms_state
+                let skip_cancel = oms_state
                     .get_order(q.client_id)
                     .map(|h| matches!(h.state, OrderState::Inflight | OrderState::Cancelling))
                     .unwrap_or(false);
 
                 if !skip_cancel {
-                    if self.ghost {
+                    if ghost {
                         debug!(
                             "[GHOST] would CANCEL ask cid={} price={:.6} (slow path requote)",
                             q.client_id.0, q.price
                         );
-                        self.ask_quote = None;
+                        sym.ask_quote = None;
                     } else {
                         debug!("slow cancel ask cid={} price={:.6}", q.client_id.0, q.price);
-                        self.oms_state.mark_cancelling(q.client_id);
-                        let oms = Arc::clone(&self.oms);
+                        oms_state.mark_cancelling(q.client_id);
+                        let oms_clone = Arc::clone(oms);
                         let cid = q.client_id;
                         tokio::spawn(async move {
-                            if let Err(e) = oms.cancel_order(&cid).await {
+                            if let Err(e) = oms_clone.cancel_order(&cid).await {
                                 warn!("failed to cancel ask {}: {e}", cid.0);
                             }
                         });
@@ -1073,15 +1176,15 @@ impl MmEngine {
         // before the HTTP call, so we can grab the cid and set the tracker immediately.
         // sync_quote_state sees Inflight → keeps tracker alive until Accepted/Rejected.
 
-        if self.bid_quote.is_none() && want_bid && self.ghost {}
-        if self.bid_quote.is_none() && want_bid && !self.ghost {
-            let tif = if self.config.post_only {
+        if sym.bid_quote.is_none() && want_bid && ghost {}
+        if sym.bid_quote.is_none() && want_bid && !ghost {
+            let tif = if sym.config.post_only {
                 TimeInForce::PostOnly
             } else {
                 TimeInForce::GTC
             };
             let req = OrderRequest {
-                symbol: self.config.symbol.clone(),
+                symbol: sym.config.symbol.clone(),
                 side: Side::Buy,
                 order_type: OrderType::Limit {
                     price: desired_bid,
@@ -1090,14 +1193,14 @@ impl MmEngine {
                 size: order_size,
                 reduce_only: false,
             };
-            match self.oms.prepare_place_order(&req) {
+            match oms.prepare_place_order(&req) {
                 Ok((cid, sdk_req)) => {
                     debug!("placing bid cid={} price={:.6}", cid.0, desired_bid);
                     // Insert inflight in local state
-                    self.oms_state.insert_inflight(OrderHandle {
+                    oms_state.insert_inflight(OrderHandle {
                         client_id: cid,
                         exchange_id: None,
-                        symbol: self.config.symbol.clone(),
+                        symbol: sym.config.symbol.clone(),
                         side: Side::Buy,
                         order_type: OrderType::Limit {
                             price: desired_bid,
@@ -1113,17 +1216,17 @@ impl MmEngine {
                         submitted_at: Some(Instant::now()),
                         last_modified: Some(Instant::now()),
                     });
-                    self.bid_quote = Some(LiveQuote {
+                    sym.bid_quote = Some(LiveQuote {
                         client_id: cid,
                         exchange_id: None,
                         price: desired_bid,
                         size: order_size,
                         placed_at: Instant::now(),
                     });
-                    let oms = Arc::clone(&self.oms);
+                    let oms_clone = Arc::clone(oms);
                     tokio::spawn(async move {
-                        match oms.sign_place_order(sdk_req) {
-                            Ok(signed) => oms.post_place_order(cid.0, signed).await,
+                        match oms_clone.sign_place_order(sdk_req) {
+                            Ok(signed) => oms_clone.post_place_order(cid.0, signed).await,
                             Err(e) => warn!("failed to sign bid {}: {e}", cid.0),
                         }
                     });
@@ -1132,14 +1235,14 @@ impl MmEngine {
             }
         }
 
-        if self.ask_quote.is_none() && want_ask && !self.ghost {
-            let tif = if self.config.post_only {
+        if sym.ask_quote.is_none() && want_ask && !ghost {
+            let tif = if sym.config.post_only {
                 TimeInForce::PostOnly
             } else {
                 TimeInForce::GTC
             };
             let req = OrderRequest {
-                symbol: self.config.symbol.clone(),
+                symbol: sym.config.symbol.clone(),
                 side: Side::Sell,
                 order_type: OrderType::Limit {
                     price: desired_ask,
@@ -1148,14 +1251,14 @@ impl MmEngine {
                 size: order_size,
                 reduce_only: false,
             };
-            match self.oms.prepare_place_order(&req) {
+            match oms.prepare_place_order(&req) {
                 Ok((cid, sdk_req)) => {
                     debug!("placing ask cid={} price={:.6}", cid.0, desired_ask);
                     // Insert inflight in local state
-                    self.oms_state.insert_inflight(OrderHandle {
+                    oms_state.insert_inflight(OrderHandle {
                         client_id: cid,
                         exchange_id: None,
-                        symbol: self.config.symbol.clone(),
+                        symbol: sym.config.symbol.clone(),
                         side: Side::Sell,
                         order_type: OrderType::Limit {
                             price: desired_ask,
@@ -1171,17 +1274,17 @@ impl MmEngine {
                         submitted_at: Some(Instant::now()),
                         last_modified: Some(Instant::now()),
                     });
-                    self.ask_quote = Some(LiveQuote {
+                    sym.ask_quote = Some(LiveQuote {
                         client_id: cid,
                         exchange_id: None,
                         price: desired_ask,
                         size: order_size,
                         placed_at: Instant::now(),
                     });
-                    let oms = Arc::clone(&self.oms);
+                    let oms_clone = Arc::clone(oms);
                     tokio::spawn(async move {
-                        match oms.sign_place_order(sdk_req) {
-                            Ok(signed) => oms.post_place_order(cid.0, signed).await,
+                        match oms_clone.sign_place_order(sdk_req) {
+                            Ok(signed) => oms_clone.post_place_order(cid.0, signed).await,
                             Err(e) => warn!("failed to sign ask {}: {e}", cid.0),
                         }
                     });
@@ -1196,7 +1299,7 @@ impl MmEngine {
     // -----------------------------------------------------------------------
 
     /// Logarithmic skew: aggressive near target, saturates for large deviations, capped at max_skew_bps.
-    fn compute_skewed_mid(&self, fair_value: f64, position: f64, target: f64, max_pos: f64) -> f64 {
+    fn compute_skewed_mid_for(config: &StrategyConfig, fair_value: f64, position: f64, target: f64, max_pos: f64) -> f64 {
         let diff = target - position;
         if diff.abs() < 1e-12 {
             return fair_value;
@@ -1210,38 +1313,41 @@ impl MmEngine {
         // Normalize to [-1, 1] then scale by max_skew_bps
         let raw = diff.signum() * (1.0 + diff.abs() / denom).ln();
         let normalized = raw / std::f64::consts::LN_2; // ∈ [-1, 1] at 100% off target
-        let skew_bps = (normalized * self.config.max_skew_bps)
-            .clamp(-self.config.max_skew_bps, self.config.max_skew_bps);
+        let skew_bps = (normalized * config.max_skew_bps)
+            .clamp(-config.max_skew_bps, config.max_skew_bps);
         fair_value + skew_bps * fair_value / 10_000.0
     }
 
     /// Record t2t: age of the feed that triggered this tick, captured when the tick was resolved.
-    /// Uses trigger_recv_age_ns (freshest feed for factor ticks, direct feed for direct ticks)
-    /// instead of re-querying FairPriceEngine, which could measure a stale direct feed
-    /// when the cancel was actually triggered by a fresh factor tick.
     #[cfg(feature = "profiling")]
-    fn record_t2t(&mut self) {
-        if self.warmed_up {
-            if let Some(inst) = self.trigger_received_instant {
-                self.latency
-                    .record(latency::METRIC_T2T, inst.elapsed().as_nanos() as u64);
+    fn record_t2t_for(sym: &SymbolState, latency: &mut latency::LatencyRecorder) {
+        if sym.warmed_up {
+            if let Some(inst) = sym.trigger_received_instant {
+                latency.record(latency::METRIC_T2T, inst.elapsed().as_nanos() as u64);
             }
         }
     }
 
-    fn get_vol_multiplier(&mut self, fair: f64, exchange_ts_ms: i64) -> f64 {
-        let Some(ref mut vp) = self.vol_provider else {
-            return 1.0;
+    fn get_vol_multiplier_for(
+        sym: &mut SymbolState,
+        vol_provider: &mut Option<crypto_feeds::vol_provider::VolProvider>,
+        fair: f64,
+        exchange_ts_ms: i64,
+    ) {
+        let Some(vp) = vol_provider else {
+            sym.cached_vol_mult = 1.0;
+            return;
         };
         // Update vol provider with current fair price (drives HAR virtual head)
         let ts_ns = exchange_ts_ms * 1_000_000;
         vp.update(0, fair, ts_ns);
         let predicted = vp.ann_vol(0);
-        if self.config.ref_vol <= 0.0 || predicted <= 0.0 || !predicted.is_finite() {
-            return 1.0;
+        if sym.config.ref_vol <= 0.0 || predicted <= 0.0 || !predicted.is_finite() {
+            sym.cached_vol_mult = 1.0;
+            return;
         }
-        (predicted / self.config.ref_vol)
-            .clamp(self.config.vol_mult_floor, self.config.vol_mult_cap)
+        sym.cached_vol_mult = (predicted / sym.config.ref_vol)
+            .clamp(sym.config.vol_mult_floor, sym.config.vol_mult_cap);
     }
 
     fn clamp_to_fair(
@@ -1262,117 +1368,120 @@ impl MmEngine {
     // -----------------------------------------------------------------------
 
     #[cfg(feature = "log_status")]
-    fn log_status(&mut self) {
-        let fair = self
-            .fair_price
-            .get_fair_price(ExchangeId::Hyperliquid, self.hl_symbol_id);
-        let basis = self
-            .fair_price
-            .get_basis(ExchangeId::Hyperliquid, self.hl_symbol_id);
-        let position = self.get_position();
-        let target = fair
-            .map(|f| self.params.target_position_usd() / f)
-            .unwrap_or(0.0);
-        let max_pos = fair
-            .map(|f| self.params.max_position_usd() / f)
-            .unwrap_or(0.0);
+    fn log_status(&self) {
+        for sym in self.symbols.iter() {
+            let fair = self
+                .fair_price
+                .get_fair_price(ExchangeId::Hyperliquid, sym.symbol_id);
+            let basis = self
+                .fair_price
+                .get_basis(ExchangeId::Hyperliquid, sym.symbol_id);
+            let position = Self::get_position_for(&sym.config.symbol, &self.oms_state);
+            let target = fair
+                .map(|f| self.params.target_position_usd() / f)
+                .unwrap_or(0.0);
+            let max_pos = fair
+                .map(|f| self.params.max_position_usd() / f)
+                .unwrap_or(0.0);
 
-        let basis_bps = match (basis, fair) {
-            (Some(b), Some(f)) if f != 0.0 => b / f * 10_000.0,
-            _ => 0.0,
-        };
+            let basis_bps = match (basis, fair) {
+                (Some(b), Some(f)) if f != 0.0 => b / f * 10_000.0,
+                _ => 0.0,
+            };
 
-        // Compute actual skew bps being applied
-        let skew_bps = if let Some(f) = fair {
-            let skewed = self.compute_skewed_mid(f, position, target, max_pos);
-            (skewed - f) / f * 10_000.0
-        } else {
-            0.0
-        };
+            // Compute actual skew bps being applied
+            let skew_bps = if let Some(f) = fair {
+                let skewed = Self::compute_skewed_mid_for(&sym.config, f, position, target, max_pos);
+                (skewed - f) / f * 10_000.0
+            } else {
+                0.0
+            };
 
-        let bid_str = self
-            .bid_quote
-            .as_ref()
-            .map(|q| format!("{:.6}", q.price))
-            .unwrap_or_else(|| "-".into());
-        let ask_str = self
-            .ask_quote
-            .as_ref()
-            .map(|q| format!("{:.6}", q.price))
-            .unwrap_or_else(|| "-".into());
+            let bid_str = sym
+                .bid_quote
+                .as_ref()
+                .map(|q| format!("{:.6}", q.price))
+                .unwrap_or_else(|| "-".into());
+            let ask_str = sym
+                .ask_quote
+                .as_ref()
+                .map(|q| format!("{:.6}", q.price))
+                .unwrap_or_else(|| "-".into());
 
-        let (exch_age_ms, ref_feed) = self
-            .fair_price
-            .get_fair_price_detail(ExchangeId::Hyperliquid, self.hl_symbol_id)
-            .map(|(_, ex_ts_ms, feed, _, _)| {
-                let now_ms = chrono::Utc::now().timestamp_millis();
-                (now_ms - ex_ts_ms, feed)
-            })
-            .unwrap_or((-1, "none"));
+            let (exch_age_ms, ref_feed) = self
+                .fair_price
+                .get_fair_price_detail(ExchangeId::Hyperliquid, sym.symbol_id)
+                .map(|(_, ex_ts_ms, feed, _, _)| {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    (now_ms - ex_ts_ms, feed)
+                })
+                .unwrap_or((-1, "none"));
 
-        let hl_mid = self
-            .fair_price
-            .get_mid(ExchangeId::Hyperliquid, self.hl_symbol_id);
-        let residual_bps = match (hl_mid, fair) {
-            (Some(hl), Some(f)) if f != 0.0 => (hl - f) / f * 10_000.0,
-            _ => 0.0,
-        };
+            let hl_mid = self
+                .fair_price
+                .get_mid(ExchangeId::Hyperliquid, sym.symbol_id);
+            let residual_bps = match (hl_mid, fair) {
+                (Some(hl), Some(f)) if f != 0.0 => (hl - f) / f * 10_000.0,
+                _ => 0.0,
+            };
 
-        // Factor model adjustment in bps (corr_fair vs direct_fair)
-        let factor_bps = match (fair, &self.factor_model) {
-            (Some(f), Some(fm)) if fm.seeded && f != 0.0 => {
-                let mut sum = 0.0f64;
-                for fac in &fm.factors {
-                    if let Some((mid, _, _)) = factor_mid(&self.market_data, fac) {
-                        sum += fac.beta * (mid.ln() - fac.snapshot_log_mid);
+            // Factor model adjustment in bps (corr_fair vs direct_fair)
+            let factor_bps = match (fair, &sym.factor_model) {
+                (Some(f), Some(fm)) if fm.seeded && f != 0.0 => {
+                    let mut sum = 0.0f64;
+                    for fac in &fm.factors {
+                        if let Some((mid, _, _)) = factor_mid(&self.market_data, fac) {
+                            sum += fac.beta * (mid.ln() - fac.snapshot_log_mid);
+                        }
                     }
+                    sum * 10_000.0
                 }
-                sum * 10_000.0
-            }
-            _ => 0.0,
-        };
+                _ => 0.0,
+            };
 
-        let vol_mult = self.cached_vol_mult;
-        let adj_min_bps = (self.config.ref_min_spread_bps * vol_mult).max(self.config.min_edge_bps);
-        let adj_spread_bps =
-            (self.config.ref_half_spread_bps * vol_mult).max(self.config.min_edge_bps);
-        let adj_requote_bps = self.config.ref_requote_tolerance_bps * vol_mult;
+            let vol_mult = sym.cached_vol_mult;
+            let adj_min_bps = (sym.config.ref_min_spread_bps * vol_mult).max(sym.config.min_edge_bps);
+            let adj_spread_bps =
+                (sym.config.ref_half_spread_bps * vol_mult).max(sym.config.min_edge_bps);
+            let adj_requote_bps = sym.config.ref_requote_tolerance_bps * vol_mult;
 
-        // Get raw vol prediction for logging
-        let pred_vol_ann = self
-            .vol_provider
-            .as_ref()
-            .map(|vp| vp.ann_vol(0))
-            .unwrap_or(0.0);
+            // Get raw vol prediction for logging
+            let pred_vol_ann = self
+                .vol_provider
+                .as_ref()
+                .map(|vp| vp.ann_vol(0))
+                .unwrap_or(0.0);
 
-        info!(
-            "status: fair={:.6} hl_mid={:.6} resid={:+.2}bps basis={:+.2}bps factor={:+.2}bps skew={:+.2}bps vol={:.1}% vmult={:.2} band=[{:.1},{:.1},{:.1}]bps pos={:+.6} target={:+.6} bid={} ask={} ref={}@{}ms",
-            fair.unwrap_or(0.0),
-            hl_mid.unwrap_or(0.0),
-            residual_bps,
-            basis_bps,
-            factor_bps,
-            skew_bps,
-            pred_vol_ann * 100.0,
-            vol_mult,
-            adj_min_bps,
-            adj_spread_bps,
-            adj_spread_bps + adj_requote_bps,
-            position,
-            target,
-            bid_str,
-            ask_str,
-            ref_feed,
-            exch_age_ms,
-        );
+            info!(
+                "[{}] status: fair={:.6} hl_mid={:.6} resid={:+.2}bps basis={:+.2}bps factor={:+.2}bps skew={:+.2}bps vol={:.1}% vmult={:.2} band=[{:.1},{:.1},{:.1}]bps pos={:+.6} target={:+.6} bid={} ask={} ref={}@{}ms",
+                sym.config.symbol,
+                fair.unwrap_or(0.0),
+                hl_mid.unwrap_or(0.0),
+                residual_bps,
+                basis_bps,
+                factor_bps,
+                skew_bps,
+                pred_vol_ann * 100.0,
+                vol_mult,
+                adj_min_bps,
+                adj_spread_bps,
+                adj_spread_bps + adj_requote_bps,
+                position,
+                target,
+                bid_str,
+                ask_str,
+                ref_feed,
+                exch_age_ms,
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
     // Position helper
     // -----------------------------------------------------------------------
 
-    fn get_position(&self) -> f64 {
-        if let Some(p) = self.oms_state.positions().get(&self.config.symbol) {
+    fn get_position_for(symbol: &str, oms_state: &OmsStateTracker) -> f64 {
+        if let Some(p) = oms_state.positions().get(symbol) {
             return match p.side {
                 Side::Buy => p.size,
                 Side::Sell => -p.size,
@@ -1399,6 +1508,33 @@ impl MmEngine {
         }
     }
 
+    fn find_symbol_for_order(&self, cid: &ClientOrderId) -> Option<usize> {
+        self.symbols.iter().position(|sym| {
+            sym.bid_quote
+                .as_ref()
+                .map(|q| q.client_id == *cid)
+                .unwrap_or(false)
+                || sym
+                    .ask_quote
+                    .as_ref()
+                    .map(|q| q.client_id == *cid)
+                    .unwrap_or(false)
+                || {
+                    // Fallback: check exchange_id match
+                    if let Some(h) = self.oms_state.get_order(*cid) {
+                        if let Some(ref o_eid) = h.exchange_id {
+                            for q in [&sym.bid_quote, &sym.ask_quote].into_iter().flatten() {
+                                if q.exchange_id.as_ref() == Some(o_eid) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                    false
+                }
+        })
+    }
+
     fn handle_oms_event(&mut self, event: OmsEvent) {
         match event {
             OmsEvent::Disconnected => {
@@ -1409,9 +1545,9 @@ impl MmEngine {
                 info!("OMS ready/reconnected");
             }
             OmsEvent::OrderAccepted { client_id, .. } => {
-                if self.is_our_order(&client_id) {
-                    self.consecutive_rejects = 0;
-                    self.reject_pause_until = None;
+                if let Some(idx) = self.find_symbol_for_order(&client_id) {
+                    self.symbols[idx].consecutive_rejects = 0;
+                    self.symbols[idx].reject_pause_until = None;
                     // Pre-sign cancel for fast path
                     match self.oms.presign_cancel_order(&client_id) {
                         Ok(signed) => {
@@ -1422,37 +1558,41 @@ impl MmEngine {
                 }
             }
             OmsEvent::OrderFilled(fill) => {
-                if self.is_our_order(&fill.client_id) {
+                if let Some(idx) = self.find_symbol_for_order(&fill.client_id) {
                     info!(
-                        "fill: cid={} side={:?} price={:.6} size={:.4}",
+                        "[{}] fill: cid={} side={:?} price={:.6} size={:.4}",
+                        self.symbols[idx].config.symbol,
                         fill.client_id.0, fill.side, fill.price, fill.size,
                     );
-                    self.consecutive_rejects = 0;
-                    self.reject_pause_until = None;
-                    self.clear_tracker(&fill.client_id);
+                    self.symbols[idx].consecutive_rejects = 0;
+                    self.symbols[idx].reject_pause_until = None;
+                    Self::clear_tracker_for(&mut self.symbols[idx], &fill.client_id, &mut self.presigned_cancels);
                 }
             }
             OmsEvent::OrderCancelled(cid) => {
-                if self.is_our_order(&cid) {
+                if let Some(idx) = self.find_symbol_for_order(&cid) {
                     debug!("order cancelled: cid={}", cid.0);
-                    self.clear_tracker(&cid);
+                    Self::clear_tracker_for(&mut self.symbols[idx], &cid, &mut self.presigned_cancels);
                 }
             }
             OmsEvent::OrderRejected { client_id, reason } => {
-                if self.is_our_order(&client_id) {
-                    warn!("order rejected: cid={} reason={}", client_id.0, reason);
-                    self.clear_tracker(&client_id);
-                    self.consecutive_rejects += 1;
+                if let Some(idx) = self.find_symbol_for_order(&client_id) {
+                    warn!(
+                        "[{}] order rejected: cid={} reason={}",
+                        self.symbols[idx].config.symbol, client_id.0, reason
+                    );
+                    Self::clear_tracker_for(&mut self.symbols[idx], &client_id, &mut self.presigned_cancels);
+                    self.symbols[idx].consecutive_rejects += 1;
                 }
             }
             _ => {}
         }
     }
 
-    /// Check if an order from open_orders matches our tracked bid or ask.
+    /// Check if an order from open_orders matches a symbol's tracked bid or ask.
     /// Matches by client_id OR exchange_id (fallback for synthetic handles from REST poll).
-    fn is_tracked_order(&self, o: &OrderHandle) -> bool {
-        for q in [&self.bid_quote, &self.ask_quote].into_iter().flatten() {
+    fn is_tracked_order_for(sym: &SymbolState, o: &OrderHandle) -> bool {
+        for q in [&sym.bid_quote, &sym.ask_quote].into_iter().flatten() {
             if q.client_id == o.client_id {
                 return true;
             }
@@ -1465,72 +1605,55 @@ impl MmEngine {
         false
     }
 
-    /// Check if a client order ID belongs to one of our tracked quotes.
-    /// Matches by client_id directly, or by exchange_id if the cid corresponds
-    /// to an OMS order with an exchange_id matching our tracker.
-    fn is_our_order(&self, cid: &ClientOrderId) -> bool {
-        for q in [&self.bid_quote, &self.ask_quote].into_iter().flatten() {
-            if q.client_id == *cid {
-                return true;
-            }
-            // Fallback: check if the order's exchange_id matches our tracker
-            if let Some(ref q_eid) = q.exchange_id {
-                if let Some(h) = self.oms_state.get_order(*cid) {
-                    if h.exchange_id.as_ref() == Some(q_eid) {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
-    }
-
-    fn clear_tracker(&mut self, cid: &ClientOrderId) {
-        if self
+    fn clear_tracker_for(
+        sym: &mut SymbolState,
+        cid: &ClientOrderId,
+        presigned_cancels: &mut HashMap<ClientOrderId, SignedPayload>,
+    ) {
+        if sym
             .bid_quote
             .as_ref()
             .map(|q| q.client_id == *cid)
             .unwrap_or(false)
         {
-            self.bid_quote = None;
+            sym.bid_quote = None;
         }
-        if self
+        if sym
             .ask_quote
             .as_ref()
             .map(|q| q.client_id == *cid)
             .unwrap_or(false)
         {
-            self.ask_quote = None;
+            sym.ask_quote = None;
         }
-        self.presigned_cancels.remove(cid);
+        presigned_cancels.remove(cid);
     }
 
     // -----------------------------------------------------------------------
     // Cancel helpers
     // -----------------------------------------------------------------------
 
-    /// Cancel any open orders on our symbol that we don't recognize as ours.
-    /// Handle duplicate/stray orders on our symbol.
-    /// - If we have a tracked quote on a side: cancel all other orders on that side
-    /// - If we DON'T have a tracked quote: adopt the closest to fair, cancel the rest
-    /// - Only act on orders where last_modified age >= stray_order_age_ms
-    /// - Skip orders in Cancelling state
-    fn cancel_stray_orders(&mut self) {
-        if self.ghost {
+    /// Cancel any open orders on a symbol that we don't recognize as ours.
+    fn cancel_stray_orders_for(
+        sym: &mut SymbolState,
+        oms: &Arc<HyperliquidOms>,
+        oms_state: &OmsStateTracker,
+        fair_price: &FairPriceEngine,
+        ghost: bool,
+    ) {
+        if ghost {
             return;
         }
 
-        let open: Vec<OrderHandle> = self
-            .oms_state
-            .open_orders(Some(&self.config.symbol))
+        let open: Vec<OrderHandle> = oms_state
+            .open_orders(Some(&sym.config.symbol))
             .into_iter()
             .cloned()
             .collect();
-        let min_age = Duration::from_millis(self.config.stray_order_age_ms);
+        let min_age = Duration::from_millis(sym.config.stray_order_age_ms);
 
-        let fair = self
-            .fair_price
-            .get_fair_price(ExchangeId::Hyperliquid, self.hl_symbol_id)
+        let fair = fair_price
+            .get_fair_price(ExchangeId::Hyperliquid, sym.symbol_id)
             .unwrap_or(0.0);
 
         // Separate strays by side
@@ -1539,7 +1662,7 @@ impl MmEngine {
 
         for o in &open {
             // Skip our tracked orders — match by client_id OR exchange_id
-            if self.is_tracked_order(o) {
+            if Self::is_tracked_order_for(sym, o) {
                 continue;
             }
             // Skip orders still being cancelled
@@ -1563,50 +1686,56 @@ impl MmEngine {
 
         // Handle stray bids
         if !stray_bids.is_empty() {
-            if self.bid_quote.is_some() {
+            if sym.bid_quote.is_some() {
                 for o in &stray_bids {
                     warn!(
                         "cancelling stray bid cid={} price={:?}",
                         o.client_id.0, o.order_type
                     );
-                    let oms = Arc::clone(&self.oms);
+                    let oms_clone = Arc::clone(oms);
                     let cid = o.client_id;
                     tokio::spawn(async move {
-                        if let Err(e) = oms.cancel_order(&cid).await {
+                        if let Err(e) = oms_clone.cancel_order(&cid).await {
                             warn!("failed to cancel stray bid {}: {e}", cid.0);
                         }
                     });
                 }
             } else {
-                self.adopt_closest_cancel_rest(&stray_bids, Side::Buy, fair);
+                Self::adopt_closest_cancel_rest_for(sym, &stray_bids, Side::Buy, fair, oms);
             }
         }
 
         // Handle stray asks
         if !stray_asks.is_empty() {
-            if self.ask_quote.is_some() {
+            if sym.ask_quote.is_some() {
                 for o in &stray_asks {
                     warn!(
                         "cancelling stray ask cid={} price={:?}",
                         o.client_id.0, o.order_type
                     );
-                    let oms = Arc::clone(&self.oms);
+                    let oms_clone = Arc::clone(oms);
                     let cid = o.client_id;
                     tokio::spawn(async move {
-                        if let Err(e) = oms.cancel_order(&cid).await {
+                        if let Err(e) = oms_clone.cancel_order(&cid).await {
                             warn!("failed to cancel stray ask {}: {e}", cid.0);
                         }
                     });
                 }
             } else {
-                self.adopt_closest_cancel_rest(&stray_asks, Side::Sell, fair);
+                Self::adopt_closest_cancel_rest_for(sym, &stray_asks, Side::Sell, fair, oms);
             }
         }
     }
 
     /// From a list of stray orders on one side, adopt the one closest to fair price
     /// as our tracked quote, cancel the rest.
-    fn adopt_closest_cancel_rest(&mut self, strays: &[&OrderHandle], side: Side, fair: f64) {
+    fn adopt_closest_cancel_rest_for(
+        sym: &mut SymbolState,
+        strays: &[&OrderHandle],
+        side: Side,
+        fair: f64,
+        oms: &Arc<HyperliquidOms>,
+    ) {
         if strays.is_empty() {
             return;
         }
@@ -1652,18 +1781,18 @@ impl MmEngine {
                     placed_at: o.submitted_at.unwrap_or_else(Instant::now),
                 };
                 match side {
-                    Side::Buy => self.bid_quote = Some(quote),
-                    Side::Sell => self.ask_quote = Some(quote),
+                    Side::Buy => sym.bid_quote = Some(quote),
+                    Side::Sell => sym.ask_quote = Some(quote),
                 }
             } else {
                 warn!(
                     "cancelling duplicate {:?} cid={} price={:?}",
                     side, o.client_id.0, o.order_type
                 );
-                let oms = Arc::clone(&self.oms);
+                let oms_clone = Arc::clone(oms);
                 let cid = o.client_id;
                 tokio::spawn(async move {
-                    if let Err(e) = oms.cancel_order(&cid).await {
+                    if let Err(e) = oms_clone.cancel_order(&cid).await {
                         warn!("failed to cancel duplicate {}: {e}", cid.0);
                     }
                 });
@@ -1671,47 +1800,62 @@ impl MmEngine {
         }
     }
 
-    fn cancel_all_quotes(&mut self) {
-        if self.ghost {
-            if self.bid_quote.is_some() || self.ask_quote.is_some() {
-                info!("[GHOST] would CANCEL ALL quotes");
+    /// Cancel quotes for a single symbol.
+    fn cancel_quotes_for(
+        sym: &mut SymbolState,
+        oms: &Arc<HyperliquidOms>,
+        ghost: bool,
+        presigned_cancels: &mut HashMap<ClientOrderId, SignedPayload>,
+    ) {
+        if ghost {
+            if sym.bid_quote.is_some() || sym.ask_quote.is_some() {
+                info!("[GHOST][{}] would CANCEL ALL quotes", sym.config.symbol);
             }
-            self.bid_quote = None;
-            self.ask_quote = None;
+            sym.bid_quote = None;
+            sym.ask_quote = None;
             return;
         }
 
-        if let Some(ref q) = self.bid_quote {
-            info!("cancelling bid cid={}", q.client_id.0);
-            let oms = Arc::clone(&self.oms);
+        if let Some(ref q) = sym.bid_quote {
+            info!("[{}] cancelling bid cid={}", sym.config.symbol, q.client_id.0);
+            let oms_clone = Arc::clone(oms);
             let cid = q.client_id;
+            presigned_cancels.remove(&cid);
             tokio::spawn(async move {
-                if let Err(e) = oms.cancel_order(&cid).await {
+                if let Err(e) = oms_clone.cancel_order(&cid).await {
                     warn!("failed to cancel bid {}: {e}", cid.0);
                 }
             });
         }
-        if let Some(ref q) = self.ask_quote {
-            info!("cancelling ask cid={}", q.client_id.0);
-            let oms = Arc::clone(&self.oms);
+        if let Some(ref q) = sym.ask_quote {
+            info!("[{}] cancelling ask cid={}", sym.config.symbol, q.client_id.0);
+            let oms_clone = Arc::clone(oms);
             let cid = q.client_id;
+            presigned_cancels.remove(&cid);
             tokio::spawn(async move {
-                if let Err(e) = oms.cancel_order(&cid).await {
+                if let Err(e) = oms_clone.cancel_order(&cid).await {
                     warn!("failed to cancel ask {}: {e}", cid.0);
                 }
             });
         }
-        self.bid_quote = None;
-        self.ask_quote = None;
-        self.presigned_cancels.clear();
+        sym.bid_quote = None;
+        sym.ask_quote = None;
+    }
+
+    fn cancel_all_quotes(&mut self) {
+        for sym in self.symbols.iter_mut() {
+            Self::cancel_quotes_for(sym, &self.oms, self.ghost, &mut self.presigned_cancels);
+        }
     }
 
     fn transition_to_paused(&mut self) {
         info!("MM engine entering Paused state");
         self.cancel_all_quotes();
         self.state = EngineState::Paused;
-        self.running_since = None;
-        self.warmed_up = false;
+        for sym in self.symbols.iter_mut() {
+            sym.running_since = None;
+            sym.warmed_up = false;
+        }
     }
 }
 
@@ -1744,6 +1888,7 @@ mod tests {
                 exchange_ts: Some(chrono::Utc::now()),
                 received_ts: Some(chrono::Utc::now()),
                 received_instant: Some(Instant::now()),
+                feed_latency_ns: 0,
             },
         );
     }

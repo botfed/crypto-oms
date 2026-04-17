@@ -124,13 +124,16 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
     let oms = HyperliquidOms::new(oms_config)?;
     oms.start();
 
+    anyhow::ensure!(!config.symbols.is_empty(), "config must have at least one symbol in 'symbols'");
+
     // FairPriceEngine — basis updated by engine in slow path, no background task
     let fair_price = Arc::new(FairPriceEngine::new(market_data.clone(), config.fair_price)?);
 
-    // Start inventory manager
-    let asset = config.strategy.symbol
+    // Start inventory manager (uses first symbol's asset)
+    let first_symbol = &config.symbols[0].symbol;
+    let asset = first_symbol
         .strip_prefix("PERP_")
-        .or_else(|| config.strategy.symbol.strip_prefix("SPOT_"))
+        .or_else(|| first_symbol.strip_prefix("SPOT_"))
         .and_then(|s| s.split('_').next())
         .unwrap_or("BTC");
     let (target_rx, _inv_handle) = start_inventory_manager(
@@ -139,8 +142,8 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
         shutdown.clone(),
     );
 
-    // Build params
-    let (params, _controller) = WatchParams::new(&config.strategy, target_rx);
+    // Build params (uses first symbol's config for defaults)
+    let (params, _controller) = WatchParams::new(&config.symbols[0], target_rx);
 
     // Initialize vol provider if vol_models is configured
     let vol_model_name = config.vol_models
@@ -186,7 +189,7 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
             har_groups.push((har_params, params.seasonality.clone(), target_min, warmup_bars));
         }
 
-        let seed_vol = config.strategy.ref_vol;
+        let seed_vol = config.symbols[0].ref_vol;
         let provider = VolProvider::new_har(har_groups, seed_vol);
         info!("vol provider ready (model={}, lock-free HAR)", vol_model_name);
 
@@ -203,7 +206,7 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
         vol_provider,
         market_data,
         Box::new(params),
-        config.strategy,
+        config.symbols.into_boxed_slice(),
         ghost,
         spin_core,
         engine_shutdown,

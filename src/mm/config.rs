@@ -24,7 +24,8 @@ pub struct MmConfig {
 
     pub fair_price: FairPriceConfig,
     pub inventory: InventoryConfig,
-    pub strategy: StrategyConfig,
+
+    pub symbols: Vec<StrategyConfig>,
 
     /// Optional vol model config for vol-adjusted spreads
     #[serde(default)]
@@ -64,7 +65,9 @@ impl MmConfig {
             base_url: self.hyperliquid.base_url.clone(),
             poll_interval: Duration::from_millis(self.hyperliquid.poll_interval_ms),
             inflight_timeout: Duration::from_millis(self.hyperliquid.inflight_timeout_ms),
-            stray_order_age: Duration::from_millis(self.strategy.stray_order_age_ms),
+            stray_order_age: Duration::from_millis(
+                self.symbols.first().map(|s| s.stray_order_age_ms).unwrap_or(5000)
+            ),
         }
     }
 }
