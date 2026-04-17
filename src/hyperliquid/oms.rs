@@ -544,11 +544,17 @@ impl HyperliquidOms {
 
             if self.ready.load(Ordering::Acquire) {
                 self.diag.log("WS re-snapshotting before reconnect...".into());
-                if let Err(e) = self.snapshot_from_rest().await {
-                    self.diag.set_error(format!("re-snapshot failed: {e:#}"));
+                match self.snapshot_from_rest().await {
+                    Ok(()) => {
+                        let _ = self.event_tx.send(OmsEvent::Reconnected);
+                        let _ = self.event_tx.send(OmsEvent::Ready);
+                        backoff = Duration::from_secs(1);
+                    }
+                    Err(e) => {
+                        self.diag.set_error(format!("re-snapshot failed: {e:#}"));
+                        continue; // back to sleep+retry, don't enter ws_loop
+                    }
                 }
-                let _ = self.event_tx.send(OmsEvent::Reconnected);
-                let _ = self.event_tx.send(OmsEvent::Ready);
             }
         }
     }
@@ -572,9 +578,12 @@ impl HyperliquidOms {
         };
         ws.send(Message::Text(serde_json::to_string(&sub)?.into())).await?;
 
-        let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         heartbeat.tick().await; // consume first immediate tick
+
+        let mut last_msg = Instant::now();
+        let msg_timeout = Duration::from_secs(90);
 
         loop {
             tokio::select! {
@@ -584,6 +593,7 @@ impl HyperliquidOms {
                         Some(Err(e)) => bail!("WS error: {e}"),
                         None => bail!("WS stream ended"),
                     };
+                    last_msg = Instant::now();
                     match msg {
                         Message::Text(text) => self.handle_ws_message(&text),
                         Message::Ping(data) => { ws.send(Message::Pong(data)).await?; }
@@ -592,7 +602,9 @@ impl HyperliquidOms {
                     }
                 }
                 _ = heartbeat.tick() => {
-                    // HL requires periodic pings to keep the connection alive
+                    if last_msg.elapsed() > msg_timeout {
+                        bail!("WS stale: no messages for {:.0}s", last_msg.elapsed().as_secs_f64());
+                    }
                     ws.send(Message::Text(r#"{"method":"ping"}"#.into())).await?;
                 }
                 _ = self.shutdown.notified() => return Ok(()),
