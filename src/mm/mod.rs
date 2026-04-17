@@ -35,7 +35,8 @@ pub mod latency {
     pub const METRIC_TICK_END: u8 = 7;
     pub const METRIC_LOOP_OVERHEAD: u8 = 8;
     pub const METRIC_FEED: u8 = 9;
-    pub const NUM_METRICS: usize = 10;
+    pub const METRIC_DRAIN: u8 = 10;
+    pub const NUM_METRICS: usize = 11;
 
     pub const GLOBAL_HEADER: usize = 8;
     pub const METRIC_HEADER: usize = 16;
@@ -568,8 +569,6 @@ impl MmEngine {
                 return;
             }
 
-            self.drain_oms_events();
-
             if !self.check_preconditions() {
                 if self.state == EngineState::Running {
                     self.transition_to_paused();
@@ -599,6 +598,18 @@ impl MmEngine {
                 latency::METRIC_LOOP_OVERHEAD,
                 loop_start.elapsed().as_nanos() as u64,
             );
+
+            #[cfg(feature = "profiling")]
+            let drain_start = Instant::now();
+
+            self.drain_oms_events();
+
+            #[cfg(feature = "profiling")]
+            self.latency.record(
+                latency::METRIC_DRAIN,
+                drain_start.elapsed().as_nanos() as u64,
+            );
+
             #[cfg(feature = "profiling")]
             let fair_start = Instant::now();
 
