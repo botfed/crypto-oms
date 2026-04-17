@@ -26,9 +26,6 @@ use fair_price::{ExchangeId, FairPriceEngine, parse_exchange_id};
 
 #[cfg(feature = "profiling")]
 pub mod latency {
-    use parking_lot::Mutex;
-    use std::sync::Arc;
-
     pub const METRIC_TICK_FAST: u8 = 0;
     pub const METRIC_T2D: u8 = 1;
     pub const METRIC_FAIR: u8 = 2;
@@ -41,43 +38,51 @@ pub mod latency {
     pub const METRIC_FEED: u8 = 9;
     pub const NUM_METRICS: usize = 10;
 
-    // File layout: per-metric ring buffers
-    // Global header: 8 bytes (NUM_METRICS as u64)
-    // Per-metric: 16-byte header (write_pos u64 + capacity u64) + samples (8 bytes each, just value_ns)
     pub const GLOBAL_HEADER: usize = 8;
-    pub const METRIC_HEADER: usize = 16; // write_pos(8) + capacity(8)
-    pub const SAMPLE_SIZE: usize = 8; // value_ns only (metric is implicit from the ring)
-    pub const SAMPLES_PER_METRIC: usize = 1_048_576; // 1M samples per metric
-    pub const METRIC_SECTION: usize = METRIC_HEADER + SAMPLES_PER_METRIC * SAMPLE_SIZE; // 8MB per metric
-    pub const FILE_SIZE: usize = GLOBAL_HEADER + NUM_METRICS * METRIC_SECTION; // 64MB total
+    pub const METRIC_HEADER: usize = 16;
+    pub const SAMPLE_SIZE: usize = 8;
+    pub const SAMPLES_PER_METRIC: usize = 1_048_576;
+    pub const METRIC_SECTION: usize = METRIC_HEADER + SAMPLES_PER_METRIC * SAMPLE_SIZE;
+    pub const FILE_SIZE: usize = GLOBAL_HEADER + NUM_METRICS * METRIC_SECTION;
     pub const LATENCY_PATH: &str = "/tmp/mm_latency.bin";
 
-    /// Lightweight recorder for the hot loop.
-    /// Just pushes to a local Vec. A background task flushes to mmap every 10s.
+    /// Direct-to-mmap recorder. No mutex, no buffering, no background task.
+    /// Single-threaded: only the engine spin loop calls record().
     pub struct LatencyRecorder {
-        buf: Arc<Mutex<Vec<(u8, u64)>>>,
+        mmap: *mut u8,
+        write_positions: [u64; NUM_METRICS],
     }
+
+    unsafe impl Send for LatencyRecorder {}
 
     impl LatencyRecorder {
         #[inline]
-        pub fn record(&self, metric: u8, nanos: u64) {
-            self.buf.lock().push((metric, nanos));
+        pub fn record(&mut self, metric: u8, nanos: u64) {
+            let m = metric as usize;
+            if m >= NUM_METRICS {
+                return;
+            }
+            let wp = &mut self.write_positions[m];
+            let section = metric_offset(m);
+            let idx = (*wp % SAMPLES_PER_METRIC as u64) as usize;
+            let offset = section + METRIC_HEADER + idx * SAMPLE_SIZE;
+            unsafe {
+                self.mmap.add(offset).cast::<u64>().write(nanos);
+            }
+            *wp += 1;
+            // Update write_pos in header so mm_profile can read live
+            unsafe {
+                self.mmap.add(section).cast::<u64>().write(*wp);
+            }
         }
     }
 
-    /// Byte offset of a metric's section in the mmap file.
     fn metric_offset(metric: usize) -> usize {
         GLOBAL_HEADER + metric * METRIC_SECTION
     }
 
     /// Initialize the profiler. Returns a recorder for the hot loop.
-    /// Spawns a background task that flushes samples to mmap every 10s.
-    pub fn init(shutdown: Arc<std::sync::atomic::AtomicBool>) -> LatencyRecorder {
-        let buf: Arc<Mutex<Vec<(u8, u64)>>> = Arc::new(Mutex::new(Vec::with_capacity(500_000)));
-        let recorder = LatencyRecorder {
-            buf: Arc::clone(&buf),
-        };
-
+    pub fn init() -> LatencyRecorder {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -92,67 +97,22 @@ pub mod latency {
 
         // Reset file on startup
         mmap.fill(0);
-        // Write global header: num_metrics
+        // Write global header
         mmap[0..8].copy_from_slice(&(NUM_METRICS as u64).to_le_bytes());
         // Write per-metric capacity
         for m in 0..NUM_METRICS {
             let off = metric_offset(m);
-            // write_pos = 0 (already zeroed)
             mmap[off + 8..off + 16].copy_from_slice(&(SAMPLES_PER_METRIC as u64).to_le_bytes());
         }
 
-        let mut write_positions = [0u64; NUM_METRICS];
+        let ptr = mmap.as_mut_ptr();
+        // Leak the MmapMut — lives for process lifetime, no cleanup needed
+        std::mem::forget(mmap);
 
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-            loop {
-                interval.tick().await;
-                flush(&buf, &mut mmap, &mut write_positions);
-                if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-                    return;
-                }
-            }
-        });
-
-        recorder
-    }
-
-    fn flush(
-        buf: &Mutex<Vec<(u8, u64)>>,
-        mmap: &mut memmap2::MmapMut,
-        write_positions: &mut [u64; NUM_METRICS],
-    ) {
-        let samples = {
-            let mut guard = buf.lock();
-            std::mem::replace(&mut *guard, Vec::with_capacity(500_000))
-        };
-
-        if samples.is_empty() {
-            return;
+        LatencyRecorder {
+            mmap: ptr,
+            write_positions: [0u64; NUM_METRICS],
         }
-
-        let cap = SAMPLES_PER_METRIC as u64;
-        for (metric, value) in &samples {
-            let m = *metric as usize;
-            if m >= NUM_METRICS {
-                continue;
-            }
-            let wp = &mut write_positions[m];
-            let section = metric_offset(m);
-            let idx = (*wp % cap) as usize;
-            let offset = section + METRIC_HEADER + idx * SAMPLE_SIZE;
-            mmap[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-            *wp += 1;
-        }
-
-        // Update per-metric write positions in headers
-        for m in 0..NUM_METRICS {
-            let off = metric_offset(m);
-            mmap[off..off + 8].copy_from_slice(&write_positions[m].to_le_bytes());
-        }
-        let _ = mmap.flush_async();
     }
 }
 
@@ -332,7 +292,7 @@ impl MmEngine {
         let oms_events = oms.subscribe();
 
         #[cfg(feature = "profiling")]
-        let latency = latency::init(Arc::clone(&shutdown));
+        let latency = latency::init();
 
         // Initialize factor model if configured
         let factor_model = if let Some(ref fm_cfg) = config.factor_model {
