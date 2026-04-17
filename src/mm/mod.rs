@@ -288,7 +288,6 @@ pub struct MmEngine {
     presigned_cancels: HashMap<ClientOrderId, SignedPayload>,
     /// Local OMS state — single-threaded, event-sourced from gateway channel.
     oms_state: OmsStateTracker,
-    last_state_log: Instant,
     #[cfg(feature = "profiling")]
     latency: latency::LatencyRecorder,
 }
@@ -413,7 +412,6 @@ impl MmEngine {
             cached_vol_mult: 1.0,
             presigned_cancels: HashMap::new(),
             oms_state: OmsStateTracker::new(StateTrackerConfig::default()),
-            last_state_log: Instant::now(),
             #[cfg(feature = "profiling")]
             latency,
         })
@@ -698,9 +696,10 @@ impl MmEngine {
             }
 
             // ── STATUS LOG (checked every spin, not just on new data) ──
-            #[cfg(feature = "status_log")]
             if self.last_status_log.elapsed() >= Duration::from_secs(1) {
+                #[cfg(feature = "status_log")]
                 self.log_status();
+                self.log_state();
                 self.last_status_log = Instant::now();
             }
 
@@ -861,11 +860,6 @@ impl MmEngine {
             }
         }
 
-        // ── STATE LOG ──
-        if self.last_state_log.elapsed() >= Duration::from_secs(1) {
-            self.log_state();
-            self.last_state_log = Instant::now();
-        }
     }
 
     fn log_state(&self) {
