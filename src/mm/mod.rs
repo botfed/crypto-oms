@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use oms_core::*;
+use oms_core::state_tracker::{OmsStateTracker, StateTrackerConfig};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
@@ -285,6 +286,9 @@ pub struct MmEngine {
     factor_model: Option<FactorModelState>,
     cached_vol_mult: f64,
     presigned_cancels: HashMap<ClientOrderId, SignedPayload>,
+    /// Local OMS state — single-threaded, event-sourced from gateway channel.
+    oms_state: OmsStateTracker,
+    last_state_log: Instant,
     #[cfg(feature = "profiling")]
     latency: latency::LatencyRecorder,
 }
@@ -408,6 +412,8 @@ impl MmEngine {
             factor_model,
             cached_vol_mult: 1.0,
             presigned_cancels: HashMap::new(),
+            oms_state: OmsStateTracker::new(StateTrackerConfig::default()),
+            last_state_log: Instant::now(),
             #[cfg(feature = "profiling")]
             latency,
         })
@@ -715,7 +721,7 @@ impl MmEngine {
     fn check_preconditions(&mut self) -> bool {
         let should_log = self.last_status_log.elapsed() >= Duration::from_secs(1);
 
-        if !self.oms.is_ready() {
+        if !self.oms_state.is_ready() {
             if should_log {
                 warn!("waiting: OMS not ready");
                 self.last_status_log = Instant::now();
@@ -804,7 +810,7 @@ impl MmEngine {
 
     fn sync_quote_state(&mut self) {
         if let Some(ref mut q) = self.bid_quote {
-            match self.oms.get_order(&q.client_id) {
+            match self.oms_state.get_order(q.client_id) {
                 Some(h)
                     if matches!(
                         h.state,
@@ -830,7 +836,7 @@ impl MmEngine {
             }
         }
         if let Some(ref mut q) = self.ask_quote {
-            match self.oms.get_order(&q.client_id) {
+            match self.oms_state.get_order(q.client_id) {
                 Some(h)
                     if matches!(
                         h.state,
@@ -854,6 +860,30 @@ impl MmEngine {
                 }
             }
         }
+
+        // ── STATE LOG ──
+        if self.last_state_log.elapsed() >= Duration::from_secs(1) {
+            self.log_state();
+            self.last_state_log = Instant::now();
+        }
+    }
+
+    fn log_state(&self) {
+        let open = self.oms_state.open_orders(None);
+        let open_summary: Vec<String> = open.iter()
+            .map(|h| format!("cid={} {:?} {:?}", h.client_id.0, h.side, h.state))
+            .collect();
+        let pos_summary: Vec<String> = self.oms_state.positions().iter()
+            .map(|(sym, p)| {
+                let signed_size = match p.side { Side::Buy => p.size, Side::Sell => -p.size };
+                format!("{}={:.4}", sym, signed_size)
+            })
+            .collect();
+        info!(
+            "state: orders=[{}] positions=[{}]",
+            open_summary.join(", "),
+            pos_summary.join(", "),
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -871,7 +901,7 @@ impl MmEngine {
 
         // Check bid: inside min_spread from fair?
         if let Some(ref q) = self.bid_quote {
-            let state = self.oms.get_order(&q.client_id).map(|h| h.state);
+            let state = self.oms_state.get_order(q.client_id).map(|h| h.state);
             let can_cancel = matches!(
                 state,
                 Some(OrderState::Accepted) | Some(OrderState::PartiallyFilled)
@@ -887,6 +917,8 @@ impl MmEngine {
                 };
                 match signed {
                     Ok(signed) => {
+                        // Mark cancelling in local state before async post
+                        self.oms_state.mark_cancelling(q.client_id);
                         #[cfg(feature = "profiling")]
                         self.latency
                             .record(latency::METRIC_SIGN, sign_start.elapsed().as_nanos() as u64);
@@ -909,7 +941,7 @@ impl MmEngine {
 
         // Check ask: inside min_spread from fair?
         if let Some(ref q) = self.ask_quote {
-            let state = self.oms.get_order(&q.client_id).map(|h| h.state);
+            let state = self.oms_state.get_order(q.client_id).map(|h| h.state);
             let can_cancel = matches!(
                 state,
                 Some(OrderState::Accepted) | Some(OrderState::PartiallyFilled)
@@ -925,6 +957,8 @@ impl MmEngine {
                 };
                 match signed {
                     Ok(signed) => {
+                        // Mark cancelling in local state before async post
+                        self.oms_state.mark_cancelling(q.client_id);
                         #[cfg(feature = "profiling")]
                         self.latency
                             .record(latency::METRIC_SIGN, sign_start.elapsed().as_nanos() as u64);
@@ -988,8 +1022,8 @@ impl MmEngine {
             if should_cancel {
                 // Don't cancel inflight (no exchange OID yet)
                 let skip_cancel = self
-                    .oms
-                    .get_order(&q.client_id)
+                    .oms_state
+                    .get_order(q.client_id)
                     .map(|h| matches!(h.state, OrderState::Inflight | OrderState::Cancelling))
                     .unwrap_or(false);
 
@@ -1002,6 +1036,7 @@ impl MmEngine {
                         self.bid_quote = None;
                     } else {
                         debug!("slow cancel bid cid={} price={:.6}", q.client_id.0, q.price);
+                        self.oms_state.mark_cancelling(q.client_id);
                         let oms = Arc::clone(&self.oms);
                         let cid = q.client_id;
                         tokio::spawn(async move {
@@ -1020,8 +1055,8 @@ impl MmEngine {
 
             if should_cancel {
                 let skip_cancel = self
-                    .oms
-                    .get_order(&q.client_id)
+                    .oms_state
+                    .get_order(q.client_id)
                     .map(|h| matches!(h.state, OrderState::Inflight | OrderState::Cancelling))
                     .unwrap_or(false);
 
@@ -1034,6 +1069,7 @@ impl MmEngine {
                         self.ask_quote = None;
                     } else {
                         debug!("slow cancel ask cid={} price={:.6}", q.client_id.0, q.price);
+                        self.oms_state.mark_cancelling(q.client_id);
                         let oms = Arc::clone(&self.oms);
                         let cid = q.client_id;
                         tokio::spawn(async move {
@@ -1071,6 +1107,23 @@ impl MmEngine {
             match self.oms.prepare_place_order(&req) {
                 Ok((cid, sdk_req)) => {
                     debug!("placing bid cid={} price={:.6}", cid.0, desired_bid);
+                    // Insert inflight in local state
+                    self.oms_state.insert_inflight(OrderHandle {
+                        client_id: cid,
+                        exchange_id: None,
+                        symbol: self.config.symbol.clone(),
+                        side: Side::Buy,
+                        order_type: OrderType::Limit { price: desired_bid, tif },
+                        size: order_size,
+                        filled_size: 0.0,
+                        avg_fill_price: None,
+                        state: OrderState::Inflight,
+                        reduce_only: false,
+                        reject_reason: None,
+                        exchange_ts: None,
+                        submitted_at: Some(Instant::now()),
+                        last_modified: Some(Instant::now()),
+                    });
                     self.bid_quote = Some(LiveQuote {
                         client_id: cid,
                         exchange_id: None,
@@ -1109,6 +1162,23 @@ impl MmEngine {
             match self.oms.prepare_place_order(&req) {
                 Ok((cid, sdk_req)) => {
                     debug!("placing ask cid={} price={:.6}", cid.0, desired_ask);
+                    // Insert inflight in local state
+                    self.oms_state.insert_inflight(OrderHandle {
+                        client_id: cid,
+                        exchange_id: None,
+                        symbol: self.config.symbol.clone(),
+                        side: Side::Sell,
+                        order_type: OrderType::Limit { price: desired_ask, tif },
+                        size: order_size,
+                        filled_size: 0.0,
+                        avg_fill_price: None,
+                        state: OrderState::Inflight,
+                        reduce_only: false,
+                        reject_reason: None,
+                        exchange_ts: None,
+                        submitted_at: Some(Instant::now()),
+                        last_modified: Some(Instant::now()),
+                    });
                     self.ask_quote = Some(LiveQuote {
                         client_id: cid,
                         exchange_id: None,
@@ -1309,13 +1379,11 @@ impl MmEngine {
     // -----------------------------------------------------------------------
 
     fn get_position(&self) -> f64 {
-        for p in self.oms.positions() {
-            if p.symbol == self.config.symbol {
-                return match p.side {
-                    Side::Buy => p.size,
-                    Side::Sell => -p.size,
-                };
-            }
+        if let Some(p) = self.oms_state.positions().get(&self.config.symbol) {
+            return match p.side {
+                Side::Buy => p.size,
+                Side::Sell => -p.size,
+            };
         }
         0.0
     }
@@ -1327,7 +1395,11 @@ impl MmEngine {
     fn drain_oms_events(&mut self) {
         loop {
             match self.oms_events.try_recv() {
-                Ok(event) => self.handle_oms_event(event),
+                Ok(event) => {
+                    // Feed state tracker before engine handling
+                    self.oms_state.apply_event(&event);
+                    self.handle_oms_event(event);
+                }
                 Err(broadcast::error::TryRecvError::Empty) => break,
                 Err(broadcast::error::TryRecvError::Lagged(n)) => {
                     warn!("OMS event stream lagged by {n} events");
@@ -1412,9 +1484,9 @@ impl MmEngine {
             if q.client_id == *cid {
                 return true;
             }
-            // Fallback: check if the OMS order's exchange_id matches our tracker
+            // Fallback: check if the order's exchange_id matches our tracker
             if let Some(ref q_eid) = q.exchange_id {
-                if let Some(h) = self.oms.get_order(cid) {
+                if let Some(h) = self.oms_state.get_order(*cid) {
                     if h.exchange_id.as_ref() == Some(q_eid) {
                         return true;
                     }
@@ -1459,7 +1531,8 @@ impl MmEngine {
             return;
         }
 
-        let open = self.oms.open_orders(Some(&self.config.symbol));
+        let open: Vec<OrderHandle> = self.oms_state.open_orders(Some(&self.config.symbol))
+            .into_iter().cloned().collect();
         let min_age = Duration::from_millis(self.config.stray_order_age_ms);
 
         let fair = self

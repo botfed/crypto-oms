@@ -476,6 +476,25 @@ impl HyperliquidOms {
             self.state.positions.len(),
         ));
 
+        // Emit Snapshot event for downstream consumers (shadow tracker / future local state)
+        let snap_orders: Vec<OrderHandle> = self.state.orders.iter()
+            .filter(|e| !matches!(e.value().state,
+                OrderState::Filled | OrderState::Cancelled | OrderState::Rejected | OrderState::TimedOut
+            ))
+            .map(|e| e.value().clone())
+            .collect();
+        let snap_positions: Vec<Position> = self.state.positions.iter()
+            .map(|e| e.value().clone())
+            .collect();
+        let snap_balances: Vec<Balance> = self.state.balances.iter()
+            .map(|e| e.value().clone())
+            .collect();
+        let _ = self.event_tx.send(OmsEvent::Snapshot {
+            orders: snap_orders,
+            positions: snap_positions,
+            balances: snap_balances,
+        });
+
         Ok(())
     }
 
@@ -641,6 +660,7 @@ impl HyperliquidOms {
                 OrderState::Filled => OmsEvent::OrderFilled(Fill {
                     client_id: ClientOrderId(cid),
                     exchange_id: oid_str,
+                    fill_id: format!("ws_status_{cid}"),
                     symbol: handle.symbol.clone(),
                     side: handle.side,
                     price: handle.avg_fill_price.unwrap_or(0.0),
@@ -681,7 +701,6 @@ impl HyperliquidOms {
         // Update order handle
         if let Some(mut handle) = self.state.orders.get_mut(&cid) {
             handle.filled_size += size;
-            // Update average fill price
             let prev_value = handle
                 .avg_fill_price
                 .unwrap_or(0.0)
@@ -700,6 +719,7 @@ impl HyperliquidOms {
         let event = OmsEvent::OrderPartialFill(oms_core::Fill {
             client_id: ClientOrderId(cid),
             exchange_id: oid_str,
+            fill_id: fill.tid.to_string(),
             symbol,
             side,
             price,

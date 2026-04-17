@@ -15,11 +15,18 @@ pub enum OmsEvent {
     OrderAccepted { client_id: ClientOrderId, exchange_id: String },
     OrderPartialFill(Fill),
     OrderFilled(Fill),
+    OrderCancelling(ClientOrderId),
     OrderCancelled(ClientOrderId),
     OrderRejected { client_id: ClientOrderId, reason: String },
     OrderTimedOut(ClientOrderId),
     PositionUpdate(Position),
     BalanceUpdate(Balance),
+    /// Full state snapshot from REST poller — Vec<OrderHandle> + positions + balances
+    Snapshot {
+        orders: Vec<OrderHandle>,
+        positions: Vec<Position>,
+        balances: Vec<Balance>,
+    },
     Disconnected,
     Reconnected,
 }

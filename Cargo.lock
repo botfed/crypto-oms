@@ -2919,6 +2919,7 @@ dependencies = [
  "chrono",
  "serde",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

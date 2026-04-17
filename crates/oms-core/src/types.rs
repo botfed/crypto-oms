@@ -119,6 +119,8 @@ pub struct OrderHandle {
 pub struct Fill {
     pub client_id: ClientOrderId,
     pub exchange_id: String,
+    /// Unique fill ID — gateway-generated from exchange-specific trade ID
+    pub fill_id: String,
     pub symbol: String,
     pub side: Side,
     pub price: f64,

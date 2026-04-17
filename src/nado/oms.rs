@@ -592,7 +592,8 @@ impl NadoOms {
                         let h = self.state.orders.get(&cid);
                         OmsEvent::OrderFilled(Fill {
                             client_id: ClientOrderId(cid),
-                            exchange_id: digest,
+                            exchange_id: digest.clone(),
+                            fill_id: format!("ws_status_{cid}"),
                             symbol: h
                                 .as_ref()
                                 .map(|h| h.symbol.clone())
@@ -672,6 +673,7 @@ impl NadoOms {
                 let event = OmsEvent::OrderPartialFill(oms_core::Fill {
                     client_id: ClientOrderId(cid),
                     exchange_id: order_digest,
+                    fill_id: format!("nado_{cid}_{}", fill_size),
                     symbol,
                     side,
                     price: fill_price,

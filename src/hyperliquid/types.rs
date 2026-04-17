@@ -147,6 +147,8 @@ pub struct UserFillWire {
     pub fee: String,
     pub side: String,      // "A" or "B"
     pub time: u64,
+    /// Unique trade ID per fill
+    pub tid: u64,
     #[serde(rename = "startPosition")]
     pub start_position: String,
     #[serde(rename = "closedPnl")]
