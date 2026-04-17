@@ -157,7 +157,7 @@ impl FairPriceEngine {
             }
 
             let coll = self.collection_for(pair.reference_exchange);
-            let Some(md) = coll.latest(&pair.reference_symbol_id) else { continue };
+            let Some(md) = coll.latest_noblock(&pair.reference_symbol_id) else { continue };
             let Some(ref_mid) = md.midquote() else { continue };
 
             let exchange_ts_ms = md.exchange_ts
@@ -285,9 +285,10 @@ impl FairPriceEngine {
     /// Update EWMA basis for all pairs. Called by the engine at its chosen cadence.
     pub fn update_basis(&self) {
         for (idx, pair) in self.pairs.iter().enumerate() {
-            let target_mid = self.get_mid(pair.target_exchange, pair.target_symbol_id);
-            let coll = self.collection_for(pair.reference_exchange);
-            let ref_mid = coll.get_midquote(&pair.reference_symbol_id);
+            let target_mid = self.collection_for(pair.target_exchange)
+                .get_midquote_noblock(&pair.target_symbol_id);
+            let ref_mid = self.collection_for(pair.reference_exchange)
+                .get_midquote_noblock(&pair.reference_symbol_id);
 
             let (Some(t_mid), Some(r_mid)) = (target_mid, ref_mid) else {
                 continue;
