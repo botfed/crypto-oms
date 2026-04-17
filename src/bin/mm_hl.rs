@@ -121,9 +121,8 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
     let oms = HyperliquidOms::new(oms_config)?;
     oms.start();
 
-    // Start FairPriceEngine
+    // FairPriceEngine — basis updated by engine in slow path, no background task
     let fair_price = Arc::new(FairPriceEngine::new(market_data.clone(), config.fair_price)?);
-    fair_price.start(shutdown.clone());
 
     // Start inventory manager
     let asset = config.strategy.symbol

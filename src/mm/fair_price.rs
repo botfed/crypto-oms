@@ -1,14 +1,12 @@
 use chrono::Utc;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
 
 use crypto_feeds::market_data::InstrumentType;
 use crypto_feeds::symbol_registry::{REGISTRY, SymbolId};
 use crypto_feeds::{AllMarketData, MarketDataCollection};
-use dashmap::DashMap;
-use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 use super::config::FairPriceConfig;
@@ -55,13 +53,21 @@ struct ResolvedPair {
 
 pub struct FairPriceEngine {
     market_data: Arc<AllMarketData>,
-    /// pair_index → current basis EWMA (one basis per pair)
-    basis: Arc<DashMap<usize, f64>>,
+    /// pair_index → current basis EWMA. Fixed size, set at construction.
+    basis: Box<[Cell<f64>]>,
     /// pair_index → whether basis has been seeded
-    seeded: Arc<DashMap<usize, bool>>,
+    seeded: Box<[Cell<bool>]>,
+    /// Pre-computed EWMA alpha
+    alpha: f64,
     pairs: Vec<ResolvedPair>,
     config: FairPriceConfig,
 }
+
+// Safety: FairPriceEngine is shared via Arc but only mutated (Cell writes)
+// from the single engine thread. Cell is !Sync by default, but our usage is
+// single-threaded — the engine spin loop is the only caller of update_basis()
+// and the only reader of basis values.
+unsafe impl Sync for FairPriceEngine {}
 
 impl FairPriceEngine {
     pub fn new(
@@ -105,8 +111,13 @@ impl FairPriceEngine {
             });
         }
 
-        let basis: Arc<DashMap<usize, f64>> = Arc::new(DashMap::new());
-        let seeded: Arc<DashMap<usize, bool>> = Arc::new(DashMap::new());
+        let n = pairs.len();
+        let basis: Box<[Cell<f64>]> = (0..n).map(|_| Cell::new(0.0)).collect();
+        let seeded: Box<[Cell<bool>]> = (0..n).map(|_| Cell::new(false)).collect();
+
+        // Pre-compute alpha from config
+        let dt_secs = config.basis_tick_ms as f64 / 1000.0;
+        let alpha = 1.0 - (-dt_secs * std::f64::consts::LN_2 / config.basis_halflife_secs).exp();
 
         // Load cached basis from disk
         load_basis_cache(&config.basis_cache_path, &pairs, &basis, &seeded);
@@ -115,33 +126,28 @@ impl FairPriceEngine {
             market_data,
             basis,
             seeded,
+            alpha,
             pairs,
             config,
         })
     }
 
-    /// Start the background basis updater task.
-    pub fn start(self: &Arc<Self>, shutdown: Arc<Notify>) {
-        let engine = Arc::clone(self);
-        tokio::spawn(async move {
-            engine.run_basis_updater(shutdown).await;
-        });
-    }
+    // -----------------------------------------------------------------------
+    // Read methods — called from engine hot path
+    // -----------------------------------------------------------------------
 
     /// Returns fair price using the freshest reference feed across all matching pairs.
     pub fn get_fair_price(&self, exchange: ExchangeId, symbol_id: SymbolId) -> Option<f64> {
         self.get_fair_price_with_age(exchange, symbol_id).map(|(price, _, _, _)| price)
     }
 
-    /// Returns (fair_price, ref_age_ms, ref_exchange_name). Uses the freshest reference feed.
-    /// Returns (fair_price, exchange_ts_ms, received_age_ns, ref_exchange_name).
-    /// Picks the feed with the freshest received_ts (most recently arrived data).
+    /// Returns (fair_price, exchange_ts_ms, ref_exchange_name, received_instant).
+    /// Picks the feed with the freshest exchange_ts.
     pub fn get_fair_price_with_age(
         &self,
         exchange: ExchangeId,
         symbol_id: SymbolId,
     ) -> Option<(f64, i64, &str, Option<std::time::Instant>)> {
-        // Pick the pair with the freshest exchange_ts (no Utc::now needed)
         let mut best: Option<(f64, i64, usize, Option<std::time::Instant>)> = None;
         let mut best_ts = i64::MIN;
 
@@ -159,7 +165,7 @@ impl FairPriceEngine {
                 .unwrap_or(0);
 
             if exchange_ts_ms > best_ts {
-                let basis = self.basis.get(&idx).map(|v| *v).unwrap_or(0.0);
+                let basis = self.basis[idx].get();
                 best = Some((ref_mid + basis, exchange_ts_ms, idx, md.received_instant));
                 best_ts = exchange_ts_ms;
             }
@@ -178,10 +184,8 @@ impl FairPriceEngine {
 
     /// Get the current basis estimate for the freshest pair (for diagnostics).
     pub fn get_basis(&self, exchange: ExchangeId, symbol_id: SymbolId) -> Option<f64> {
-        // Return basis of the freshest pair
         self.get_fair_price_with_age(exchange, symbol_id)
             .and_then(|(_, _, _, _)| {
-                // Find the freshest pair index
                 let now = Utc::now();
                 let mut best_idx = None;
                 let mut best_age = i64::MAX;
@@ -199,12 +203,11 @@ impl FairPriceEngine {
                         best_idx = Some(idx);
                     }
                 }
-                best_idx.and_then(|idx| self.basis.get(&idx).map(|v| *v))
+                best_idx.map(|idx| self.basis[idx].get())
             })
     }
 
     /// Get the best (lowest) exchange_ts age in ms across all matching pairs.
-    /// Used for "is feed dead" check.
     pub fn get_ref_age_ms(&self, exchange: ExchangeId, symbol_id: SymbolId) -> Option<i64> {
         let now = Utc::now();
         let mut best = i64::MAX;
@@ -223,7 +226,7 @@ impl FairPriceEngine {
         if best == i64::MAX { None } else { Some(best) }
     }
 
-    /// Age in nanoseconds since the winning ref feed's `received_ts` (system latency).
+    /// Age in nanoseconds since the winning ref feed's received_ts.
     pub fn get_received_age_ns(&self, exchange: ExchangeId, symbol_id: SymbolId) -> Option<u64> {
         let now = Utc::now();
         let mut best_age_ns: Option<u64> = None;
@@ -236,7 +239,6 @@ impl FairPriceEngine {
             let coll = self.collection_for(pair.reference_exchange);
             let Some(md) = coll.latest(&pair.reference_symbol_id) else { continue };
 
-            // Use exchange_ts to pick the freshest feed (same logic as get_fair_price_with_age)
             let ex_age = md.exchange_ts
                 .map(|ts| (now - ts).num_milliseconds())
                 .unwrap_or(i64::MAX);
@@ -250,7 +252,7 @@ impl FairPriceEngine {
         best_age_ns
     }
 
-    /// Sum of write_counts across all ref feeds for this target. Changes when any feed ticks.
+    /// Sum of write_counts across all ref feeds for this target.
     pub fn ref_write_count(&self, exchange: ExchangeId, symbol_id: SymbolId) -> u64 {
         let mut total = 0u64;
         for pair in &self.pairs {
@@ -262,7 +264,7 @@ impl FairPriceEngine {
         total
     }
 
-    /// Read live mid from any exchange (public, for diagnostics).
+    /// Read live mid from any exchange (for diagnostics).
     pub fn get_mid(&self, exchange: ExchangeId, symbol_id: SymbolId) -> Option<f64> {
         self.collection_for(exchange).get_midquote(&symbol_id)
     }
@@ -277,42 +279,11 @@ impl FairPriceEngine {
     }
 
     // -----------------------------------------------------------------------
-    // Background basis updater
+    // Basis update — called by engine from slow path
     // -----------------------------------------------------------------------
 
-    async fn run_basis_updater(&self, shutdown: Arc<Notify>) {
-        let tick = Duration::from_millis(self.config.basis_tick_ms);
-        let dt_secs = self.config.basis_tick_ms as f64 / 1000.0;
-        let alpha = 1.0 - (-dt_secs * std::f64::consts::LN_2 / self.config.basis_halflife_secs).exp();
-
-        let mut interval = tokio::time::interval(tick);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        let mut last_cache_save = std::time::Instant::now();
-        let cache_save_interval = Duration::from_secs(10);
-
-        let shutdown_fut = shutdown.notified();
-        tokio::pin!(shutdown_fut);
-
-        loop {
-            tokio::select! {
-                _ = &mut shutdown_fut => {
-                    save_basis_cache(&self.config.basis_cache_path, &self.pairs, &self.basis);
-                    return;
-                }
-                _ = interval.tick() => {
-                    self.update_basis(alpha);
-
-                    if last_cache_save.elapsed() >= cache_save_interval {
-                        save_basis_cache(&self.config.basis_cache_path, &self.pairs, &self.basis);
-                        last_cache_save = std::time::Instant::now();
-                    }
-                }
-            }
-        }
-    }
-
-    fn update_basis(&self, alpha: f64) {
+    /// Update EWMA basis for all pairs. Called by the engine at its chosen cadence.
+    pub fn update_basis(&self) {
         for (idx, pair) in self.pairs.iter().enumerate() {
             let target_mid = self.get_mid(pair.target_exchange, pair.target_symbol_id);
             let coll = self.collection_for(pair.reference_exchange);
@@ -324,20 +295,24 @@ impl FairPriceEngine {
 
             let instantaneous = t_mid - r_mid;
 
-            let is_seeded = self.seeded.get(&idx).map(|v| *v).unwrap_or(false);
-            if !is_seeded {
-                self.basis.insert(idx, instantaneous);
-                self.seeded.insert(idx, true);
+            if !self.seeded[idx].get() {
+                self.basis[idx].set(instantaneous);
+                self.seeded[idx].set(true);
                 debug!(
                     "basis seeded: pair={} ({}) = {:.6} (target={:.6}, ref={:.6})",
                     idx, pair.cache_key, instantaneous, t_mid, r_mid
                 );
             } else {
-                let prev = self.basis.get(&idx).map(|v| *v).unwrap_or(0.0);
-                let new_val = alpha * instantaneous + (1.0 - alpha) * prev;
-                self.basis.insert(idx, new_val);
+                let prev = self.basis[idx].get();
+                let new_val = self.alpha * instantaneous + (1.0 - self.alpha) * prev;
+                self.basis[idx].set(new_val);
             }
         }
+    }
+
+    /// Save basis cache to disk.
+    pub fn save_basis_cache(&self) {
+        save_basis_cache(&self.config.basis_cache_path, &self.pairs, &self.basis);
     }
 }
 
@@ -355,7 +330,6 @@ pub(crate) fn parse_exchange_id(s: &str) -> anyhow::Result<ExchangeId> {
     }
 }
 
-/// Parse "PERP_BTC_USDC" → InstrumentType::Perp, or "SPOT_BTC_USDT" → InstrumentType::Spot
 fn parse_instrument_type(symbol: &str) -> anyhow::Result<InstrumentType> {
     if symbol.starts_with("PERP_") {
         Ok(InstrumentType::Perp)
@@ -366,7 +340,6 @@ fn parse_instrument_type(symbol: &str) -> anyhow::Result<InstrumentType> {
     }
 }
 
-/// "PERP_BTC_USDC" → "BTC_USDC"
 fn strip_instrument_prefix(symbol: &str) -> String {
     if let Some(rest) = symbol.strip_prefix("PERP_")
         .or_else(|| symbol.strip_prefix("SPOT_"))
@@ -384,8 +357,8 @@ fn strip_instrument_prefix(symbol: &str) -> String {
 fn load_basis_cache(
     path: &str,
     pairs: &[ResolvedPair],
-    basis: &DashMap<usize, f64>,
-    seeded: &DashMap<usize, bool>,
+    basis: &[Cell<f64>],
+    seeded: &[Cell<bool>],
 ) {
     let contents = match std::fs::read_to_string(path) {
         Ok(c) => c,
@@ -402,8 +375,8 @@ fn load_basis_cache(
 
     for (idx, pair) in pairs.iter().enumerate() {
         if let Some(&val) = cache.get(&pair.cache_key) {
-            basis.insert(idx, val);
-            seeded.insert(idx, true);
+            basis[idx].set(val);
+            seeded[idx].set(true);
             info!("basis loaded from cache: {} = {:.6}", pair.cache_key, val);
         }
     }
@@ -412,13 +385,11 @@ fn load_basis_cache(
 fn save_basis_cache(
     path: &str,
     pairs: &[ResolvedPair],
-    basis: &DashMap<usize, f64>,
+    basis: &[Cell<f64>],
 ) {
     let mut cache: HashMap<String, f64> = HashMap::new();
     for (idx, pair) in pairs.iter().enumerate() {
-        if let Some(val) = basis.get(&idx) {
-            cache.insert(pair.cache_key.clone(), *val);
-        }
+        cache.insert(pair.cache_key.clone(), basis[idx].get());
     }
 
     match serde_json::to_string_pretty(&cache) {

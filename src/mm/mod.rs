@@ -288,6 +288,7 @@ pub struct MmEngine {
     presigned_cancels: HashMap<ClientOrderId, SignedPayload>,
     /// Local OMS state — single-threaded, event-sourced from gateway channel.
     oms_state: OmsStateTracker,
+    last_basis_save: Instant,
     #[cfg(feature = "profiling")]
     latency: latency::LatencyRecorder,
 }
@@ -412,6 +413,7 @@ impl MmEngine {
             cached_vol_mult: 1.0,
             presigned_cancels: HashMap::new(),
             oms_state: OmsStateTracker::new(StateTrackerConfig::default()),
+            last_basis_save: Instant::now(),
             #[cfg(feature = "profiling")]
             latency,
         })
@@ -589,6 +591,7 @@ impl MmEngine {
             if self.shutdown.load(Ordering::Relaxed) {
                 info!("MM engine shutting down");
                 self.cancel_all_quotes();
+                self.fair_price.save_basis_cache();
                 std::thread::sleep(Duration::from_secs(1));
                 return;
             }
@@ -674,6 +677,8 @@ impl MmEngine {
             // ── SLOW PATH (~quote_interval_ms): quote placement ──
             let interval = Duration::from_millis(self.config.quote_interval_ms);
             if self.warmed_up && self.last_quote_eval.elapsed() >= interval {
+                self.fair_price.update_basis();
+
                 #[cfg(feature = "profiling")]
                 let vol_start = Instant::now();
                 self.cached_vol_mult = self.get_vol_multiplier(tick.fair, tick.exchange_ts_ms);
@@ -694,6 +699,11 @@ impl MmEngine {
                 }
 
                 self.last_quote_eval = Instant::now();
+
+                if self.last_basis_save.elapsed() >= Duration::from_secs(10) {
+                    self.fair_price.save_basis_cache();
+                    self.last_basis_save = Instant::now();
+                }
             }
 
             // ── STATUS LOG (checked every spin, not just on new data) ──
