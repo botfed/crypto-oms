@@ -37,7 +37,8 @@ pub mod latency {
     pub const METRIC_T2T: u8 = 5;
     pub const METRIC_SIGN: u8 = 6;
     pub const METRIC_TICK_END: u8 = 7;
-    pub const NUM_METRICS: usize = 8;
+    pub const METRIC_LOOP_OVERHEAD: u8 = 8;
+    pub const NUM_METRICS: usize = 9;
 
     // File layout: per-metric ring buffers
     // Global header: 8 bytes (NUM_METRICS as u64)
@@ -596,6 +597,9 @@ impl MmEngine {
                 return;
             }
 
+            #[cfg(feature = "profiling")]
+            let loop_start = Instant::now();
+
             self.drain_oms_events();
 
             if !self.check_preconditions() {
@@ -622,6 +626,11 @@ impl MmEngine {
                 .unwrap_or(false);
 
             // ── CHECK FOR NEW DATA ──
+            #[cfg(feature = "profiling")]
+            self.latency.record(
+                latency::METRIC_LOOP_OVERHEAD,
+                loop_start.elapsed().as_nanos() as u64,
+            );
             #[cfg(feature = "profiling")]
             let fair_start = Instant::now();
 
