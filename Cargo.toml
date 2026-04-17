@@ -8,8 +8,8 @@ edition = "2024"
 
 [features]
 profiling = []
-status_log = []
-state_log = []
+log_status = []
+log_state = []
 
 [dependencies]
 oms-core = { path = "crates/oms-core" }

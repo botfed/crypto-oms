@@ -707,11 +707,11 @@ impl MmEngine {
             }
 
             // ── STATUS LOG (checked every spin, not just on new data) ──
-            #[cfg(any(feature = "status_log", feature = "state_log"))]
+            #[cfg(any(feature = "log_status", feature = "log_state"))]
             if self.last_status_log.elapsed() >= Duration::from_secs(1) {
-                #[cfg(feature = "status_log")]
+                #[cfg(feature = "log_status")]
                 self.log_status();
-                #[cfg(feature = "state_log")]
+                #[cfg(feature = "log_state")]
                 self.log_state();
                 self.last_status_log = Instant::now();
             }
@@ -875,7 +875,7 @@ impl MmEngine {
 
     }
 
-    #[cfg(feature = "state_log")]
+    #[cfg(feature = "log_state")]
     fn log_state(&self) {
         let open = self.oms_state.open_orders(None);
         let open_summary: Vec<String> = open.iter()
@@ -1276,7 +1276,7 @@ impl MmEngine {
     // Periodic status log
     // -----------------------------------------------------------------------
 
-    #[cfg(feature = "status_log")]
+    #[cfg(feature = "log_status")]
     fn log_status(&mut self) {
         let fair = self
             .fair_price
