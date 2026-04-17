@@ -548,6 +548,7 @@ impl HyperliquidOms {
                     self.diag.set_error(format!("re-snapshot failed: {e:#}"));
                 }
                 let _ = self.event_tx.send(OmsEvent::Reconnected);
+                let _ = self.event_tx.send(OmsEvent::Ready);
             }
         }
     }
