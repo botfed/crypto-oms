@@ -207,51 +207,6 @@ impl FairPriceEngine {
             })
     }
 
-    /// Get the best (lowest) exchange_ts age in ms across all matching pairs.
-    pub fn get_ref_age_ms(&self, exchange: ExchangeId, symbol_id: SymbolId) -> Option<i64> {
-        let now = Utc::now();
-        let mut best = i64::MAX;
-        for pair in &self.pairs {
-            if pair.target_exchange != exchange || pair.target_symbol_id != symbol_id {
-                continue;
-            }
-            let coll = self.collection_for(pair.reference_exchange);
-            if let Some(md) = coll.latest_blocking(&pair.reference_symbol_id) {
-                if let Some(ts) = md.exchange_ts {
-                    let age = (now - ts).num_milliseconds();
-                    if age < best { best = age; }
-                }
-            }
-        }
-        if best == i64::MAX { None } else { Some(best) }
-    }
-
-    /// Age in nanoseconds since the winning ref feed's received_ts.
-    pub fn get_received_age_ns(&self, exchange: ExchangeId, symbol_id: SymbolId) -> Option<u64> {
-        let now = Utc::now();
-        let mut best_age_ns: Option<u64> = None;
-        let mut best_exchange_age = i64::MAX;
-
-        for pair in &self.pairs {
-            if pair.target_exchange != exchange || pair.target_symbol_id != symbol_id {
-                continue;
-            }
-            let coll = self.collection_for(pair.reference_exchange);
-            let Some(md) = coll.latest_blocking(&pair.reference_symbol_id) else { continue };
-
-            let ex_age = md.exchange_ts
-                .map(|ts| (now - ts).num_milliseconds())
-                .unwrap_or(i64::MAX);
-
-            if ex_age < best_exchange_age {
-                best_exchange_age = ex_age;
-                best_age_ns = md.received_ts
-                    .map(|ts| (now - ts).num_nanoseconds().unwrap_or(0).max(0) as u64);
-            }
-        }
-        best_age_ns
-    }
-
     /// Sum of write_counts across all ref feeds for this target.
     pub fn ref_write_count(&self, exchange: ExchangeId, symbol_id: SymbolId) -> u64 {
         let mut total = 0u64;

@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use oms_core::*;
 use oms_core::state_tracker::{OmsStateTracker, StateTrackerConfig};
+use oms_core::*;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
@@ -281,7 +281,7 @@ pub struct MmEngine {
     reject_pause_until: Option<Instant>,
     last_ref_wc: u64, // track seqlock write count to detect new ticks
     trigger_received_instant: Option<Instant>, // monotonic receive time of the feed that triggered the current tick
-    last_exchange_ts_ms: i64,                                   // global freshness watermark
+    last_exchange_ts_ms: i64,                  // global freshness watermark
     last_direct_exchange_ts_ms: i64, // freshest direct tick exchange_ts (for factor snapshot gating)
     factor_model: Option<FactorModelState>,
     cached_vol_mult: f64,
@@ -639,7 +639,8 @@ impl MmEngine {
                 self.latency
                     .record(latency::METRIC_FAIR, fair_start.elapsed().as_nanos() as u64);
                 if let Some(inst) = tick.trigger_received_instant {
-                    self.latency.record(latency::METRIC_T2D, inst.elapsed().as_nanos() as u64);
+                    self.latency
+                        .record(latency::METRIC_T2D, inst.elapsed().as_nanos() as u64);
                 }
             }
 
@@ -778,34 +779,13 @@ impl MmEngine {
             }
         }
 
-        // Check fair price is available
-        let fp = self
-            .fair_price
-            .get_fair_price(ExchangeId::Hyperliquid, self.hl_symbol_id);
-        if fp.is_none() {
-            if should_log {
-                let basis = self
-                    .fair_price
-                    .get_basis(ExchangeId::Hyperliquid, self.hl_symbol_id);
-                warn!(
-                    "waiting: no fair price (basis={:?}, check feeds for ref symbol)",
-                    basis,
-                );
-                self.last_status_log = Instant::now();
-            }
-            return false;
-        }
-
-        // Check feed is alive (engine-level — feed completely dead)
-        if let Some(age_ms) = self
-            .fair_price
-            .get_ref_age_ms(ExchangeId::Hyperliquid, self.hl_symbol_id)
-        {
-            if age_ms > self.config.max_feed_age_ms as i64 {
+        // Check feed is alive (monotonic — no Utc::now syscall)
+        if let Some(recv) = self.trigger_received_instant {
+            if recv.elapsed().as_millis() as u64 > self.config.max_feed_age_ms {
                 if should_log {
                     warn!(
-                        "paused: reference feed dead (age={}ms > {}ms)",
-                        age_ms, self.config.max_feed_age_ms
+                        "paused: reference feed dead (recv_age={}ms > {}ms)",
+                        recv.elapsed().as_millis(), self.config.max_feed_age_ms
                     );
                     self.last_status_log = Instant::now();
                 }
@@ -872,18 +852,24 @@ impl MmEngine {
                 }
             }
         }
-
     }
 
     #[cfg(feature = "log_state")]
     fn log_state(&self) {
         let open = self.oms_state.open_orders(None);
-        let open_summary: Vec<String> = open.iter()
+        let open_summary: Vec<String> = open
+            .iter()
             .map(|h| format!("cid={} {:?} {:?}", h.client_id.0, h.side, h.state))
             .collect();
-        let pos_summary: Vec<String> = self.oms_state.positions().iter()
+        let pos_summary: Vec<String> = self
+            .oms_state
+            .positions()
+            .iter()
             .map(|(sym, p)| {
-                let signed_size = match p.side { Side::Buy => p.size, Side::Sell => -p.size };
+                let signed_size = match p.side {
+                    Side::Buy => p.size,
+                    Side::Sell => -p.size,
+                };
                 format!("{}={:.4}", sym, signed_size)
             })
             .collect();
@@ -1121,7 +1107,10 @@ impl MmEngine {
                         exchange_id: None,
                         symbol: self.config.symbol.clone(),
                         side: Side::Buy,
-                        order_type: OrderType::Limit { price: desired_bid, tif },
+                        order_type: OrderType::Limit {
+                            price: desired_bid,
+                            tif,
+                        },
                         size: order_size,
                         filled_size: 0.0,
                         avg_fill_price: None,
@@ -1176,7 +1165,10 @@ impl MmEngine {
                         exchange_id: None,
                         symbol: self.config.symbol.clone(),
                         side: Side::Sell,
-                        order_type: OrderType::Limit { price: desired_ask, tif },
+                        order_type: OrderType::Limit {
+                            price: desired_ask,
+                            tif,
+                        },
                         size: order_size,
                         filled_size: 0.0,
                         avg_fill_price: None,
@@ -1239,7 +1231,8 @@ impl MmEngine {
     fn record_t2t(&self) {
         if self.warmed_up {
             if let Some(inst) = self.trigger_received_instant {
-                self.latency.record(latency::METRIC_T2T, inst.elapsed().as_nanos() as u64);
+                self.latency
+                    .record(latency::METRIC_T2T, inst.elapsed().as_nanos() as u64);
             }
         }
     }
@@ -1539,8 +1532,12 @@ impl MmEngine {
             return;
         }
 
-        let open: Vec<OrderHandle> = self.oms_state.open_orders(Some(&self.config.symbol))
-            .into_iter().cloned().collect();
+        let open: Vec<OrderHandle> = self
+            .oms_state
+            .open_orders(Some(&self.config.symbol))
+            .into_iter()
+            .cloned()
+            .collect();
         let min_age = Duration::from_millis(self.config.stray_order_age_ms);
 
         let fair = self
