@@ -10,7 +10,7 @@ use std::collections::HashMap;
 pub enum InfoRequest<'a> {
     #[serde(rename = "meta")]
     Meta,
-    #[serde(rename = "openOrders")]
+    #[serde(rename = "frontendOpenOrders")]
     OpenOrders { user: &'a str },
     #[serde(rename = "clearinghouseState")]
     ClearinghouseState { user: &'a str },

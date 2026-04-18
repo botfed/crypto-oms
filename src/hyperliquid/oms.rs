@@ -254,7 +254,30 @@ impl HyperliquidOms {
                 if let Some(mut handle) = self.state.orders.get_mut(&cid) {
                     let remaining_sz: f64 = oo.sz.parse().unwrap_or(0.0);
                     let orig_sz: f64 = oo.orig_sz.parse().unwrap_or(handle.size);
+                    let prev_filled = handle.filled_size;
                     handle.filled_size = orig_sz - remaining_sz;
+
+                    // Emit fill event if exchange shows more filled than gateway knew
+                    if handle.filled_size - prev_filled > 1e-12 {
+                        let fill = oms_core::Fill {
+                            client_id: handle.client_id,
+                            exchange_id: handle.exchange_id.clone().unwrap_or_default(),
+                            fill_id: format!("poll_{}", self.next_client_id.fetch_add(1, Ordering::Relaxed)),
+                            symbol: handle.symbol.clone(),
+                            side: handle.side,
+                            price: 0.0,
+                            size: handle.filled_size - prev_filled,
+                            fee: 0.0,
+                            fee_asset: "USDC".to_string(),
+                            liquidity: Liquidity::Taker,
+                            ts: Utc::now(),
+                        };
+                        if remaining_sz < 1e-12 {
+                            let _ = self.event_tx.send(OmsEvent::OrderFilled(fill));
+                        } else {
+                            let _ = self.event_tx.send(OmsEvent::OrderPartialFill(fill));
+                        }
+                    }
 
                     let active_state = if handle.filled_size > 0.0 {
                         OrderState::PartiallyFilled
@@ -363,6 +386,19 @@ impl HyperliquidOms {
                 // Assume filled if it had partial fills, cancelled otherwise
                 if handle.filled_size > 0.0 {
                     handle.state = OrderState::Filled;
+                    let _ = self.event_tx.send(OmsEvent::OrderFilled(oms_core::Fill {
+                        client_id: handle.client_id,
+                        exchange_id: handle.exchange_id.clone().unwrap_or_default(),
+                        fill_id: format!("poll_{}", self.next_client_id.fetch_add(1, Ordering::Relaxed)),
+                        symbol: handle.symbol.clone(),
+                        side: handle.side,
+                        price: handle.avg_fill_price.unwrap_or(0.0),
+                        size: handle.filled_size,
+                        fee: 0.0,
+                        fee_asset: "USDC".to_string(),
+                        liquidity: Liquidity::Taker,
+                        ts: Utc::now(),
+                    }));
                 } else {
                     handle.state = OrderState::Cancelled;
                     let _ = self.event_tx.send(OmsEvent::OrderCancelled(handle.client_id));
