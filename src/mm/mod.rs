@@ -575,6 +575,12 @@ impl MmEngine {
             #[cfg(feature = "profiling")]
             let t0 = Instant::now();
 
+            // ── DRAIN OMS EVENTS (always first — no `continue` may skip this) ──
+            #[cfg(feature = "profiling")]
+            let t1 = Instant::now();
+
+            self.drain_oms_events();
+
             if self.shutdown.load(Ordering::Relaxed) {
                 info!("MM engine shutting down");
                 self.cancel_all_quotes();
@@ -605,12 +611,6 @@ impl MmEngine {
                 .running_since
                 .map(|t| t.elapsed() >= Duration::from_secs(self.config.warmup_secs))
                 .unwrap_or(false);
-
-            // ── DRAIN OMS EVENTS ──
-            #[cfg(feature = "profiling")]
-            let t1 = Instant::now(); // after preconditions
-
-            self.drain_oms_events();
 
             // ── CHECK FOR NEW DATA ──
             #[cfg(feature = "profiling")]
