@@ -4,11 +4,10 @@ pub mod inventory;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use oms_core::state_tracker::{OmsStateTracker, StateTrackerConfig};
+use oms_core::state_tracker::OmsStateTracker;
 use oms_core::*;
 use tracing::{debug, info, warn};
 
@@ -218,19 +217,16 @@ fn factor_mid(
 }
 
 // ---------------------------------------------------------------------------
-// MmEngine
+// MmEngine — one per symbol
 // ---------------------------------------------------------------------------
 
 pub struct MmEngine {
     oms: Arc<HyperliquidOms>,
     fair_price: Arc<FairPriceEngine>,
-    vol_provider: Option<crypto_feeds::vol_provider::VolProvider>,
     market_data: Arc<crypto_feeds::AllMarketData>,
-    params: Box<dyn MmParamSource>,
+    params: Arc<dyn MmParamSource>,
     config: StrategyConfig,
-    shutdown: Arc<AtomicBool>,
     ghost: bool,
-    spin_core: Option<usize>,
     warmed_up: bool,
 
     bid_quote: Option<LiveQuote>,
@@ -238,7 +234,7 @@ pub struct MmEngine {
     state: EngineState,
 
     hl_symbol_id: SymbolId,
-    oms_events: crossbeam_channel::Receiver<OmsEvent>,
+    vol_group_idx: usize,
     last_quote_eval: Instant,
     last_status_log: Instant,
     running_since: Option<Instant>,
@@ -251,9 +247,7 @@ pub struct MmEngine {
     factor_model: Option<FactorModelState>,
     cached_vol_mult: f64,
     presigned_cancels: HashMap<ClientOrderId, SignedPayload>,
-    /// Local OMS state — single-threaded, event-sourced from gateway channel.
-    oms_state: OmsStateTracker,
-    last_basis_save: Instant,
+    // TODO: per-engine profiling files for multi-ticker
     #[cfg(feature = "profiling")]
     latency: latency::LatencyRecorder,
 }
@@ -265,13 +259,11 @@ impl MmEngine {
     pub fn new(
         oms: Arc<HyperliquidOms>,
         fair_price: Arc<FairPriceEngine>,
-        vol_provider: Option<crypto_feeds::vol_provider::VolProvider>,
         market_data: Arc<crypto_feeds::AllMarketData>,
-        params: Box<dyn MmParamSource>,
+        params: Arc<dyn MmParamSource>,
         config: StrategyConfig,
         ghost: bool,
-        spin_core: Option<usize>,
-        shutdown: Arc<AtomicBool>,
+        vol_group_idx: usize,
     ) -> Result<Self> {
         // Resolve the HL symbol to a SymbolId for fair price lookups
         let itype = if config.symbol.starts_with("PERP_") {
@@ -288,8 +280,6 @@ impl MmEngine {
         let hl_symbol_id = *REGISTRY
             .lookup(base, &itype)
             .ok_or_else(|| anyhow::anyhow!("symbol not in registry: {}", config.symbol))?;
-
-        let oms_events = oms.event_receiver();
 
         #[cfg(feature = "profiling")]
         let latency = latency::init();
@@ -327,7 +317,8 @@ impl MmEngine {
                     });
                 }
                 info!(
-                    "factor model enabled: {} factor(s) [{}]",
+                    "[{}] factor model: {} factor(s) [{}]",
+                    config.symbol,
                     factors.len(),
                     fm_cfg
                         .factors
@@ -352,19 +343,16 @@ impl MmEngine {
         Ok(Self {
             oms,
             fair_price,
-            vol_provider,
             market_data,
             params,
             config,
-            shutdown,
             ghost,
-            spin_core,
             warmed_up: false,
             bid_quote: None,
             ask_quote: None,
             state: EngineState::Initializing,
             hl_symbol_id,
-            oms_events,
+            vol_group_idx,
             last_quote_eval: Instant::now(),
             last_status_log: Instant::now(),
             running_since: None,
@@ -377,11 +365,150 @@ impl MmEngine {
             factor_model,
             cached_vol_mult: 1.0,
             presigned_cancels: HashMap::new(),
-            oms_state: OmsStateTracker::new(StateTrackerConfig::default()),
-            last_basis_save: Instant::now(),
             #[cfg(feature = "profiling")]
             latency,
         })
+    }
+
+    pub fn symbol(&self) -> &str {
+        &self.config.symbol
+    }
+
+    // -----------------------------------------------------------------------
+    // Tick — one iteration of the per-symbol loop
+    // -----------------------------------------------------------------------
+
+    /// Run one tick for this engine's symbol. Returns true if new data was processed.
+    /// The caller (outer loop) is responsible for draining OMS events and dispatching
+    /// them via handle_oms_event before calling tick.
+    pub fn tick(
+        &mut self,
+        oms_state: &mut OmsStateTracker,
+        vol_provider: &mut Option<crypto_feeds::vol_provider::VolProvider>,
+    ) -> bool {
+        #[cfg(feature = "profiling")]
+        let t0 = Instant::now();
+
+        if !self.check_preconditions(oms_state) {
+            if self.state == EngineState::Running {
+                self.transition_to_paused();
+            }
+            return false;
+        }
+
+        #[cfg(feature = "profiling")]
+        let t1 = Instant::now(); // after preconditions
+
+        if self.state != EngineState::Running {
+            info!(
+                "[{}] entering Running state (warmup={}s)",
+                self.config.symbol, self.config.warmup_secs
+            );
+            self.state = EngineState::Running;
+            self.running_since = Some(Instant::now());
+        }
+
+        self.warmed_up = self
+            .running_since
+            .map(|t| t.elapsed() >= Duration::from_secs(self.config.warmup_secs))
+            .unwrap_or(false);
+
+        // ── CHECK FOR NEW DATA ──
+        let Some(tick) = self.resolve_tick() else {
+            return false;
+        };
+
+        #[cfg(feature = "profiling")]
+        let t2 = Instant::now(); // after resolve_tick
+
+        self.trigger_received_instant = tick.trigger_received_instant;
+
+        // Staleness check — direct feed only
+        if tick.is_direct {
+            if let Some(inst) = tick.trigger_received_instant {
+                let recv_age_ms = inst.elapsed().as_millis() as i64;
+                if recv_age_ms > self.config.max_stale_ms as i64 {
+                    if self.bid_quote.is_some() || self.ask_quote.is_some() {
+                        warn!(
+                            "[{}] ref feed stale (recv_age={}ms > {}ms), cancelling quotes",
+                            self.config.symbol, recv_age_ms, self.config.max_stale_ms
+                        );
+                        self.cancel_all_quotes();
+                    }
+                    return false;
+                }
+            }
+        }
+
+        // Sync local trackers with OMS reality
+        self.sync_quote_state(oms_state);
+
+        // ── FAST PATH: adverse cancel guard ──
+        self.fast_cancel_check(tick.fair, oms_state);
+
+        #[cfg(feature = "profiling")]
+        let t3 = Instant::now(); // after fast path
+
+        #[cfg(feature = "profiling")]
+        let mut vol_ns: u64 = 0;
+        #[cfg(feature = "profiling")]
+        let mut is_slow = false;
+
+        // ── SLOW PATH (~quote_interval_ms): quote placement ──
+        let interval = Duration::from_millis(self.config.quote_interval_ms);
+        if self.warmed_up && self.last_quote_eval.elapsed() >= interval {
+            #[cfg(feature = "profiling")]
+            { is_slow = true; }
+
+            self.fair_price.update_basis();
+
+            #[cfg(feature = "profiling")]
+            let vol_start = Instant::now();
+
+            self.cached_vol_mult =
+                self.get_vol_multiplier(tick.fair, tick.exchange_ts_ms, vol_provider);
+
+            #[cfg(feature = "profiling")]
+            { vol_ns = vol_start.elapsed().as_nanos() as u64; }
+
+            self.evaluate_and_place_quotes(tick.fair, oms_state);
+
+            self.last_quote_eval = Instant::now();
+        }
+
+        // ── STATUS LOG ──
+        #[cfg(any(feature = "log_status", feature = "log_state"))]
+        if self.last_status_log.elapsed() >= Duration::from_secs(1) {
+            #[cfg(feature = "log_status")]
+            self.log_status(oms_state, vol_provider);
+            #[cfg(feature = "log_state")]
+            self.log_state(oms_state);
+            self.last_status_log = Instant::now();
+        }
+
+        // ── FLUSH PROFILING ──
+        #[cfg(feature = "profiling")]
+        if self.warmed_up {
+            let t4 = Instant::now(); // end of tick
+
+            self.latency.record(latency::METRIC_PRECONDITIONS, (t1 - t0).as_nanos() as u64);
+            self.latency.record(latency::METRIC_FAIR, (t2 - t1).as_nanos() as u64);
+            self.latency.record(latency::METRIC_TICK_FAST, (t3 - t2).as_nanos() as u64);
+            self.latency.record(latency::METRIC_TICK_END, (t4 - t2).as_nanos() as u64);
+
+            if let Some(inst) = tick.trigger_received_instant {
+                self.latency.record(latency::METRIC_T2D, (t2 - inst).as_nanos() as u64);
+            }
+            if tick.feed_latency_ns > 0 {
+                self.latency.record(latency::METRIC_FEED, tick.feed_latency_ns);
+            }
+            if is_slow {
+                self.latency.record(latency::METRIC_VOL, vol_ns);
+                self.latency.record(latency::METRIC_TICK_SLOW, (t4 - t2).as_nanos() as u64);
+            }
+        }
+
+        true
     }
 
     // -----------------------------------------------------------------------
@@ -526,222 +653,22 @@ impl MmEngine {
     }
 
     // -----------------------------------------------------------------------
-    // Main loop — two cadences
-    // -----------------------------------------------------------------------
-
-    pub async fn run(mut self) -> Result<()> {
-        info!(
-            "MM engine starting: symbol={} ghost={} post_only={}",
-            self.config.symbol, self.ghost, self.config.post_only,
-        );
-
-        self.oms.wait_ready().await?;
-        self.oms_state.apply_event(&OmsEvent::Ready);
-        info!("OMS ready, entering main loop (dedicated thread)");
-
-        tokio::task::spawn_blocking(move || self.spin_loop())
-            .await
-            .map_err(|e| anyhow::anyhow!("engine thread panicked: {e}"))?;
-        Ok(())
-    }
-
-    /// Hot loop on a dedicated OS thread — no tokio scheduling jitter.
-    fn spin_loop(&mut self) {
-        if let Some(cpu) = self.spin_core {
-            let ok = core_affinity::set_for_current(core_affinity::CoreId { id: cpu });
-            if ok {
-                info!("hot loop pinned to CPU {cpu}");
-            } else {
-                warn!("failed to pin hot loop to CPU {cpu}");
-            }
-        }
-
-        // SCHED_FIFO on engine thread only — feeds/OMS stay on normal scheduling.
-        // Requires CAP_SYS_NICE: sudo setcap cap_sys_nice=eip on the binary.
-        #[cfg(all(target_os = "linux", feature = "sched_fifo"))]
-        unsafe {
-            let param = libc::sched_param { sched_priority: 50 };
-            if libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) == 0 {
-                info!("SCHED_FIFO enabled on engine thread (priority=50)");
-            } else {
-                warn!(
-                    "SCHED_FIFO failed (errno={}). Grant CAP_SYS_NICE to fix.",
-                    *libc::__errno_location()
-                );
-            }
-        }
-
-        loop {
-            #[cfg(feature = "profiling")]
-            let t0 = Instant::now();
-
-            // ── DRAIN OMS EVENTS (always first — no `continue` may skip this) ──
-            self.drain_oms_events();
-
-            #[cfg(feature = "profiling")]
-            let t1 = Instant::now(); // after drain
-
-            if self.shutdown.load(Ordering::Relaxed) {
-                info!("MM engine shutting down");
-                // Let inflight HTTP requests land on exchange before we cancel
-                std::thread::sleep(Duration::from_secs(1));
-                let oms = Arc::clone(&self.oms);
-                let symbol = self.config.symbol.clone();
-                if let Err(e) = tokio::runtime::Handle::current().block_on(
-                    oms.shutdown_cancel_all(Some(&symbol))
-                ) {
-                    warn!("shutdown cancel failed: {e:#}");
-                }
-                self.fair_price.save_basis_cache();
-                return;
-            }
-
-            if !self.check_preconditions() {
-                if self.state == EngineState::Running {
-                    self.transition_to_paused();
-                }
-                // Brief sleep to avoid burning CPU when paused/waiting
-                std::thread::sleep(Duration::from_millis(1));
-                continue;
-            }
-
-            if self.state != EngineState::Running {
-                info!(
-                    "MM engine entering Running state (warmup={}s)",
-                    self.config.warmup_secs
-                );
-                self.state = EngineState::Running;
-                self.running_since = Some(Instant::now());
-            }
-
-            self.warmed_up = self
-                .running_since
-                .map(|t| t.elapsed() >= Duration::from_secs(self.config.warmup_secs))
-                .unwrap_or(false);
-
-            // ── CHECK FOR NEW DATA ──
-            #[cfg(feature = "profiling")]
-            let t2 = Instant::now(); // after preconditions
-
-            let Some(tick) = self.resolve_tick() else {
-                continue;
-            };
-
-            // ── NEW TICK ──
-            #[cfg(feature = "profiling")]
-            let t3 = Instant::now(); // after resolve_tick
-
-            self.trigger_received_instant = tick.trigger_received_instant;
-
-            // Staleness check — direct feed only
-            if tick.is_direct {
-                if let Some(inst) = tick.trigger_received_instant {
-                    let recv_age_ms = inst.elapsed().as_millis() as i64;
-                    if recv_age_ms > self.config.max_stale_ms as i64 {
-                        if self.bid_quote.is_some() || self.ask_quote.is_some() {
-                            warn!(
-                                "ref feed stale (recv_age={}ms > {}ms), cancelling all quotes",
-                                recv_age_ms, self.config.max_stale_ms
-                            );
-                            self.cancel_all_quotes();
-                        }
-                        continue;
-                    }
-                }
-            }
-
-            // Sync local trackers with OMS reality
-            self.sync_quote_state();
-
-            // ── FAST PATH: adverse cancel guard ──
-            self.fast_cancel_check(tick.fair);
-
-            // ── SLOW PATH (~quote_interval_ms): quote placement ──
-            #[cfg(feature = "profiling")]
-            let t4 = Instant::now(); // after fast path
-
-            #[cfg(feature = "profiling")]
-            let mut vol_ns: u64 = 0;
-            #[cfg(feature = "profiling")]
-            let mut is_slow = false;
-
-            let interval = Duration::from_millis(self.config.quote_interval_ms);
-            if self.warmed_up && self.last_quote_eval.elapsed() >= interval {
-                #[cfg(feature = "profiling")]
-                { is_slow = true; }
-
-                self.fair_price.update_basis();
-
-                #[cfg(feature = "profiling")]
-                let vol_start = Instant::now();
-
-                self.cached_vol_mult = self.get_vol_multiplier(tick.fair, tick.exchange_ts_ms);
-
-                #[cfg(feature = "profiling")]
-                { vol_ns = vol_start.elapsed().as_nanos() as u64; }
-
-                self.evaluate_and_place_quotes(tick.fair);
-
-                self.last_quote_eval = Instant::now();
-
-                if self.last_basis_save.elapsed() >= Duration::from_secs(10) {
-                    self.fair_price.save_basis_cache();
-                    self.last_basis_save = Instant::now();
-                }
-            }
-
-            // ── STATUS LOG (checked every spin, not just on new data) ──
-            #[cfg(any(feature = "log_status", feature = "log_state"))]
-            if self.last_status_log.elapsed() >= Duration::from_secs(1) {
-                #[cfg(feature = "log_status")]
-                self.log_status();
-                #[cfg(feature = "log_state")]
-                self.log_state();
-                self.last_status_log = Instant::now();
-            }
-
-            // ── FLUSH ALL PROFILING ──
-            #[cfg(feature = "profiling")]
-            if self.warmed_up {
-                let t5 = Instant::now(); // end of tick
-
-                self.latency.record(latency::METRIC_DRAIN, (t1 - t0).as_nanos() as u64);
-                self.latency.record(latency::METRIC_PRECONDITIONS, (t2 - t1).as_nanos() as u64);
-                self.latency.record(latency::METRIC_FAIR, (t3 - t2).as_nanos() as u64);
-                self.latency.record(latency::METRIC_TICK_FAST, (t4 - t3).as_nanos() as u64);
-                self.latency.record(latency::METRIC_TICK_END, (t5 - t3).as_nanos() as u64);
-
-                if let Some(inst) = tick.trigger_received_instant {
-                    self.latency.record(latency::METRIC_T2D, (t3 - inst).as_nanos() as u64);
-                }
-                if tick.feed_latency_ns > 0 {
-                    self.latency.record(latency::METRIC_FEED, tick.feed_latency_ns);
-                }
-                if is_slow {
-                    self.latency.record(latency::METRIC_VOL, vol_ns);
-                    self.latency.record(latency::METRIC_TICK_SLOW, (t5 - t3).as_nanos() as u64);
-                }
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
     // Preconditions
     // -----------------------------------------------------------------------
 
-    fn check_preconditions(&mut self) -> bool {
+    fn check_preconditions(&mut self, oms_state: &OmsStateTracker) -> bool {
         let should_log = self.last_status_log.elapsed() >= Duration::from_secs(1);
 
-        if !self.oms_state.is_ready() {
+        if !oms_state.is_ready() {
             if should_log {
-                warn!("waiting: OMS not ready");
+                warn!("[{}] waiting: OMS not ready", self.config.symbol);
                 self.last_status_log = Instant::now();
             }
             return false;
         }
         if !self.params.enabled() {
             if should_log {
-                warn!("waiting: params disabled");
+                warn!("[{}] waiting: params disabled", self.config.symbol);
                 self.last_status_log = Instant::now();
             }
             return false;
@@ -749,15 +676,15 @@ impl MmEngine {
         if self.consecutive_rejects >= MAX_CONSECUTIVE_REJECTS {
             if let Some(until) = self.reject_pause_until {
                 if Instant::now() >= until {
-                    info!("reject cooldown elapsed, resetting and retrying");
+                    info!("[{}] reject cooldown elapsed, retrying", self.config.symbol);
                     self.consecutive_rejects = 0;
                     self.reject_pause_until = None;
-                    // fall through to remaining precondition checks
                 } else {
                     if should_log {
                         let remaining = until.duration_since(Instant::now());
                         warn!(
-                            "paused: {} consecutive rejects (retry in {:.0}s)",
+                            "[{}] paused: {} consecutive rejects (retry in {:.0}s)",
+                            self.config.symbol,
                             self.consecutive_rejects,
                             remaining.as_secs_f64()
                         );
@@ -767,7 +694,8 @@ impl MmEngine {
                 }
             } else {
                 warn!(
-                    "paused: {} consecutive rejects, cooldown {}s",
+                    "[{}] paused: {} consecutive rejects, cooldown {}s",
+                    self.config.symbol,
                     self.consecutive_rejects,
                     REJECT_COOLDOWN.as_secs()
                 );
@@ -787,7 +715,8 @@ impl MmEngine {
             if recv.elapsed().as_millis() as u64 > self.config.max_feed_age_ms {
                 if should_log {
                     warn!(
-                        "paused: reference feed dead (recv_age={}ms > {}ms)",
+                        "[{}] paused: reference feed dead (recv_age={}ms > {}ms)",
+                        self.config.symbol,
                         recv.elapsed().as_millis(),
                         self.config.max_feed_age_ms
                     );
@@ -804,9 +733,9 @@ impl MmEngine {
     // Quote state sync
     // -----------------------------------------------------------------------
 
-    fn sync_quote_state(&mut self) {
+    fn sync_quote_state(&mut self, oms_state: &OmsStateTracker) {
         if let Some(ref mut q) = self.bid_quote {
-            match self.oms_state.get_order(q.client_id) {
+            match oms_state.get_order(q.client_id) {
                 Some(h)
                     if matches!(
                         h.state,
@@ -832,7 +761,7 @@ impl MmEngine {
             }
         }
         if let Some(ref mut q) = self.ask_quote {
-            match self.oms_state.get_order(q.client_id) {
+            match oms_state.get_order(q.client_id) {
                 Some(h)
                     if matches!(
                         h.state,
@@ -859,28 +788,18 @@ impl MmEngine {
     }
 
     #[cfg(feature = "log_state")]
-    fn log_state(&self) {
-        let open = self.oms_state.open_orders(None);
+    fn log_state(&self, oms_state: &OmsStateTracker) {
+        let open = oms_state.open_orders(Some(&self.config.symbol));
         let open_summary: Vec<String> = open
             .iter()
             .map(|h| format!("cid={} {:?} {:?}", h.client_id.0, h.side, h.state))
             .collect();
-        let pos_summary: Vec<String> = self
-            .oms_state
-            .positions()
-            .iter()
-            .map(|(sym, p)| {
-                let signed_size = match p.side {
-                    Side::Buy => p.size,
-                    Side::Sell => -p.size,
-                };
-                format!("{}={:.4}", sym, signed_size)
-            })
-            .collect();
+        let pos = self.get_position(oms_state);
         info!(
-            "state: orders=[{}] positions=[{}]",
+            "[{}] state: orders=[{}] pos={:+.4}",
+            self.config.symbol,
             open_summary.join(", "),
-            pos_summary.join(", "),
+            pos,
         );
     }
 
@@ -888,7 +807,7 @@ impl MmEngine {
     // Fast path: cancel guard (inner-side adverse detection)
     // -----------------------------------------------------------------------
 
-    fn fast_cancel_check(&mut self, fair: f64) {
+    fn fast_cancel_check(&mut self, fair: f64, oms_state: &mut OmsStateTracker) {
         if self.bid_quote.is_none() && self.ask_quote.is_none() {
             return;
         }
@@ -899,7 +818,7 @@ impl MmEngine {
 
         // Check bid: inside min_spread from fair?
         if let Some(ref q) = self.bid_quote {
-            let state = self.oms_state.get_order(q.client_id).map(|h| h.state);
+            let state = oms_state.get_order(q.client_id).map(|h| h.state);
             let can_cancel = matches!(
                 state,
                 Some(OrderState::Accepted) | Some(OrderState::PartiallyFilled)
@@ -915,8 +834,7 @@ impl MmEngine {
                 };
                 match signed {
                     Ok(signed) => {
-                        // Mark cancelling in local state before async post
-                        self.oms_state.mark_cancelling(q.client_id);
+                        oms_state.mark_cancelling(q.client_id);
                         #[cfg(feature = "profiling")]
                         self.latency
                             .record(latency::METRIC_SIGN, sign_start.elapsed().as_nanos() as u64);
@@ -939,7 +857,7 @@ impl MmEngine {
 
         // Check ask: inside min_spread from fair?
         if let Some(ref q) = self.ask_quote {
-            let state = self.oms_state.get_order(q.client_id).map(|h| h.state);
+            let state = oms_state.get_order(q.client_id).map(|h| h.state);
             let can_cancel = matches!(
                 state,
                 Some(OrderState::Accepted) | Some(OrderState::PartiallyFilled)
@@ -955,8 +873,7 @@ impl MmEngine {
                 };
                 match signed {
                     Ok(signed) => {
-                        // Mark cancelling in local state before async post
-                        self.oms_state.mark_cancelling(q.client_id);
+                        oms_state.mark_cancelling(q.client_id);
                         #[cfg(feature = "profiling")]
                         self.latency
                             .record(latency::METRIC_SIGN, sign_start.elapsed().as_nanos() as u64);
@@ -982,15 +899,15 @@ impl MmEngine {
     // Slow path: evaluate and place quotes
     // -----------------------------------------------------------------------
 
-    fn evaluate_and_place_quotes(&mut self, fair: f64) {
+    fn evaluate_and_place_quotes(&mut self, fair: f64, oms_state: &mut OmsStateTracker) {
         // Cancel any stray orders on our symbol that we don't own
-        self.cancel_stray_orders();
+        self.cancel_stray_orders(oms_state);
 
-        let position = self.get_position();
+        let position = self.get_position(oms_state);
         let target = self.params.target_position_usd() / fair;
-        let notional = self.params.order_notional_usd();
+        let notional = self.config.order_notional_usd;
         let order_size = notional / fair;
-        let max_pos = self.params.max_position_usd() / fair;
+        let max_pos = self.config.max_position_usd / fair;
 
         let min_edge = self.config.min_edge_bps * fair / 10_000.0;
         let half_spread = (self.config.ref_half_spread_bps * self.cached_vol_mult * fair
@@ -1015,12 +932,10 @@ impl MmEngine {
 
         // Bid: cancel if too passive (outer side) or shouldn't quote
         if let Some(ref q) = self.bid_quote {
-            let should_cancel = !want_bid || (desired_bid - q.price) > requote_thresh; // bid too LOW = too passive
+            let should_cancel = !want_bid || (desired_bid - q.price) > requote_thresh;
 
             if should_cancel {
-                // Don't cancel inflight (no exchange OID yet)
-                let skip_cancel = self
-                    .oms_state
+                let skip_cancel = oms_state
                     .get_order(q.client_id)
                     .map(|h| matches!(h.state, OrderState::Inflight | OrderState::Cancelling))
                     .unwrap_or(false);
@@ -1034,7 +949,7 @@ impl MmEngine {
                         self.bid_quote = None;
                     } else {
                         debug!("slow cancel bid cid={} price={:.6}", q.client_id.0, q.price);
-                        self.oms_state.mark_cancelling(q.client_id);
+                        oms_state.mark_cancelling(q.client_id);
                         let oms = Arc::clone(&self.oms);
                         let cid = q.client_id;
                         tokio::spawn(async move {
@@ -1049,11 +964,10 @@ impl MmEngine {
 
         // Ask: cancel if too passive or shouldn't quote
         if let Some(ref q) = self.ask_quote {
-            let should_cancel = !want_ask || (q.price - desired_ask) > requote_thresh; // ask too HIGH = too passive
+            let should_cancel = !want_ask || (q.price - desired_ask) > requote_thresh;
 
             if should_cancel {
-                let skip_cancel = self
-                    .oms_state
+                let skip_cancel = oms_state
                     .get_order(q.client_id)
                     .map(|h| matches!(h.state, OrderState::Inflight | OrderState::Cancelling))
                     .unwrap_or(false);
@@ -1067,7 +981,7 @@ impl MmEngine {
                         self.ask_quote = None;
                     } else {
                         debug!("slow cancel ask cid={} price={:.6}", q.client_id.0, q.price);
-                        self.oms_state.mark_cancelling(q.client_id);
+                        oms_state.mark_cancelling(q.client_id);
                         let oms = Arc::clone(&self.oms);
                         let cid = q.client_id;
                         tokio::spawn(async move {
@@ -1081,9 +995,6 @@ impl MmEngine {
         }
 
         // ── PLACE new quotes where needed ──
-        // Placements are spawned fire-and-forget. The OMS inserts the Inflight order
-        // before the HTTP call, so we can grab the cid and set the tracker immediately.
-        // sync_quote_state sees Inflight → keeps tracker alive until Accepted/Rejected.
 
         if self.bid_quote.is_none() && want_bid && self.ghost {}
         if self.bid_quote.is_none() && want_bid && !self.ghost {
@@ -1105,8 +1016,7 @@ impl MmEngine {
             match self.oms.prepare_place_order(&req) {
                 Ok((cid, sdk_req)) => {
                     debug!("placing bid cid={} price={:.6}", cid.0, desired_bid);
-                    // Insert inflight in local state
-                    self.oms_state.insert_inflight(OrderHandle {
+                    oms_state.insert_inflight(OrderHandle {
                         client_id: cid,
                         exchange_id: None,
                         symbol: self.config.symbol.clone(),
@@ -1163,8 +1073,7 @@ impl MmEngine {
             match self.oms.prepare_place_order(&req) {
                 Ok((cid, sdk_req)) => {
                     debug!("placing ask cid={} price={:.6}", cid.0, desired_ask);
-                    // Insert inflight in local state
-                    self.oms_state.insert_inflight(OrderHandle {
+                    oms_state.insert_inflight(OrderHandle {
                         client_id: cid,
                         exchange_id: None,
                         symbol: self.config.symbol.clone(),
@@ -1207,7 +1116,6 @@ impl MmEngine {
     // Inventory skew
     // -----------------------------------------------------------------------
 
-    /// Logarithmic skew: aggressive near target, saturates for large deviations, capped at max_skew_bps.
     fn compute_skewed_mid(&self, fair_value: f64, position: f64, target: f64, max_pos: f64) -> f64 {
         let diff = target - position;
         if diff.abs() < 1e-12 {
@@ -1218,19 +1126,13 @@ impl MmEngine {
         } else {
             max_pos
         };
-        // raw ∈ [-ln(2), ln(2)] when diff ∈ [-denom, denom]
-        // Normalize to [-1, 1] then scale by max_skew_bps
         let raw = diff.signum() * (1.0 + diff.abs() / denom).ln();
-        let normalized = raw / std::f64::consts::LN_2; // ∈ [-1, 1] at 100% off target
+        let normalized = raw / std::f64::consts::LN_2;
         let skew_bps = (normalized * self.config.max_skew_bps)
             .clamp(-self.config.max_skew_bps, self.config.max_skew_bps);
         fair_value + skew_bps * fair_value / 10_000.0
     }
 
-    /// Record t2t: age of the feed that triggered this tick, captured when the tick was resolved.
-    /// Uses trigger_recv_age_ns (freshest feed for factor ticks, direct feed for direct ticks)
-    /// instead of re-querying FairPriceEngine, which could measure a stale direct feed
-    /// when the cancel was actually triggered by a fresh factor tick.
     #[cfg(feature = "profiling")]
     fn record_t2t(&mut self) {
         if self.warmed_up {
@@ -1241,14 +1143,18 @@ impl MmEngine {
         }
     }
 
-    fn get_vol_multiplier(&mut self, fair: f64, exchange_ts_ms: i64) -> f64 {
-        let Some(ref mut vp) = self.vol_provider else {
+    fn get_vol_multiplier(
+        &self,
+        fair: f64,
+        exchange_ts_ms: i64,
+        vol_provider: &mut Option<crypto_feeds::vol_provider::VolProvider>,
+    ) -> f64 {
+        let Some(ref mut vp) = *vol_provider else {
             return 1.0;
         };
-        // Update vol provider with current fair price (drives HAR virtual head)
         let ts_ns = exchange_ts_ms * 1_000_000;
-        vp.update(0, fair, ts_ns);
-        let predicted = vp.ann_vol(0);
+        vp.update(self.vol_group_idx, fair, ts_ns);
+        let predicted = vp.ann_vol(self.vol_group_idx);
         if self.config.ref_vol <= 0.0 || predicted <= 0.0 || !predicted.is_finite() {
             return 1.0;
         }
@@ -1274,19 +1180,23 @@ impl MmEngine {
     // -----------------------------------------------------------------------
 
     #[cfg(feature = "log_status")]
-    fn log_status(&mut self) {
+    fn log_status(
+        &self,
+        oms_state: &OmsStateTracker,
+        vol_provider: &Option<crypto_feeds::vol_provider::VolProvider>,
+    ) {
         let fair = self
             .fair_price
             .get_fair_price(ExchangeId::Hyperliquid, self.hl_symbol_id);
         let basis = self
             .fair_price
             .get_basis(ExchangeId::Hyperliquid, self.hl_symbol_id);
-        let position = self.get_position();
+        let position = self.get_position(oms_state);
         let target = fair
             .map(|f| self.params.target_position_usd() / f)
             .unwrap_or(0.0);
         let max_pos = fair
-            .map(|f| self.params.max_position_usd() / f)
+            .map(|f| self.config.max_position_usd / f)
             .unwrap_or(0.0);
 
         let basis_bps = match (basis, fair) {
@@ -1294,7 +1204,6 @@ impl MmEngine {
             _ => 0.0,
         };
 
-        // Compute actual skew bps being applied
         let skew_bps = if let Some(f) = fair {
             let skewed = self.compute_skewed_mid(f, position, target, max_pos);
             (skewed - f) / f * 10_000.0
@@ -1330,7 +1239,6 @@ impl MmEngine {
             _ => 0.0,
         };
 
-        // Factor model adjustment in bps (corr_fair vs direct_fair)
         let factor_bps = match (fair, &self.factor_model) {
             (Some(f), Some(fm)) if fm.seeded && f != 0.0 => {
                 let mut sum = 0.0f64;
@@ -1350,15 +1258,14 @@ impl MmEngine {
             (self.config.ref_half_spread_bps * vol_mult).max(self.config.min_edge_bps);
         let adj_requote_bps = self.config.ref_requote_tolerance_bps * vol_mult;
 
-        // Get raw vol prediction for logging
-        let pred_vol_ann = self
-            .vol_provider
+        let pred_vol_ann = vol_provider
             .as_ref()
-            .map(|vp| vp.ann_vol(0))
+            .map(|vp| vp.ann_vol(self.vol_group_idx))
             .unwrap_or(0.0);
 
         info!(
-            "status: fair={:.6} hl_mid={:.6} resid={:+.2}bps basis={:+.2}bps factor={:+.2}bps skew={:+.2}bps vol={:.1}% vmult={:.2} band=[{:.1},{:.1},{:.1}]bps pos={:+.6} target={:+.6} bid={} ask={} ref={}@{}ms",
+            "[{}] fair={:.6} hl_mid={:.6} resid={:+.2}bps basis={:+.2}bps factor={:+.2}bps skew={:+.2}bps vol={:.1}% vmult={:.2} band=[{:.1},{:.1},{:.1}]bps pos={:+.6} target={:+.6} bid={} ask={} ref={}@{}ms",
+            self.config.symbol,
             fair.unwrap_or(0.0),
             hl_mid.unwrap_or(0.0),
             residual_bps,
@@ -1383,8 +1290,8 @@ impl MmEngine {
     // Position helper
     // -----------------------------------------------------------------------
 
-    fn get_position(&self) -> f64 {
-        if let Some(p) = self.oms_state.positions().get(&self.config.symbol) {
+    fn get_position(&self, oms_state: &OmsStateTracker) -> f64 {
+        if let Some(p) = oms_state.positions().get(&self.config.symbol) {
             return match p.side {
                 Side::Buy => p.size,
                 Side::Sell => -p.size,
@@ -1394,55 +1301,33 @@ impl MmEngine {
     }
 
     // -----------------------------------------------------------------------
-    // OMS event handling
+    // OMS event handling — called by outer loop after drain
     // -----------------------------------------------------------------------
 
-    fn drain_oms_events(&mut self) {
-        loop {
-            match self.oms_events.try_recv() {
-                Ok(event) => {
-                    // Feed state tracker before engine handling
-                    self.oms_state.apply_event(&event);
-                    self.handle_oms_event(event);
-                }
-                Err(crossbeam_channel::TryRecvError::Empty) => break,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
-            }
-        }
-    }
-
-    fn handle_oms_event(&mut self, event: OmsEvent) {
+    pub fn handle_oms_event(&mut self, event: &OmsEvent, oms_state: &OmsStateTracker) {
         match event {
-            OmsEvent::Disconnected => {
-                warn!("OMS disconnected");
-                // State will be caught by check_preconditions → is_ready() == false
-            }
-            OmsEvent::Ready | OmsEvent::Reconnected => {
-                info!("OMS ready/reconnected");
-            }
             OmsEvent::OrderAccepted { client_id, .. } => {
-                if self.is_our_order(&client_id) {
+                if self.is_our_order(client_id, oms_state) {
                     self.consecutive_rejects = 0;
                     self.reject_pause_until = None;
                     // Pre-sign cancel for fast path
-                    match self.oms.presign_cancel_order(&client_id) {
+                    match self.oms.presign_cancel_order(client_id) {
                         Ok(signed) => {
-                            self.presigned_cancels.insert(client_id, signed);
+                            self.presigned_cancels.insert(*client_id, signed);
                         }
                         Err(e) => debug!("pre-sign cancel failed for {}: {e}", client_id.0),
                     }
                 }
             }
             OmsEvent::OrderPartialFill(fill) => {
-                if self.is_our_order(&fill.client_id) {
+                if self.is_our_order(&fill.client_id, oms_state) {
                     info!(
-                        "partial fill: cid={} side={:?} price={:.6} size={:.4}",
-                        fill.client_id.0, fill.side, fill.price, fill.size,
+                        "[{}] partial fill: cid={} side={:?} price={:.6} size={:.4}",
+                        self.config.symbol, fill.client_id.0, fill.side, fill.price, fill.size,
                     );
                     self.consecutive_rejects = 0;
                     self.reject_pause_until = None;
-                    // Check if fully filled
-                    if let Some(h) = self.oms_state.get_order(fill.client_id) {
+                    if let Some(h) = oms_state.get_order(fill.client_id) {
                         if h.filled_size >= h.size - 1e-12 {
                             self.clear_tracker(&fill.client_id);
                         }
@@ -1450,10 +1335,10 @@ impl MmEngine {
                 }
             }
             OmsEvent::OrderFilled(fill) => {
-                if self.is_our_order(&fill.client_id) {
+                if self.is_our_order(&fill.client_id, oms_state) {
                     info!(
-                        "fill: cid={} side={:?} price={:.6} size={:.4}",
-                        fill.client_id.0, fill.side, fill.price, fill.size,
+                        "[{}] fill: cid={} side={:?} price={:.6} size={:.4}",
+                        self.config.symbol, fill.client_id.0, fill.side, fill.price, fill.size,
                     );
                     self.consecutive_rejects = 0;
                     self.reject_pause_until = None;
@@ -1461,15 +1346,18 @@ impl MmEngine {
                 }
             }
             OmsEvent::OrderCancelled(cid) => {
-                if self.is_our_order(&cid) {
-                    debug!("order cancelled: cid={}", cid.0);
-                    self.clear_tracker(&cid);
+                if self.is_our_order(cid, oms_state) {
+                    debug!("[{}] order cancelled: cid={}", self.config.symbol, cid.0);
+                    self.clear_tracker(cid);
                 }
             }
             OmsEvent::OrderRejected { client_id, reason } => {
-                if self.is_our_order(&client_id) {
-                    warn!("order rejected: cid={} reason={}", client_id.0, reason);
-                    self.clear_tracker(&client_id);
+                if self.is_our_order(client_id, oms_state) {
+                    warn!(
+                        "[{}] order rejected: cid={} reason={}",
+                        self.config.symbol, client_id.0, reason
+                    );
+                    self.clear_tracker(client_id);
                     self.consecutive_rejects += 1;
                 }
             }
@@ -1478,7 +1366,6 @@ impl MmEngine {
     }
 
     /// Check if an order from open_orders matches our tracked bid or ask.
-    /// Matches by client_id OR exchange_id (fallback for synthetic handles from REST poll).
     fn is_tracked_order(&self, o: &OrderHandle) -> bool {
         for q in [&self.bid_quote, &self.ask_quote].into_iter().flatten() {
             if q.client_id == o.client_id {
@@ -1493,17 +1380,13 @@ impl MmEngine {
         false
     }
 
-    /// Check if a client order ID belongs to one of our tracked quotes.
-    /// Matches by client_id directly, or by exchange_id if the cid corresponds
-    /// to an OMS order with an exchange_id matching our tracker.
-    fn is_our_order(&self, cid: &ClientOrderId) -> bool {
+    fn is_our_order(&self, cid: &ClientOrderId, oms_state: &OmsStateTracker) -> bool {
         for q in [&self.bid_quote, &self.ask_quote].into_iter().flatten() {
             if q.client_id == *cid {
                 return true;
             }
-            // Fallback: check if the order's exchange_id matches our tracker
             if let Some(ref q_eid) = q.exchange_id {
-                if let Some(h) = self.oms_state.get_order(*cid) {
+                if let Some(h) = oms_state.get_order(*cid) {
                     if h.exchange_id.as_ref() == Some(q_eid) {
                         return true;
                     }
@@ -1537,19 +1420,12 @@ impl MmEngine {
     // Cancel helpers
     // -----------------------------------------------------------------------
 
-    /// Cancel any open orders on our symbol that we don't recognize as ours.
-    /// Handle duplicate/stray orders on our symbol.
-    /// - If we have a tracked quote on a side: cancel all other orders on that side
-    /// - If we DON'T have a tracked quote: adopt the closest to fair, cancel the rest
-    /// - Only act on orders where last_modified age >= stray_order_age_ms
-    /// - Skip orders in Cancelling state
-    fn cancel_stray_orders(&mut self) {
+    fn cancel_stray_orders(&mut self, oms_state: &OmsStateTracker) {
         if self.ghost {
             return;
         }
 
-        let open: Vec<OrderHandle> = self
-            .oms_state
+        let open: Vec<OrderHandle> = oms_state
             .open_orders(Some(&self.config.symbol))
             .into_iter()
             .cloned()
@@ -1561,20 +1437,16 @@ impl MmEngine {
             .get_fair_price(ExchangeId::Hyperliquid, self.hl_symbol_id)
             .unwrap_or(0.0);
 
-        // Separate strays by side
         let mut stray_bids: Vec<&OrderHandle> = Vec::new();
         let mut stray_asks: Vec<&OrderHandle> = Vec::new();
 
         for o in &open {
-            // Skip our tracked orders — match by client_id OR exchange_id
             if self.is_tracked_order(o) {
                 continue;
             }
-            // Skip orders still being cancelled
             if o.state == OrderState::Cancelling {
                 continue;
             }
-            // Skip orders that are too recent
             let old_enough = o
                 .last_modified
                 .map(|t| t.elapsed() >= min_age)
@@ -1589,7 +1461,6 @@ impl MmEngine {
             }
         }
 
-        // Handle stray bids
         if !stray_bids.is_empty() {
             if self.bid_quote.is_some() {
                 for o in &stray_bids {
@@ -1610,7 +1481,6 @@ impl MmEngine {
             }
         }
 
-        // Handle stray asks
         if !stray_asks.is_empty() {
             if self.ask_quote.is_some() {
                 for o in &stray_asks {
@@ -1632,14 +1502,11 @@ impl MmEngine {
         }
     }
 
-    /// From a list of stray orders on one side, adopt the one closest to fair price
-    /// as our tracked quote, cancel the rest.
     fn adopt_closest_cancel_rest(&mut self, strays: &[&OrderHandle], side: Side, fair: f64) {
         if strays.is_empty() {
             return;
         }
 
-        // Find the one closest to fair
         let best_idx = strays
             .iter()
             .enumerate()
@@ -1663,7 +1530,6 @@ impl MmEngine {
 
         for (i, o) in strays.iter().enumerate() {
             if i == best_idx {
-                // Adopt this one
                 let price = match o.order_type {
                     OrderType::Limit { price, .. } => price,
                     _ => 0.0,
@@ -1699,7 +1565,7 @@ impl MmEngine {
         }
     }
 
-    fn cancel_all_quotes(&mut self) {
+    pub fn cancel_all_quotes(&mut self) {
         if self.ghost {
             if self.bid_quote.is_some() || self.ask_quote.is_some() {
                 info!("[GHOST] would CANCEL ALL quotes");
@@ -1735,7 +1601,7 @@ impl MmEngine {
     }
 
     fn transition_to_paused(&mut self) {
-        info!("MM engine entering Paused state");
+        info!("[{}] entering Paused state", self.config.symbol);
         self.cancel_all_quotes();
         self.state = EngineState::Paused;
         self.running_since = None;
@@ -1772,20 +1638,11 @@ mod tests {
                 exchange_ts: Some(chrono::Utc::now()),
                 received_ts: Some(chrono::Utc::now()),
                 received_instant: Some(Instant::now()),
+                feed_latency_ns: 0,
             },
         );
     }
 
-    /// With factor_model disabled, resolve_tick() is a transparent wrapper around
-    /// the existing write-count + get_fair_price_detail logic.
-    ///
-    /// The ONLY behavioral change vs pre-refactor code is that fast_cancel_check
-    /// and evaluate_and_place_quotes now receive `fair` as a parameter instead of
-    /// re-reading from FairPriceEngine. This eliminates potential micro-inconsistency
-    /// (basis EWMA ticking between reads) and is strictly an improvement.
-    ///
-    /// This test verifies that with factor_model=None the direct tick path works
-    /// correctly and factor code paths are never entered.
     #[test]
     fn factor_model_none_direct_tick_only() {
         let md = AllMarketData::new();
@@ -1793,11 +1650,8 @@ mod tests {
             .lookup("ETH_USDC", &InstrumentType::Perp)
             .expect("ETH_USDC perp must be in registry");
 
-        // Push a quote so write_count > 0
         push_quote(&md, ExchangeId::Binance, eth_id, 2000.0, 2001.0);
 
-        // With no factor model, total_factor_wc should not be called,
-        // and factor_mid should return None for any arbitrary factor state.
         let factor = FactorState {
             symbol_id: eth_id,
             exchanges: vec![ExchangeId::Binance],
@@ -1805,14 +1659,8 @@ mod tests {
             snapshot_log_mid: 0.0,
         };
 
-        // factor_mid works when data is present
         let (mid, _, _) = factor_mid(&md, &factor).expect("should find ETH mid");
         assert!((mid - 2000.5).abs() < 0.01);
-
-        // factor_model=None means we never enter factor tick path:
-        // resolve_tick first checks direct write count, then only checks factor_model
-        // if direct didn't fire. With factor_model=None, the second branch is skipped.
-        // This is structurally verified by code inspection and this compilation test.
     }
 
     #[test]
@@ -1824,7 +1672,6 @@ mod tests {
 
         let beta = 0.97;
 
-        // Snapshot: ETH at 2000
         push_quote(&md, ExchangeId::Binance, eth_id, 1999.5, 2000.5);
         let (snapshot_mid, _, _) = factor_mid(
             &md,
@@ -1838,9 +1685,8 @@ mod tests {
         .unwrap();
 
         let snapshot_log_mid = snapshot_mid.ln();
-        let direct_fair = 0.15; // AIXBT fair price at snapshot time
+        let direct_fair = 0.15;
 
-        // ETH moves to 2020 (1% up)
         push_quote(&md, ExchangeId::Binance, eth_id, 2019.5, 2020.5);
 
         let factor = FactorState {
@@ -1854,7 +1700,6 @@ mod tests {
         let r = current_mid.ln() - snapshot_log_mid;
         let corr_fair = direct_fair * (beta * r).exp();
 
-        // ETH moved ~1%, beta=0.97, so AIXBT fair should move ~0.97%
         let expected_pct_move = beta * r;
         let actual_pct_move = (corr_fair / direct_fair).ln();
         assert!(
@@ -1862,7 +1707,6 @@ mod tests {
             "corr_fair pct move should be beta * ETH return"
         );
 
-        // Sanity: corr_fair > direct_fair since ETH went up
         assert!(corr_fair > direct_fair);
     }
 
@@ -1879,7 +1723,6 @@ mod tests {
         let beta_eth = 0.97;
         let beta_btc = 0.30;
 
-        // Snapshot both factors
         push_quote(&md, ExchangeId::Binance, eth_id, 1999.5, 2000.5);
         push_quote(&md, ExchangeId::Binance, btc_id, 59999.5, 60000.5);
 
@@ -1920,11 +1763,9 @@ mod tests {
 
         let direct_fair = 0.15;
 
-        // ETH +1%, BTC -0.5%
         push_quote(&md, ExchangeId::Binance, eth_id, 2019.5, 2020.5);
         push_quote(&md, ExchangeId::Binance, btc_id, 59699.5, 59700.5);
 
-        // Compute sum manually
         let (eth_mid, _, _) = factor_mid(&md, &eth_factor).unwrap();
         let (btc_mid, _, _) = factor_mid(&md, &btc_factor).unwrap();
 
@@ -1933,11 +1774,9 @@ mod tests {
         let sum = beta_eth * r_eth + beta_btc * r_btc;
         let corr_fair = direct_fair * sum.exp();
 
-        // Verify: the multi-factor result combines both returns
         let single_eth_fair = direct_fair * (beta_eth * r_eth).exp();
         let single_btc_fair = direct_fair * (beta_btc * r_btc).exp();
 
-        // Multi-factor should be between single-factor results (ETH pushes up, BTC pushes down)
         assert!(r_eth > 0.0, "ETH should have positive return");
         assert!(r_btc < 0.0, "BTC should have negative return");
         assert!(
@@ -1949,7 +1788,6 @@ mod tests {
             "multi-factor fair should be above BTC-only fair (ETH pushed it up)"
         );
 
-        // Verify the math: exp(a+b) = exp(a)*exp(b)
         let expected = direct_fair * (beta_eth * r_eth).exp() * (beta_btc * r_btc).exp();
         assert!(
             (corr_fair - expected).abs() < 1e-15,
@@ -1959,7 +1797,6 @@ mod tests {
 
     #[test]
     fn factor_model_no_move_returns_none() {
-        // If no factor has moved since snapshot, sum ≈ 0 and resolve should skip
         let md = AllMarketData::new();
         let eth_id = *REGISTRY
             .lookup("ETH_USDC", &InstrumentType::Perp)
@@ -1980,7 +1817,6 @@ mod tests {
 
         let snapshot_log = mid.ln();
 
-        // Don't push any new data — same mid
         let factor = FactorState {
             symbol_id: eth_id,
             exchanges: vec![ExchangeId::Binance],

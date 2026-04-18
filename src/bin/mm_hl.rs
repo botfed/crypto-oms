@@ -8,10 +8,13 @@ use crypto_oms::mm::config::{MmConfig, WatchParams};
 use crypto_oms::mm::fair_price::FairPriceEngine;
 use crypto_oms::mm::inventory::start_inventory_manager;
 use crypto_oms::mm::MmEngine;
+use oms_core::state_tracker::{OmsStateTracker, StateTrackerConfig};
+use crypto_oms::ExchangeOms;
+use oms_core::OmsEvent;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tracing::{info, warn};
 
@@ -24,9 +27,6 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-
-    // SCHED_FIFO is set per-thread on the engine spin loop, not process-wide.
-    // See spin_loop() in mm/mod.rs. Requires --features sched_fifo + CAP_SYS_NICE.
 
     // Parse CLI args: mm_hl [--ghost] [--spin-core N] [--tokio-cores 2,3] [config_path]
     let mut ghost = false;
@@ -56,9 +56,6 @@ fn main() -> Result<()> {
     }
 
     // Build tokio runtime — pin workers to specific cores if requested.
-    // on_thread_start fires for worker threads at build() time (before block_on).
-    // Blocking pool threads are created lazily later, so the counter cap ensures
-    // only the first N threads (the workers) get pinned.
     let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
     rt_builder.enable_all();
     if let Some(ref cores) = tokio_cores {
@@ -124,13 +121,17 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
     let oms = HyperliquidOms::new(oms_config)?;
     oms.start();
 
+    anyhow::ensure!(!config.symbols.is_empty(), "config must have at least one symbol in 'symbols'");
+    let symbols = config.symbols;
+
     // FairPriceEngine — basis updated by engine in slow path, no background task
     let fair_price = Arc::new(FairPriceEngine::new(market_data.clone(), config.fair_price)?);
 
-    // Start inventory manager
-    let asset = config.strategy.symbol
+    // Start inventory manager (uses first symbol's asset)
+    let first_symbol = &symbols[0].symbol;
+    let asset = first_symbol
         .strip_prefix("PERP_")
-        .or_else(|| config.strategy.symbol.strip_prefix("SPOT_"))
+        .or_else(|| first_symbol.strip_prefix("SPOT_"))
         .and_then(|s| s.split('_').next())
         .unwrap_or("BTC");
     let (target_rx, _inv_handle) = start_inventory_manager(
@@ -139,8 +140,9 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
         shutdown.clone(),
     );
 
-    // Build params
-    let (params, _controller) = WatchParams::new(&config.strategy, target_rx);
+    // Build params (shared across engines)
+    let (params, _controller) = WatchParams::new(&symbols[0], target_rx);
+    let params: Arc<dyn crypto_oms::mm::config::MmParamSource> = Arc::new(params);
 
     // Initialize vol provider if vol_models is configured
     let vol_model_name = config.vol_models
@@ -148,7 +150,7 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
         .map(|v| v.model.clone())
         .unwrap_or_else(|| "har_qlike".to_string());
 
-    let vol_provider = if let Some(ref vol_cfg) = config.vol_models {
+    let mut vol_provider = if let Some(ref vol_cfg) = config.vol_models {
         info!("initializing vol provider from {}", vol_cfg.params_dir);
 
         let params_dir = Path::new(&vol_cfg.params_dir);
@@ -159,36 +161,67 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
             all_params.len(), all_params.keys().collect::<Vec<_>>());
 
         let target_min = all_params.values().next().map(|p| p.target_min).unwrap_or(5);
-
-        // Build HAR vol provider: load warmup bars per symbol, pair with HAR params
         let bar_data_dir = Path::new(&vol_cfg.bar_data_dir);
+
+        // Build HAR groups in config symbol order — group[i] matches symbols[i].vol_group_idx
         let mut har_groups = Vec::new();
-        for (sym, params) in all_params {
-            let har = match vol_model_name.as_str() {
-                "har_ols" => params.har_ols.clone(),
-                _ => params.har_qlike.clone(),
-            };
-            let Some(har_params) = har else { continue };
-
-            // Load historical bars for warmup
-            let warmup_bars = match load_1m_bars_with_backfill(bar_data_dir, &sym, vol_cfg.warmup_days).await {
-                Ok(bars_1m) => {
-                    let target_bars = aggregate_bars(&bars_1m, target_min);
-                    info!("vol warmup: {} target bars for {}", target_bars.len(), sym);
-                    target_bars
+        for sym_cfg in &symbols {
+            let vol_sym = &sym_cfg.vol_symbol;
+            if vol_sym.is_empty() {
+                har_groups.push(None);
+                continue;
+            }
+            match all_params.get(vol_sym.as_str()) {
+                Some(params) => {
+                    let har = match vol_model_name.as_str() {
+                        "har_ols" => params.har_ols.clone(),
+                        _ => params.har_qlike.clone(),
+                    };
+                    match har {
+                        Some(har_params) => {
+                            let warmup_bars = match load_1m_bars_with_backfill(bar_data_dir, vol_sym, vol_cfg.warmup_days).await {
+                                Ok(bars_1m) => {
+                                    let target_bars = aggregate_bars(&bars_1m, target_min);
+                                    info!("vol warmup: {} target bars for {}", target_bars.len(), vol_sym);
+                                    target_bars
+                                }
+                                Err(e) => {
+                                    warn!("vol warmup failed for {}: {}", vol_sym, e);
+                                    Vec::new()
+                                }
+                            };
+                            har_groups.push(Some((har_params, params.seasonality.clone(), target_min, warmup_bars, sym_cfg.ref_vol)));
+                        }
+                        None => {
+                            warn!("no HAR params for vol_symbol={}, using vol_mult=1.0", vol_sym);
+                            har_groups.push(None);
+                        }
+                    }
                 }
-                Err(e) => {
-                    warn!("vol warmup failed for {}: {}", sym, e);
-                    Vec::new()
+                None => {
+                    warn!("vol_symbol={} not found in params dir, using vol_mult=1.0", vol_sym);
+                    har_groups.push(None);
                 }
-            };
-
-            har_groups.push((har_params, params.seasonality.clone(), target_min, warmup_bars));
+            }
         }
 
-        let seed_vol = config.strategy.ref_vol;
-        let provider = VolProvider::new_har(har_groups, seed_vol);
-        info!("vol provider ready (model={}, lock-free HAR)", vol_model_name);
+        // Build provider with one group per symbol
+        let final_groups: Vec<_> = har_groups.into_iter().enumerate().map(|(i, g)| {
+            g.unwrap_or_else(|| {
+                let har = crypto_feeds::vol_params::HarParams {
+                    intercept: 0.0,
+                    betas: vec![],
+                    windows: vec![],
+                };
+                let seasonality = crypto_feeds::vol_params::SeasonalFactors {
+                    f_h: [1.0; 24],
+                    f_d: [1.0; 7],
+                };
+                (har, seasonality, target_min, Vec::new(), symbols[i].ref_vol)
+            })
+        }).collect();
+        let provider = VolProvider::new_har(final_groups);
+        info!("vol provider ready (model={}, {} groups)", vol_model_name, provider.group_count());
 
         Some(provider)
     } else {
@@ -196,19 +229,141 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
         None
     };
 
-    // Run engine
-    let engine = MmEngine::new(
-        oms,
-        fair_price,
-        vol_provider,
-        market_data,
-        Box::new(params),
-        config.strategy,
-        ghost,
-        spin_core,
-        engine_shutdown,
-    )?;
+    // Build N engines — one per symbol
+    let mut engines: Vec<MmEngine> = Vec::with_capacity(symbols.len());
+    for (i, sym_cfg) in symbols.iter().enumerate() {
+        let engine = MmEngine::new(
+            Arc::clone(&oms),
+            Arc::clone(&fair_price),
+            Arc::clone(&market_data),
+            Arc::clone(&params),
+            sym_cfg.clone(),
+            ghost,
+            i,
+        )?;
+        engines.push(engine);
+    }
 
-    engine.run().await?;
+    let sym_names: Vec<&str> = engines.iter().map(|e| e.symbol()).collect();
+    info!("MM engine starting: symbols=[{}] ghost={}", sym_names.join(", "), ghost);
+
+    // Wait for OMS ready
+    oms.wait_ready().await?;
+    let mut oms_state = OmsStateTracker::new(StateTrackerConfig::default());
+    oms_state.apply_event(&OmsEvent::Ready);
+    info!("OMS ready, entering main loop (dedicated thread)");
+
+    // Get OMS event receiver
+    let oms_events = oms.event_receiver();
+
+    // Run the spin loop on a dedicated thread
+    tokio::task::spawn_blocking(move || {
+        spin_loop(
+            &mut engines,
+            &mut oms_state,
+            &oms_events,
+            &mut vol_provider,
+            &oms,
+            &fair_price,
+            &engine_shutdown,
+            spin_core,
+        );
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("engine thread panicked: {e}"))?;
+
     std::process::exit(0);
+}
+
+/// Hot loop on a dedicated OS thread — no tokio scheduling jitter.
+fn spin_loop(
+    engines: &mut [MmEngine],
+    oms_state: &mut OmsStateTracker,
+    oms_events: &crossbeam_channel::Receiver<OmsEvent>,
+    vol_provider: &mut Option<VolProvider>,
+    oms: &Arc<HyperliquidOms>,
+    fair_price: &Arc<FairPriceEngine>,
+    shutdown: &AtomicBool,
+    spin_core: Option<usize>,
+) {
+    if let Some(cpu) = spin_core {
+        let ok = core_affinity::set_for_current(core_affinity::CoreId { id: cpu });
+        if ok {
+            info!("hot loop pinned to CPU {cpu}");
+        } else {
+            warn!("failed to pin hot loop to CPU {cpu}");
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "sched_fifo"))]
+    unsafe {
+        let param = libc::sched_param { sched_priority: 50 };
+        if libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) == 0 {
+            info!("SCHED_FIFO enabled on engine thread (priority=50)");
+        } else {
+            warn!(
+                "SCHED_FIFO failed (errno={}). Grant CAP_SYS_NICE to fix.",
+                *libc::__errno_location()
+            );
+        }
+    }
+
+    let mut last_basis_save = Instant::now();
+
+    loop {
+        // ── DRAIN OMS EVENTS, dispatch to engines ──
+        loop {
+            match oms_events.try_recv() {
+                Ok(event) => {
+                    oms_state.apply_event(&event);
+                    match &event {
+                        OmsEvent::Disconnected => warn!("OMS disconnected"),
+                        OmsEvent::Ready | OmsEvent::Reconnected => info!("OMS ready/reconnected"),
+                        _ => {
+                            for engine in engines.iter_mut() {
+                                engine.handle_oms_event(&event, oms_state);
+                            }
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        // ── SHUTDOWN ──
+        if shutdown.load(Ordering::Relaxed) {
+            info!("MM engine shutting down");
+            for engine in engines.iter_mut() {
+                engine.cancel_all_quotes();
+            }
+            // Let inflight HTTP requests land on exchange before final cancel
+            std::thread::sleep(Duration::from_secs(1));
+            if let Err(e) = tokio::runtime::Handle::current().block_on(
+                oms.shutdown_cancel_all(None)
+            ) {
+                warn!("shutdown cancel failed: {e:#}");
+            }
+            fair_price.save_basis_cache();
+            return;
+        }
+
+        // ── TICK EACH ENGINE ──
+        let mut any_ticked = false;
+        for engine in engines.iter_mut() {
+            if engine.tick(oms_state, vol_provider) {
+                any_ticked = true;
+            }
+        }
+
+        if !any_ticked {
+            // All engines had no new data — brief yield to avoid 100% CPU
+            std::hint::spin_loop();
+        }
+
+        // ── PERIODIC BASIS CACHE SAVE ──
+        if last_basis_save.elapsed() >= Duration::from_secs(10) {
+            fair_price.save_basis_cache();
+            last_basis_save = Instant::now();
+        }
+    }
 }
