@@ -583,6 +583,8 @@ impl MmEngine {
 
             if self.shutdown.load(Ordering::Relaxed) {
                 info!("MM engine shutting down");
+                // Let inflight HTTP requests land on exchange before we cancel
+                std::thread::sleep(Duration::from_secs(1));
                 let oms = Arc::clone(&self.oms);
                 let symbol = self.config.symbol.clone();
                 if let Err(e) = tokio::runtime::Handle::current().block_on(
