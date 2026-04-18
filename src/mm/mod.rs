@@ -583,9 +583,14 @@ impl MmEngine {
 
             if self.shutdown.load(Ordering::Relaxed) {
                 info!("MM engine shutting down");
-                self.cancel_all_quotes();
+                let oms = Arc::clone(&self.oms);
+                let symbol = self.config.symbol.clone();
+                if let Err(e) = tokio::runtime::Handle::current().block_on(
+                    oms.shutdown_cancel_all(Some(&symbol))
+                ) {
+                    warn!("shutdown cancel failed: {e:#}");
+                }
                 self.fair_price.save_basis_cache();
-                std::thread::sleep(Duration::from_secs(1));
                 return;
             }
 

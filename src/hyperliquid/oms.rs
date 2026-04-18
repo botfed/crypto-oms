@@ -12,8 +12,8 @@ use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
 
 use super::client::{
-    HyperliquidClient, ClientCancelRequest, ClientLimit, ClientModifyRequest,
-    ClientOrder, ClientOrderRequest, ClientTrigger,
+    HyperliquidClient, ClientCancelRequest, ClientCancelRequestCloid, ClientLimit,
+    ClientModifyRequest, ClientOrder, ClientOrderRequest, ClientTrigger,
 };
 use super::types::*;
 
@@ -199,6 +199,56 @@ impl HyperliquidOms {
 
     pub fn shutdown(&self) {
         self.shutdown.notify_waiters();
+    }
+
+    /// Cancel all orders on the exchange for a symbol — used at shutdown.
+    /// Fetches open orders from REST (no local state dependency) + cancels
+    /// inflight orders by cloid.
+    pub async fn shutdown_cancel_all(&self, symbol: Option<&str>) -> Result<()> {
+        // 1. Cancel all open orders from exchange
+        let open_orders = self.client.fetch_open_orders().await?;
+        let mut oid_cancels = Vec::new();
+        for oo in &open_orders {
+            if let Some(sym) = symbol {
+                if AssetMap::asset_to_canonical(&oo.coin) != sym {
+                    continue;
+                }
+            }
+            let (_, asset_name) = self.resolve_asset(&AssetMap::asset_to_canonical(&oo.coin))?;
+            oid_cancels.push(ClientCancelRequest {
+                asset: asset_name,
+                oid: oo.oid,
+            });
+        }
+        if !oid_cancels.is_empty() {
+            info!("shutdown: cancelling {} open orders by oid", oid_cancels.len());
+            let _ = self.client.exchange().bulk_cancel(oid_cancels, None).await;
+        }
+
+        // 2. Cancel inflight orders by cloid (not yet visible on exchange)
+        let mut cloid_cancels = Vec::new();
+        for entry in self.state.orders.iter() {
+            let h = entry.value();
+            if h.state != OrderState::Inflight {
+                continue;
+            }
+            if let Some(sym) = symbol {
+                if h.symbol != sym {
+                    continue;
+                }
+            }
+            let (_, asset_name) = self.resolve_asset(&h.symbol)?;
+            cloid_cancels.push(ClientCancelRequestCloid {
+                asset: asset_name,
+                cloid: uuid::Uuid::from_u128(h.client_id.0 as u128),
+            });
+        }
+        if !cloid_cancels.is_empty() {
+            info!("shutdown: cancelling {} inflight orders by cloid", cloid_cancels.len());
+            let _ = self.client.exchange().bulk_cancel_by_cloid(cloid_cancels, None).await;
+        }
+
+        Ok(())
     }
 
     // -----------------------------------------------------------------------

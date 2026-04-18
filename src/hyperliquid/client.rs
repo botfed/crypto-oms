@@ -5,8 +5,8 @@ use super::types::*;
 
 // Re-export SDK types used by the OMS
 pub use hyperliquid_rust_sdk::{
-    BaseUrl, ClientCancelRequest, ClientLimit, ClientModifyRequest, ClientOrder,
-    ClientOrderRequest, ClientTrigger, ExchangeClient, ExchangeResponseStatus,
+    BaseUrl, ClientCancelRequest, ClientCancelRequestCloid, ClientLimit, ClientModifyRequest,
+    ClientOrder, ClientOrderRequest, ClientTrigger, ExchangeClient, ExchangeResponseStatus,
 };
 
 // ---------------------------------------------------------------------------
