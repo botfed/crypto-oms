@@ -1426,6 +1426,22 @@ impl MmEngine {
                     }
                 }
             }
+            OmsEvent::OrderPartialFill(fill) => {
+                if self.is_our_order(&fill.client_id) {
+                    info!(
+                        "partial fill: cid={} side={:?} price={:.6} size={:.4}",
+                        fill.client_id.0, fill.side, fill.price, fill.size,
+                    );
+                    self.consecutive_rejects = 0;
+                    self.reject_pause_until = None;
+                    // Check if fully filled
+                    if let Some(h) = self.oms_state.get_order(fill.client_id) {
+                        if h.filled_size >= h.size - 1e-12 {
+                            self.clear_tracker(&fill.client_id);
+                        }
+                    }
+                }
+            }
             OmsEvent::OrderFilled(fill) => {
                 if self.is_our_order(&fill.client_id) {
                     info!(
