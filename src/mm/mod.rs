@@ -33,7 +33,7 @@ pub mod latency {
     pub const METRIC_T2T: u8 = 5;
     pub const METRIC_SIGN: u8 = 6;
     pub const METRIC_TICK_END: u8 = 7;
-    pub const METRIC_LOOP_OVERHEAD: u8 = 8;
+    pub const METRIC_PRECONDITIONS: u8 = 8;
     pub const METRIC_FEED: u8 = 9;
     pub const METRIC_DRAIN: u8 = 10;
     pub const NUM_METRICS: usize = 11;
@@ -699,7 +699,7 @@ impl MmEngine {
                 let t5 = Instant::now(); // end of tick
 
                 self.latency.record(latency::METRIC_DRAIN, (t1 - t0).as_nanos() as u64);
-                self.latency.record(latency::METRIC_LOOP_OVERHEAD, (t2 - t1).as_nanos() as u64);
+                self.latency.record(latency::METRIC_PRECONDITIONS, (t2 - t1).as_nanos() as u64);
                 self.latency.record(latency::METRIC_FAIR, (t3 - t2).as_nanos() as u64);
                 self.latency.record(latency::METRIC_TICK_FAST, (t4 - t3).as_nanos() as u64);
                 self.latency.record(latency::METRIC_TICK_END, (t5 - t3).as_nanos() as u64);
