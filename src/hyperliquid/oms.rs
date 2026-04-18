@@ -307,8 +307,14 @@ impl HyperliquidOms {
                     let prev_filled = handle.filled_size;
                     handle.filled_size = orig_sz - remaining_sz;
 
-                    // Emit fill event if exchange shows more filled than gateway knew
-                    if handle.filled_size - prev_filled > 1e-12 {
+                    let age_exceeded = handle.last_modified
+                        .map(|t| t.elapsed() >= self.config.stray_order_age)
+                        .unwrap_or(true);
+
+                    // Emit fill event if exchange shows more filled than gateway knew.
+                    // Gate on stray_order_age to let WS deliver real fills first
+                    // (poll fills have synthetic fill_ids that can't dedup with WS).
+                    if age_exceeded && handle.filled_size - prev_filled > 1e-12 {
                         let fill = oms_core::Fill {
                             client_id: handle.client_id,
                             exchange_id: handle.exchange_id.clone().unwrap_or_default(),
@@ -334,10 +340,6 @@ impl HyperliquidOms {
                     } else {
                         OrderState::Accepted
                     };
-
-                    let age_exceeded = handle.last_modified
-                        .map(|t| t.elapsed() >= self.config.stray_order_age)
-                        .unwrap_or(true);
 
                     match handle.state {
                         // Already active — just update fill info
