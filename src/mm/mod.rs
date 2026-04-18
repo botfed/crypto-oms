@@ -576,10 +576,10 @@ impl MmEngine {
             let t0 = Instant::now();
 
             // ── DRAIN OMS EVENTS (always first — no `continue` may skip this) ──
-            #[cfg(feature = "profiling")]
-            let t1 = Instant::now();
-
             self.drain_oms_events();
+
+            #[cfg(feature = "profiling")]
+            let t1 = Instant::now(); // after drain
 
             if self.shutdown.load(Ordering::Relaxed) {
                 info!("MM engine shutting down");
@@ -614,7 +614,7 @@ impl MmEngine {
 
             // ── CHECK FOR NEW DATA ──
             #[cfg(feature = "profiling")]
-            let t2 = Instant::now(); // after drain
+            let t2 = Instant::now(); // after preconditions
 
             let Some(tick) = self.resolve_tick() else {
                 continue;
@@ -698,8 +698,8 @@ impl MmEngine {
             if self.warmed_up {
                 let t5 = Instant::now(); // end of tick
 
-                self.latency.record(latency::METRIC_LOOP_OVERHEAD, (t1 - t0).as_nanos() as u64);
-                self.latency.record(latency::METRIC_DRAIN, (t2 - t1).as_nanos() as u64);
+                self.latency.record(latency::METRIC_DRAIN, (t1 - t0).as_nanos() as u64);
+                self.latency.record(latency::METRIC_LOOP_OVERHEAD, (t2 - t1).as_nanos() as u64);
                 self.latency.record(latency::METRIC_FAIR, (t3 - t2).as_nanos() as u64);
                 self.latency.record(latency::METRIC_TICK_FAST, (t4 - t3).as_nanos() as u64);
                 self.latency.record(latency::METRIC_TICK_END, (t5 - t3).as_nanos() as u64);
