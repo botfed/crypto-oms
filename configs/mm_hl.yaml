@@ -55,7 +55,7 @@ strategy:
   vol_symbol: "AIXBT"
   quote_interval_ms: 150
   post_only: false
-  warmup_secs: 10
+  warmup_secs: 5
   max_feed_age_ms: 2000
   stray_order_age_ms: 6000
   factor_model:
