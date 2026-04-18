@@ -770,8 +770,13 @@ impl MmEngine {
             }
         }
 
-        // Check feed is alive (monotonic — no Utc::now syscall)
-        if let Some(recv) = self.trigger_received_instant {
+        // Check feed is alive — read received_instant from seqlock directly
+        // so we can detect recovery while paused (tick loop doesn't run).
+        let live_recv = self
+            .fair_price
+            .get_fair_price_detail(ExchangeId::Hyperliquid, self.hl_symbol_id)
+            .and_then(|(_, _, _, recv, _)| recv);
+        if let Some(recv) = live_recv {
             if recv.elapsed().as_millis() as u64 > self.config.max_feed_age_ms {
                 if should_log {
                     warn!(
