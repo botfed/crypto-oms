@@ -1,7 +1,6 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::Duration;
-use tokio::sync::watch;
 
 use crate::hyperliquid::HyperliquidOmsConfig;
 use crypto_feeds::app_config::AppConfig;
@@ -237,81 +236,3 @@ fn default_stray_age_ms() -> u64 { 1000 }
 fn default_post_only() -> bool { true }
 fn default_warmup_secs() -> u64 { 10 }
 
-// ---------------------------------------------------------------------------
-// MmParamSource trait
-// ---------------------------------------------------------------------------
-
-pub trait MmParamSource: Send + Sync {
-    fn target_position_usd(&self) -> f64;
-    fn order_notional_usd(&self) -> f64;
-    fn max_position_usd(&self) -> f64;
-    fn enabled(&self) -> bool;
-}
-
-// ---------------------------------------------------------------------------
-// WatchParams — MmParamSource backed by watch channels
-// ---------------------------------------------------------------------------
-
-pub struct WatchParams {
-    target_position_usd: watch::Receiver<f64>,
-    order_notional_usd: watch::Receiver<f64>,
-    max_position_usd: watch::Receiver<f64>,
-    enabled: watch::Receiver<bool>,
-}
-
-/// Controller side — hand this to external tasks to update params at runtime.
-pub struct WatchParamController {
-    pub target_position_usd: watch::Sender<f64>,
-    pub order_notional_usd: watch::Sender<f64>,
-    pub max_position_usd: watch::Sender<f64>,
-    pub enabled: watch::Sender<bool>,
-}
-
-impl WatchParams {
-    /// Create from strategy config + a pre-built target_position receiver
-    /// (target comes from the inventory manager, not from strategy config).
-    pub fn new(
-        config: &StrategyConfig,
-        target_rx: watch::Receiver<f64>,
-    ) -> (Self, WatchParamController) {
-        let (size_tx, size_rx) = watch::channel(config.order_notional_usd);
-        let (max_tx, max_rx) = watch::channel(config.max_position_usd);
-        let (en_tx, en_rx) = watch::channel(true);
-
-        let (target_tx, _) = watch::channel(0.0);
-
-        let params = WatchParams {
-            target_position_usd: target_rx,
-            order_notional_usd: size_rx,
-            max_position_usd: max_rx,
-            enabled: en_rx,
-        };
-
-        let controller = WatchParamController {
-            target_position_usd: target_tx,
-            order_notional_usd: size_tx,
-            max_position_usd: max_tx,
-            enabled: en_tx,
-        };
-
-        (params, controller)
-    }
-}
-
-impl MmParamSource for WatchParams {
-    fn target_position_usd(&self) -> f64 {
-        *self.target_position_usd.borrow()
-    }
-
-    fn order_notional_usd(&self) -> f64 {
-        *self.order_notional_usd.borrow()
-    }
-
-    fn max_position_usd(&self) -> f64 {
-        *self.max_position_usd.borrow()
-    }
-
-    fn enabled(&self) -> bool {
-        *self.enabled.borrow()
-    }
-}

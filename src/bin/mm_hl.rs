@@ -4,7 +4,7 @@ use crypto_feeds::historical_bars::{aggregate_bars, load_1m_bars_with_backfill};
 use crypto_feeds::vol_provider::VolProvider;
 use crypto_feeds::AllMarketData;
 use crypto_oms::hyperliquid::HyperliquidOms;
-use crypto_oms::mm::config::{MmConfig, WatchParams};
+use crypto_oms::mm::config::MmConfig;
 use crypto_oms::mm::fair_price::FairPriceEngine;
 use crypto_oms::mm::inventory::start_inventory_manager;
 use crypto_oms::mm::MmEngine;
@@ -140,9 +140,8 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
         shutdown.clone(),
     );
 
-    // Build params (shared across engines)
-    let (params, _controller) = WatchParams::new(&symbols[0], target_rx);
-    let params: Arc<dyn crypto_oms::mm::config::MmParamSource> = Arc::new(params);
+    // target_rx comes from inventory manager — only used when hedge mode is active
+    let use_target_rx = config.inventory.mode == crypto_oms::mm::config::InventoryMode::Hedge;
 
     // Initialize vol provider if vol_models is configured
     let vol_model_name = config.vol_models
@@ -232,11 +231,12 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
     // Build N engines — one per symbol
     let mut engines: Vec<MmEngine> = Vec::with_capacity(symbols.len());
     for (i, sym_cfg) in symbols.iter().enumerate() {
+        let target_rx = if use_target_rx { Some(target_rx.clone()) } else { None };
         let engine = MmEngine::new(
             Arc::clone(&oms),
             Arc::clone(&fair_price),
             Arc::clone(&market_data),
-            Arc::clone(&params),
+            target_rx,
             sym_cfg.clone(),
             ghost,
             i,

@@ -12,7 +12,7 @@ use oms_core::*;
 use tracing::{debug, info, warn};
 
 use crate::hyperliquid::{HyperliquidOms, SignedPayload};
-use config::{MmParamSource, StrategyConfig};
+use config::StrategyConfig;
 use crypto_feeds::MarketDataCollection;
 use crypto_feeds::market_data::InstrumentType;
 use crypto_feeds::symbol_registry::{REGISTRY, SymbolId};
@@ -224,7 +224,7 @@ pub struct MmEngine {
     oms: Arc<HyperliquidOms>,
     fair_price: Arc<FairPriceEngine>,
     market_data: Arc<crypto_feeds::AllMarketData>,
-    params: Arc<dyn MmParamSource>,
+    target_position_rx: Option<tokio::sync::watch::Receiver<f64>>,
     config: StrategyConfig,
     ghost: bool,
     warmed_up: bool,
@@ -260,7 +260,7 @@ impl MmEngine {
         oms: Arc<HyperliquidOms>,
         fair_price: Arc<FairPriceEngine>,
         market_data: Arc<crypto_feeds::AllMarketData>,
-        params: Arc<dyn MmParamSource>,
+        target_position_rx: Option<tokio::sync::watch::Receiver<f64>>,
         config: StrategyConfig,
         ghost: bool,
         vol_group_idx: usize,
@@ -344,7 +344,7 @@ impl MmEngine {
             oms,
             fair_price,
             market_data,
-            params,
+            target_position_rx,
             config,
             ghost,
             warmed_up: false,
@@ -666,13 +666,6 @@ impl MmEngine {
             }
             return false;
         }
-        if !self.params.enabled() {
-            if should_log {
-                warn!("[{}] waiting: params disabled", self.config.symbol);
-                self.last_status_log = Instant::now();
-            }
-            return false;
-        }
         if self.consecutive_rejects >= MAX_CONSECUTIVE_REJECTS {
             if let Some(until) = self.reject_pause_until {
                 if Instant::now() >= until {
@@ -904,7 +897,8 @@ impl MmEngine {
         self.cancel_stray_orders(oms_state);
 
         let position = self.get_position(oms_state);
-        let target = self.params.target_position_usd() / fair;
+        let target_usd = self.target_position_rx.as_ref().map(|rx| *rx.borrow()).unwrap_or(0.0);
+        let target = target_usd / fair;
         let notional = self.config.order_notional_usd;
         let order_size = notional / fair;
         let max_pos = self.config.max_position_usd / fair;
@@ -1192,8 +1186,9 @@ impl MmEngine {
             .fair_price
             .get_basis(ExchangeId::Hyperliquid, self.hl_symbol_id);
         let position = self.get_position(oms_state);
+        let target_usd = self.target_position_rx.as_ref().map(|rx| *rx.borrow()).unwrap_or(0.0);
         let target = fair
-            .map(|f| self.params.target_position_usd() / f)
+            .map(|f| target_usd / f)
             .unwrap_or(0.0);
         let max_pos = fair
             .map(|f| self.config.max_position_usd / f)
