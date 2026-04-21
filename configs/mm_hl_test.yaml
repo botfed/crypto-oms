@@ -4,6 +4,7 @@ hyperliquid:
 
 perp:
   binance: [ETH_USDT, AIXBT_USDT, BRETT_USDT]
+  hyperliquid: [AIXBT_USDC, BRETT_USDC]
 
 sample_interval_ms: 10
 
