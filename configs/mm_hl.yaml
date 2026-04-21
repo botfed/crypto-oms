@@ -3,10 +3,8 @@ hyperliquid:
   inflight_timeout_ms: 5000
 
 perp:
-  binance: [ETH_USDT, AIXBT_USDT]
-  okx: [AIXBT_USDT]
-  bybit: [AIXBT_USDT]
-  hyperliquid: [AIXBT_USDC]
+  binance: [ETH_USDT, AIXBT_USDT, BRETT_USDT]
+  hyperliquid: [AIXBT_USDC, BRETT_USDT]
 
 sample_interval_ms: 10
 
@@ -18,6 +16,10 @@ fair_price:
       target_symbol: PERP_AIXBT_USDC
       reference_exchange: binance
       reference_symbol: PERP_AIXBT_USDT
+    - target_exchange: hyperliquid
+      target_symbol: PERP_BRETT_USDC
+      reference_exchange: binance
+      reference_symbol: PERP_BRETT_USDT
 
 inventory:
   mode: hedge
