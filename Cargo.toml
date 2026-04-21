@@ -30,6 +30,8 @@ chrono = { version = "0.4", features = ["serde"] }
 alloy = { version = "1", default-features = false, features = ["signer-local", "sol-types"] }
 rand = "0.8"
 hex = "0.4"
+sha2 = "0.10"
+hmac = "0.12"
 futures-util = "0.3"
 crypto-feeds = { path = "../crypto-feeds" }
 nado-ws = { path = "../crypto-feeds/crates/nado-ws" }
@@ -61,6 +63,10 @@ path = "src/bin/nado_demo.rs"
 [[bin]]
 name = "nado_link_signer"
 path = "src/bin/nado_link_signer.rs"
+
+[[bin]]
+name = "hibachi_demo"
+path = "src/bin/hibachi_demo.rs"
 
 [[bin]]
 name = "mm_hl"

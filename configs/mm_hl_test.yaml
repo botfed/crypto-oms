@@ -4,9 +4,6 @@ hyperliquid:
 
 perp:
   binance: [ETH_USDT, AIXBT_USDT, BRETT_USDT]
-  okx: [AIXBT_USDT, BRETT_USDT]
-  bybit: [AIXBT_USDT, BRETT_USDT]
-  hyperliquid: [AIXBT_USDC, BRETT_USDC]
 
 sample_interval_ms: 10
 
@@ -18,14 +15,6 @@ fair_price:
     - target_exchange: hyperliquid
       target_symbol: PERP_AIXBT_USDC
       reference_exchange: binance
-      reference_symbol: PERP_AIXBT_USDT
-    - target_exchange: hyperliquid
-      target_symbol: PERP_AIXBT_USDC
-      reference_exchange: okx
-      reference_symbol: PERP_AIXBT_USDT
-    - target_exchange: hyperliquid
-      target_symbol: PERP_AIXBT_USDC
-      reference_exchange: bybit
       reference_symbol: PERP_AIXBT_USDT
     # BRETT pairs
     - target_exchange: hyperliquid

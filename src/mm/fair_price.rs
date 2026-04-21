@@ -59,8 +59,10 @@ pub struct FairPriceEngine {
     seeded: Box<[Cell<bool>]>,
     /// Pre-computed EWMA alpha
     alpha: f64,
-    /// Monotonic guard: last winning received_instant (best-to-best comparison)
-    last_best_received: Cell<Option<std::time::Instant>>,
+    /// Per-target monotonic guard: last winning received_instant per (exchange, symbol).
+    last_best_received: Box<[Cell<Option<std::time::Instant>>]>,
+    /// Maps (target_exchange, target_symbol_id) → index into last_best_received
+    target_index: HashMap<(ExchangeId, SymbolId), usize>,
     pairs: Vec<ResolvedPair>,
     config: FairPriceConfig,
 }
@@ -121,6 +123,16 @@ impl FairPriceEngine {
         let dt_secs = config.basis_tick_ms as f64 / 1000.0;
         let alpha = 1.0 - (-dt_secs * std::f64::consts::LN_2 / config.basis_halflife_secs).exp();
 
+        // Build per-target monotonic guard index
+        let mut target_index: HashMap<(ExchangeId, SymbolId), usize> = HashMap::new();
+        for pair in &pairs {
+            let key = (pair.target_exchange, pair.target_symbol_id);
+            let next = target_index.len();
+            target_index.entry(key).or_insert(next);
+        }
+        let last_best_received: Box<[Cell<Option<std::time::Instant>>]> =
+            (0..target_index.len()).map(|_| Cell::new(None)).collect();
+
         // Load cached basis from disk
         load_basis_cache(&config.basis_cache_path, &pairs, &basis, &seeded);
 
@@ -129,7 +141,8 @@ impl FairPriceEngine {
             basis,
             seeded,
             alpha,
-            last_best_received: Cell::new(None),
+            last_best_received,
+            target_index,
             pairs,
             config,
         })
@@ -175,14 +188,17 @@ impl FairPriceEngine {
         }
 
         best.and_then(|(price, ex_ts, idx, received_instant, feed_lat)| {
-            // Monotonic guard: received_instant must not go backwards
+            // Per-target monotonic guard: received_instant must not go backwards
             if let Some(recv) = received_instant {
-                if let Some(last) = self.last_best_received.get() {
-                    if recv < last {
-                        return None;
+                let target_key = (self.pairs[idx].target_exchange, self.pairs[idx].target_symbol_id);
+                if let Some(&ti) = self.target_index.get(&target_key) {
+                    if let Some(last) = self.last_best_received[ti].get() {
+                        if recv < last {
+                            return None;
+                        }
                     }
+                    self.last_best_received[ti].set(Some(recv));
                 }
-                self.last_best_received.set(Some(recv));
             }
             let ref_name = match self.pairs[idx].reference_exchange {
                 ExchangeId::Binance => "binance",

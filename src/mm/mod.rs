@@ -43,7 +43,9 @@ pub mod latency {
     pub const SAMPLES_PER_METRIC: usize = 1_048_576;
     pub const METRIC_SECTION: usize = METRIC_HEADER + SAMPLES_PER_METRIC * SAMPLE_SIZE;
     pub const FILE_SIZE: usize = GLOBAL_HEADER + NUM_METRICS * METRIC_SECTION;
-    pub const LATENCY_PATH: &str = "/tmp/mm_latency.bin";
+    pub fn latency_path(symbol: &str) -> String {
+        format!("/tmp/mm_latency_{symbol}.bin")
+    }
 
     /// Direct-to-mmap recorder. No mutex, no buffering, no background task.
     /// Single-threaded: only the engine spin loop calls record().
@@ -80,14 +82,15 @@ pub mod latency {
         GLOBAL_HEADER + metric * METRIC_SECTION
     }
 
-    /// Initialize the profiler. Returns a recorder for the hot loop.
-    pub fn init() -> LatencyRecorder {
+    /// Initialize the profiler for a specific symbol. Returns a recorder for the hot loop.
+    pub fn init(symbol: &str) -> LatencyRecorder {
+        let path = latency_path(symbol);
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .open(LATENCY_PATH)
-            .expect("failed to open latency mmap file");
+            .open(&path)
+            .unwrap_or_else(|e| panic!("failed to open latency mmap file {path}: {e}"));
         file.set_len(FILE_SIZE as u64)
             .expect("failed to set latency file size");
 
@@ -282,7 +285,7 @@ impl MmEngine {
             .ok_or_else(|| anyhow::anyhow!("symbol not in registry: {}", config.symbol))?;
 
         #[cfg(feature = "profiling")]
-        let latency = latency::init();
+        let latency = latency::init(&config.symbol);
 
         // Initialize factor model if configured
         let factor_model = if let Some(ref fm_cfg) = config.factor_model {

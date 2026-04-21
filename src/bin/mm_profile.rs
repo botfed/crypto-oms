@@ -1,7 +1,7 @@
 //! Latency profiler viewer for the MM engine.
-//! Reads samples from the shared mmap file and displays percentile tables.
+//! Reads per-ticker mmap files and displays aggregate + per-ticker percentile tables.
 //!
-//! Usage: cargo run --bin mm_profile
+//! Usage: cargo run --bin mm_profile [--detail]
 
 use std::fmt::Write as FmtWrite;
 use std::io::{Write, stdout};
@@ -16,9 +16,10 @@ const METRIC_HEADER: usize = 16;
 const SAMPLE_SIZE: usize = 8;
 const SAMPLES_PER_METRIC: usize = 1_048_576;
 const METRIC_SECTION: usize = METRIC_HEADER + SAMPLES_PER_METRIC * SAMPLE_SIZE;
-const LATENCY_PATH: &str = "/tmp/mm_latency.bin";
-
-const METRIC_NAMES: &[&str] = &["tick_fast", "rt2d", "fair_calc", "vol_calc", "tick_slow", "rt2t", "sign", "tick_end", "precond", "feed", "drain"];
+const METRIC_NAMES: &[&str] = &[
+    "tick_fast", "rt2d", "fair_calc", "vol_calc", "tick_slow",
+    "rt2t", "sign", "tick_end", "precond", "feed", "drain",
+];
 
 const CURSOR_HOME: &str = "\x1B[H";
 const CURSOR_HIDE: &str = "\x1B[?25l";
@@ -80,8 +81,72 @@ fn metric_offset(metric: usize) -> usize {
     GLOBAL_HEADER + metric * METRIC_SECTION
 }
 
-fn render_frame(mmap: &memmap2::Mmap, start_time: Instant) -> String {
-    let mut buf = String::with_capacity(2048);
+struct TickerFile {
+    name: String,
+    mmap: memmap2::Mmap,
+}
+
+/// Read samples for a given metric from one mmap file.
+fn read_metric_samples(mmap: &memmap2::Mmap, mi: usize, num_metrics: usize) -> Vec<u64> {
+    if mi >= num_metrics { return Vec::new(); }
+    let off = metric_offset(mi);
+    let write_pos = u64::from_le_bytes(mmap[off..off + 8].try_into().unwrap());
+    let capacity = u64::from_le_bytes(mmap[off + 8..off + 16].try_into().unwrap()) as usize;
+    if write_pos == 0 || capacity == 0 { return Vec::new(); }
+
+    let n = write_pos.min(capacity as u64) as usize;
+    let start = if write_pos > capacity as u64 { write_pos - capacity as u64 } else { 0 };
+
+    let mut samples = Vec::with_capacity(n);
+    for pos in start..write_pos {
+        let idx = (pos % capacity as u64) as usize;
+        let sample_off = off + METRIC_HEADER + idx * SAMPLE_SIZE;
+        if sample_off + SAMPLE_SIZE > mmap.len() { break; }
+        let value = u64::from_le_bytes(mmap[sample_off..sample_off + 8].try_into().unwrap());
+        if value > 0 {
+            samples.push(value);
+        }
+    }
+    samples
+}
+
+fn get_num_metrics(mmap: &memmap2::Mmap) -> usize {
+    let n = u64::from_le_bytes(mmap[0..8].try_into().unwrap()) as usize;
+    if n > 0 && n <= 64 { n } else { 0 }
+}
+
+fn write_table_header(buf: &mut String) {
+    let _ = writeln!(buf,
+        "  {:<9}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}",
+        "metric", "min", "p1", "p5", "p25", "p50", "p75", "p95", "p99", "p99.9", "max", "n");
+    let _ = writeln!(buf,
+        "  {:-<9}  {:->8}  {:->8}  {:->8}  {:->8}  {:->8}  {:->8}  {:->8}  {:->8}  {:->8}  {:->8}  {:->8}",
+        "", "", "", "", "", "", "", "", "", "", "", "");
+}
+
+fn write_metric_row(buf: &mut String, name: &str, samples: &mut Vec<u64>) {
+    if samples.is_empty() { return; }
+    samples.sort_unstable();
+    let sn = samples.len();
+    let _ = writeln!(buf,
+        "  {:<9}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}",
+        name,
+        fmt_ns(samples[0]),
+        fmt_ns(percentile(samples, 1.0)),
+        fmt_ns(percentile(samples, 5.0)),
+        fmt_ns(percentile(samples, 25.0)),
+        fmt_ns(percentile(samples, 50.0)),
+        fmt_ns(percentile(samples, 75.0)),
+        fmt_ns(percentile(samples, 95.0)),
+        fmt_ns(percentile(samples, 99.0)),
+        fmt_ns(percentile(samples, 99.9)),
+        fmt_ns(samples[sn - 1]),
+        sn,
+    );
+}
+
+fn render_frame(tickers: &[TickerFile], start_time: Instant, detail: bool) -> String {
+    let mut buf = String::with_capacity(4096);
 
     // Header
     let elapsed = start_time.elapsed().as_secs();
@@ -89,22 +154,24 @@ fn render_frame(mmap: &memmap2::Mmap, start_time: Instant) -> String {
     let m = (elapsed % 3600) / 60;
     let s = elapsed % 60;
     let now = Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
-    let _ = writeln!(buf, "  MM Latency Profile   uptime: {:02}:{:02}:{:02}   {}", h, m, s, now);
+    let ticker_names: Vec<&str> = tickers.iter().map(|t| t.name.as_str()).collect();
+    let _ = writeln!(buf,
+        "  MM Latency Profile   uptime: {:02}:{:02}:{:02}   {}   tickers: [{}]",
+        h, m, s, now, ticker_names.join(", "));
 
-    let num_metrics = u64::from_le_bytes(mmap[0..8].try_into().unwrap()) as usize;
-    if num_metrics == 0 || num_metrics > 64 {
-        let _ = writeln!(buf, "  Waiting for samples...");
-        return buf;
-    }
-
-    // Compute total samples across all metrics
+    // Count total samples across all tickers
     let mut total_samples: u64 = 0;
-    for mi in 0..num_metrics.min(METRIC_NAMES.len()) {
-        let off = metric_offset(mi);
-        let wp = u64::from_le_bytes(mmap[off..off + 8].try_into().unwrap());
-        total_samples += wp;
+    let mut max_metrics: usize = 0;
+    for tf in tickers {
+        let nm = get_num_metrics(&tf.mmap);
+        max_metrics = max_metrics.max(nm);
+        for mi in 0..nm.min(METRIC_NAMES.len()) {
+            let off = metric_offset(mi);
+            let wp = u64::from_le_bytes(tf.mmap[off..off + 8].try_into().unwrap());
+            total_samples += wp;
+        }
     }
-    let _ = writeln!(buf, "  total samples: {}   file: {}", total_samples, LATENCY_PATH);
+    let _ = writeln!(buf, "  total samples: {}   files: {}", total_samples, tickers.len());
     let _ = writeln!(buf);
 
     if total_samples == 0 {
@@ -112,55 +179,36 @@ fn render_frame(mmap: &memmap2::Mmap, start_time: Instant) -> String {
         return buf;
     }
 
-    // Table header
-    let _ = writeln!(buf,
-        "  {:<9}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}",
-        "metric", "min", "p1", "p5", "p25", "p50", "p75", "p95", "p99", "p99.9", "max", "n");
-    let _ = writeln!(buf,
-        "  {:-<9}  {:->8}  {:->8}  {:->8}  {:->8}  {:->8}  {:->8}  {:->8}  {:->8}  {:->8}  {:->8}  {:->8}",
-        "", "", "", "", "", "", "", "", "", "", "", "");
+    // Aggregate table
+    let _ = writeln!(buf, "  === AGGREGATE ===");
+    write_table_header(&mut buf);
 
-    // Table rows — one per metric
     for (mi, name) in METRIC_NAMES.iter().enumerate() {
-        if mi >= num_metrics { break; }
-        let off = metric_offset(mi);
-        let write_pos = u64::from_le_bytes(mmap[off..off + 8].try_into().unwrap());
-        let capacity = u64::from_le_bytes(mmap[off + 8..off + 16].try_into().unwrap()) as usize;
-        if write_pos == 0 || capacity == 0 { continue; }
+        if mi >= max_metrics { break; }
+        let mut combined: Vec<u64> = Vec::new();
+        for tf in tickers {
+            let nm = get_num_metrics(&tf.mmap);
+            combined.extend(read_metric_samples(&tf.mmap, mi, nm));
+        }
+        write_metric_row(&mut buf, name, &mut combined);
+    }
 
-        let n = write_pos.min(capacity as u64) as usize;
-        let start = if write_pos > capacity as u64 { write_pos - capacity as u64 } else { 0 };
+    // Per-ticker detail
+    if detail {
+        for tf in tickers {
+            let nm = get_num_metrics(&tf.mmap);
+            if nm == 0 { continue; }
 
-        let mut samples = Vec::with_capacity(n);
-        for pos in start..write_pos {
-            let idx = (pos % capacity as u64) as usize;
-            let sample_off = off + METRIC_HEADER + idx * SAMPLE_SIZE;
-            if sample_off + SAMPLE_SIZE > mmap.len() { break; }
-            let value = u64::from_le_bytes(mmap[sample_off..sample_off + 8].try_into().unwrap());
-            if value > 0 {
-                samples.push(value);
+            let _ = writeln!(buf);
+            let _ = writeln!(buf, "  === {} ===", tf.name);
+            write_table_header(&mut buf);
+
+            for (mi, name) in METRIC_NAMES.iter().enumerate() {
+                if mi >= nm { break; }
+                let mut samples = read_metric_samples(&tf.mmap, mi, nm);
+                write_metric_row(&mut buf, name, &mut samples);
             }
         }
-
-        if samples.is_empty() { continue; }
-        samples.sort_unstable();
-        let sn = samples.len();
-
-        let _ = writeln!(buf,
-            "  {:<9}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}",
-            name,
-            fmt_ns(samples[0]),
-            fmt_ns(percentile(&samples, 1.0)),
-            fmt_ns(percentile(&samples, 5.0)),
-            fmt_ns(percentile(&samples, 25.0)),
-            fmt_ns(percentile(&samples, 50.0)),
-            fmt_ns(percentile(&samples, 75.0)),
-            fmt_ns(percentile(&samples, 95.0)),
-            fmt_ns(percentile(&samples, 99.0)),
-            fmt_ns(percentile(&samples, 99.9)),
-            fmt_ns(samples[sn - 1]),
-            sn,
-        );
     }
 
     let _ = writeln!(buf);
@@ -169,25 +217,51 @@ fn render_frame(mmap: &memmap2::Mmap, start_time: Instant) -> String {
     buf
 }
 
-fn main() {
-    // Wait for the latency file to appear
-    eprintln!("Waiting for {} ...", LATENCY_PATH);
-    let file = loop {
-        match std::fs::OpenOptions::new().read(true).open(LATENCY_PATH) {
-            Ok(f) => break f,
-            Err(_) => thread::sleep(Duration::from_secs(1)),
-        }
+fn discover_ticker_files() -> Vec<TickerFile> {
+    let mut tickers = Vec::new();
+    let entries = match std::fs::read_dir("/tmp") {
+        Ok(e) => e,
+        Err(_) => return tickers,
     };
+    for entry in entries.flatten() {
+        let fname = entry.file_name();
+        let fname = fname.to_string_lossy();
+        if !fname.starts_with("mm_latency_") || !fname.ends_with(".bin") { continue; }
 
-    let mmap = unsafe {
-        memmap2::Mmap::map(&file).expect("failed to mmap")
-    };
+        let name = fname
+            .strip_prefix("mm_latency_")
+            .and_then(|s| s.strip_suffix(".bin"))
+            .unwrap_or("unknown")
+            .to_string();
 
-    // Wait for global header to be written
-    loop {
+        let file = match std::fs::OpenOptions::new().read(true).open(entry.path()) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let mmap = match unsafe { memmap2::Mmap::map(&file) } {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if mmap.len() < GLOBAL_HEADER { continue; }
+
         let num_metrics = u64::from_le_bytes(mmap[0..8].try_into().unwrap()) as usize;
-        if num_metrics > 0 && num_metrics <= 64 { break; }
-        eprintln!("Waiting for MM process to initialize profiling...");
+        if num_metrics == 0 || num_metrics > 64 { continue; }
+
+        tickers.push(TickerFile { name, mmap });
+    }
+    tickers.sort_by(|a, b| a.name.cmp(&b.name));
+    tickers
+}
+
+fn main() {
+    let detail = std::env::args().any(|a| a == "--detail" || a == "-d");
+
+    eprintln!("Waiting for latency files (/tmp/mm_latency_*.bin) ...");
+
+    // Wait for at least one file with valid data
+    loop {
+        let tickers = discover_ticker_files();
+        if !tickers.is_empty() { break; }
         thread::sleep(Duration::from_secs(1));
     }
 
@@ -200,7 +274,7 @@ fn main() {
         let _ = out.flush();
     }
 
-    // Ctrl-C handler: restore cursor and exit immediately
+    // Ctrl-C handler: restore cursor and exit
     ctrlc::set_handler(move || {
         use std::os::unix::io::AsRawFd;
         let fd = std::io::stdout().as_raw_fd();
@@ -209,7 +283,10 @@ fn main() {
     }).ok();
 
     loop {
-        let raw = render_frame(&mmap, start_time);
+        // Re-discover files each frame (new tickers may appear)
+        let tickers = discover_ticker_files();
+
+        let raw = render_frame(&tickers, start_time, detail);
         let frame = prepare_frame(&raw);
 
         {
