@@ -247,7 +247,7 @@ impl FairPriceEngine {
         total
     }
 
-    /// Read live mid from any exchange (for diagnostics).
+    /// Read live mid from any exchange.
     pub fn get_mid(&self, exchange: ExchangeId, symbol_id: SymbolId) -> Option<f64> {
         self.collection_for(exchange).get_midquote(&symbol_id)
     }
