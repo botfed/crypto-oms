@@ -249,6 +249,7 @@ pub struct MmEngine {
     last_direct_exchange_ts_ms: i64, // freshest direct tick exchange_ts (for factor snapshot gating)
     factor_model: Option<FactorModelState>,
     cached_vol_mult: f64,
+    cached_skew_bps: f64,
     presigned_cancels: HashMap<ClientOrderId, SignedPayload>,
     // TODO: per-engine profiling files for multi-ticker
     #[cfg(feature = "profiling")]
@@ -367,6 +368,7 @@ impl MmEngine {
             last_direct_exchange_ts_ms: 0,
             factor_model,
             cached_vol_mult: 1.0,
+            cached_skew_bps: 0.0,
             presigned_cancels: HashMap::new(),
             #[cfg(feature = "profiling")]
             latency,
@@ -808,18 +810,19 @@ impl MmEngine {
             return;
         }
 
+        let mid = self.skewed_mid(fair);
         let min_edge = self.config.min_edge_bps * fair / 10_000.0;
         let min_spread =
             (self.config.ref_min_spread_bps * self.cached_vol_mult * fair / 10_000.0).max(min_edge);
 
-        // Check bid: inside min_spread from fair?
+        // Check bid: inside min_spread from skewed mid?
         if let Some(ref q) = self.bid_quote {
             let state = oms_state.get_order(q.client_id).map(|h| h.state);
             let can_cancel = matches!(
                 state,
                 Some(OrderState::Accepted) | Some(OrderState::PartiallyFilled)
             );
-            if can_cancel && q.price > self.oms.round_price(fair - min_spread) {
+            if can_cancel && q.price > self.oms.round_price(mid - min_spread) {
                 #[cfg(feature = "profiling")]
                 let sign_start = Instant::now();
                 let signed = if let Some(s) = self.presigned_cancels.remove(&q.client_id) {
@@ -851,14 +854,14 @@ impl MmEngine {
             }
         }
 
-        // Check ask: inside min_spread from fair?
+        // Check ask: inside min_spread from skewed mid?
         if let Some(ref q) = self.ask_quote {
             let state = oms_state.get_order(q.client_id).map(|h| h.state);
             let can_cancel = matches!(
                 state,
                 Some(OrderState::Accepted) | Some(OrderState::PartiallyFilled)
             );
-            if can_cancel && q.price < self.oms.round_price(fair + min_spread) {
+            if can_cancel && q.price < self.oms.round_price(mid + min_spread) {
                 #[cfg(feature = "profiling")]
                 let sign_start = Instant::now();
                 let signed = if let Some(s) = self.presigned_cancels.remove(&q.client_id) {
@@ -913,7 +916,8 @@ impl MmEngine {
         let requote_thresh =
             self.config.ref_requote_tolerance_bps * self.cached_vol_mult * fair / 10_000.0;
 
-        let skewed_mid = self.compute_skewed_mid(fair, position, target);
+        self.cached_skew_bps = self.compute_skew_bps(fair, position, target);
+        let skewed_mid = self.skewed_mid(fair);
         let (desired_bid, desired_ask) = Self::clamp_to_fair(
             fair,
             skewed_mid - half_spread,
@@ -1113,12 +1117,16 @@ impl MmEngine {
     // Inventory skew
     // -----------------------------------------------------------------------
 
-    fn compute_skewed_mid(&self, fair_value: f64, position: f64, target: f64) -> f64 {
+    fn compute_skew_bps(&self, fair_value: f64, position: f64, target: f64) -> f64 {
         let diff_usd = (target - position) * fair_value;
         let scale = self.config.skew_scale_usd.unwrap_or(100.0);
-        let skew_bps = (diff_usd / scale * self.config.max_skew_bps)
-            .clamp(-self.config.max_skew_bps, self.config.max_skew_bps);
-        fair_value + skew_bps * fair_value / 10_000.0
+        (diff_usd / scale * self.config.max_skew_bps)
+            .clamp(-self.config.max_skew_bps, self.config.max_skew_bps)
+    }
+
+    #[inline]
+    fn skewed_mid(&self, fair: f64) -> f64 {
+        fair + self.cached_skew_bps * fair / 10_000.0
     }
 
     #[cfg(feature = "profiling")]
@@ -1193,9 +1201,8 @@ impl MmEngine {
             _ => 0.0,
         };
 
-        let skew_bps = if let Some(f) = fair {
-            let skewed = self.compute_skewed_mid(f, position, target);
-            (skewed - f) / f * 10_000.0
+        let skew_bps = if let Some(_f) = fair {
+            self.cached_skew_bps
         } else {
             0.0
         };
