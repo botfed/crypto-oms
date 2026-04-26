@@ -256,7 +256,7 @@ pub struct MmEngine {
 }
 
 const MAX_CONSECUTIVE_REJECTS: u32 = 5;
-const REJECT_COOLDOWN: Duration = Duration::from_secs(30);
+const REJECT_COOLDOWN: Duration = Duration::from_secs(1);
 
 impl MmEngine {
     pub fn new(
