@@ -122,7 +122,10 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
     oms.start();
 
     anyhow::ensure!(!config.symbols.is_empty(), "config must have at least one symbol in 'symbols'");
-    let symbols = config.symbols;
+    let mut symbols = config.symbols;
+    for sym in &mut symbols {
+        sym.skew_scale_usd.get_or_insert(config.skew_scale_usd);
+    }
 
     // FairPriceEngine — basis updated by engine in slow path, no background task
     let fair_price = Arc::new(FairPriceEngine::new(market_data.clone(), config.fair_price)?);

@@ -913,7 +913,7 @@ impl MmEngine {
         let requote_thresh =
             self.config.ref_requote_tolerance_bps * self.cached_vol_mult * fair / 10_000.0;
 
-        let skewed_mid = self.compute_skewed_mid(fair, position, target, max_pos);
+        let skewed_mid = self.compute_skewed_mid(fair, position, target);
         let (desired_bid, desired_ask) = Self::clamp_to_fair(
             fair,
             skewed_mid - half_spread,
@@ -922,8 +922,8 @@ impl MmEngine {
         );
 
         // Determine if we should quote each side (position limits)
-        let want_bid = position < max_pos;
-        let want_ask = position > -max_pos;
+        let want_bid = position - target < max_pos;
+        let want_ask = position - target > -max_pos;
 
         // ── CANCEL stale/outer-side quotes ──
 
@@ -1113,19 +1113,10 @@ impl MmEngine {
     // Inventory skew
     // -----------------------------------------------------------------------
 
-    fn compute_skewed_mid(&self, fair_value: f64, position: f64, target: f64, max_pos: f64) -> f64 {
-        let diff = target - position;
-        if diff.abs() < 1e-12 {
-            return fair_value;
-        }
-        let denom = if target.abs() > 1e-12 {
-            target.abs()
-        } else {
-            max_pos
-        };
-        let raw = diff.signum() * (1.0 + diff.abs() / denom).ln();
-        let normalized = raw / std::f64::consts::LN_2;
-        let skew_bps = (normalized * self.config.max_skew_bps)
+    fn compute_skewed_mid(&self, fair_value: f64, position: f64, target: f64) -> f64 {
+        let diff_usd = (target - position) * fair_value;
+        let scale = self.config.skew_scale_usd.unwrap_or(100.0);
+        let skew_bps = (diff_usd / scale * self.config.max_skew_bps)
             .clamp(-self.config.max_skew_bps, self.config.max_skew_bps);
         fair_value + skew_bps * fair_value / 10_000.0
     }
@@ -1203,7 +1194,7 @@ impl MmEngine {
         };
 
         let skew_bps = if let Some(f) = fair {
-            let skewed = self.compute_skewed_mid(f, position, target, max_pos);
+            let skewed = self.compute_skewed_mid(f, position, target);
             (skewed - f) / f * 10_000.0
         } else {
             0.0
@@ -1261,8 +1252,11 @@ impl MmEngine {
             .map(|vp| vp.ann_vol(self.vol_group_idx))
             .unwrap_or(0.0);
 
+        let want_bid = position - target < max_pos;
+        let want_ask = position - target > -max_pos;
+
         info!(
-            "[{}] fair={:.6} hl_mid={:.6} resid={:+.2}bps basis={:+.2}bps factor={:+.2}bps skew={:+.2}bps vol={:.1}% vmult={:.2} band=[{:.1},{:.1},{:.1}]bps pos={:+.6} target={:+.6} bid={} ask={} ref={}@{}ms",
+            "[{}] fair={:.6} hl_mid={:.6} resid={:+.2}bps basis={:+.2}bps factor={:+.2}bps skew={:+.2}bps vol={:.1}% vmult={:.2} band=[{:.1},{:.1},{:.1}]bps pos={:+.6} target={:+.6} maxpos={:.4} want=[{},{}] bid={} ask={} ref={}@{}ms",
             self.config.symbol,
             fair.unwrap_or(0.0),
             hl_mid.unwrap_or(0.0),
@@ -1277,6 +1271,9 @@ impl MmEngine {
             adj_spread_bps + adj_requote_bps,
             position,
             target,
+            max_pos,
+            want_bid as u8,
+            want_ask as u8,
             bid_str,
             ask_str,
             ref_feed,

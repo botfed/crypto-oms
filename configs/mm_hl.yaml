@@ -42,6 +42,8 @@ inventory:
       ZORA:
         - "0x1111111111166b7FE7bd91427724B487980aFc69"
 
+skew_scale_usd: 100.0
+
 vol_models:
   params_dir: "../botfed-params/vol"
   bar_data_dir: "../data/binance_ohlcv/perps/1m"

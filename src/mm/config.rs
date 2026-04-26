@@ -25,6 +25,10 @@ pub struct MmConfig {
     pub inventory: InventoryConfig,
     pub symbols: Vec<StrategyConfig>,
 
+    /// Global default: USD deviation from target at which inventory skew hits max_skew_bps
+    #[serde(default = "default_skew_scale_usd")]
+    pub skew_scale_usd: f64,
+
     /// Optional vol model config for vol-adjusted spreads
     #[serde(default)]
     pub vol_models: Option<crypto_feeds::app_config::VolModelConfig>,
@@ -154,9 +158,12 @@ pub struct StrategyConfig {
     pub order_notional_usd: f64,
     /// Max absolute position before hard pause
     pub max_position_usd: f64,
-    /// Max inventory skew in bps (log formula, capped at this value)
+    /// Max inventory skew in bps (linear ramp, clamped at this value)
     #[serde(default = "default_max_skew")]
     pub max_skew_bps: f64,
+    /// USD deviation from target at which skew hits max_skew_bps (overrides global)
+    #[serde(default)]
+    pub skew_scale_usd: Option<f64>,
     /// Absolute minimum edge from fair in bps — hard floor, never quotes closer
     #[serde(default = "default_min_edge_bps")]
     pub min_edge_bps: f64,
@@ -225,6 +232,7 @@ pub struct FactorConfig {
 }
 
 fn default_max_skew() -> f64 { 5.0 }
+fn default_skew_scale_usd() -> f64 { 100.0 }
 fn default_min_edge_bps() -> f64 { 0.1 }
 fn default_requote_tolerance() -> f64 { 1.5 }
 fn default_ref_vol() -> f64 { 1.0 }
