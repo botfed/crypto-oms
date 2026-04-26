@@ -13,6 +13,10 @@ fair_price:
   basis_tick_ms: 100
   pairs:
     - target_exchange: hyperliquid
+      target_symbol: PERP_ETH_USDC
+      reference_exchange: binance
+      reference_symbol: PERP_ETH_USDT
+    - target_exchange: hyperliquid
       target_symbol: PERP_AIXBT_USDC
       reference_exchange: binance
       reference_symbol: PERP_AIXBT_USDT
@@ -60,12 +64,6 @@ symbols:
     warmup_secs: 10
     max_feed_age_ms: 10000
     stray_order_age_ms: 6000
-    factor_model:
-      enabled: true
-      factors:
-        - symbol: PERP_ETH_USDT
-          exchanges: [binance]
-          beta: 0.97
   - symbol: PERP_AIXBT_USDC
     max_stale_ms: 2000
     order_notional_usd: 100.0
