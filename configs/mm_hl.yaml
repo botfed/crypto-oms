@@ -33,9 +33,10 @@ inventory:
     exposure_file: "/tmp/aerobot/0x313b6755EFe1A31E16aa7D375AE918384ACD737e.json"
     poll_ms: 100
     mappings:
+      ETH:
+        - "0x4200000000000000000000000000000000000006"
       BTC:
-        - "0xWBTC_ADDRESS"
-        - "0xcbBTC_ADDRESS"
+        - "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"
       AIXBT:
         - "0x4F9Fd6Be4a90f2620860d680c0d4d5Fb53d1A825"
 
