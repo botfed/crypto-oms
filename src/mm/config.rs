@@ -29,6 +29,10 @@ pub struct MmConfig {
     #[serde(default = "default_skew_scale_usd")]
     pub skew_scale_usd: f64,
 
+    /// Global default: use PostOnly (true) or GTC (false) for quotes
+    #[serde(default = "default_post_only")]
+    pub post_only: bool,
+
     /// Optional vol model config for vol-adjusted spreads
     #[serde(default)]
     pub vol_models: Option<crypto_feeds::app_config::VolModelConfig>,
@@ -199,9 +203,9 @@ pub struct StrategyConfig {
     /// Minimum age (ms) before an unrecognized order is treated as stray and cancelled
     #[serde(default = "default_stray_age_ms")]
     pub stray_order_age_ms: u64,
-    /// Use PostOnly (true) or GTC (false) for quotes
-    #[serde(default = "default_post_only")]
-    pub post_only: bool,
+    /// Use PostOnly (true) or GTC (false) for quotes (overrides global)
+    #[serde(default)]
+    pub post_only: Option<bool>,
     /// Warmup period in seconds before placing first quotes (let EWMA settle)
     #[serde(default = "default_warmup_secs")]
     pub warmup_secs: u64,

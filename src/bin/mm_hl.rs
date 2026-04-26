@@ -125,6 +125,7 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
     let mut symbols = config.symbols;
     for sym in &mut symbols {
         sym.skew_scale_usd.get_or_insert(config.skew_scale_usd);
+        sym.post_only.get_or_insert(config.post_only);
     }
 
     // FairPriceEngine — basis updated by engine in slow path, no background task

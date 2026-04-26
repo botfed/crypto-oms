@@ -995,7 +995,7 @@ impl MmEngine {
 
         if self.bid_quote.is_none() && want_bid && self.ghost {}
         if self.bid_quote.is_none() && want_bid && !self.ghost {
-            let tif = if self.config.post_only {
+            let tif = if self.config.post_only.unwrap_or(true) {
                 TimeInForce::PostOnly
             } else {
                 TimeInForce::GTC
@@ -1052,7 +1052,7 @@ impl MmEngine {
         }
 
         if self.ask_quote.is_none() && want_ask && !self.ghost {
-            let tif = if self.config.post_only {
+            let tif = if self.config.post_only.unwrap_or(true) {
                 TimeInForce::PostOnly
             } else {
                 TimeInForce::GTC
