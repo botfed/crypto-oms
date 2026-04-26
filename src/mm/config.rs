@@ -53,6 +53,7 @@ impl MmConfig {
             fair_price: Default::default(),
             vol_models: None,
             clock_correction: ClockCorrectionConfig::default(),
+            trades: Default::default(),
         }
     }
 
