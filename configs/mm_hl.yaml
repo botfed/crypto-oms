@@ -57,8 +57,8 @@ symbols:
     order_notional_usd: 100.0
     max_position_usd: 100000.0
     ref_half_spread_bps: 2
-    ref_min_spread_bps: 0.5
-    ref_requote_tolerance_bps: 10.0
+    ref_min_spread_bps: 0.25
+    ref_requote_tolerance_bps: 5.0
     max_skew_bps: 10.0
     min_edge_bps: 0.1
     ref_vol: 0.35
