@@ -3,8 +3,8 @@ hyperliquid:
   inflight_timeout_ms: 5000
 
 perp:
-  binance: [ETH_USDT, AIXBT_USDT, BRETT_USDT]
-  hyperliquid: [ETH_USDC, AIXBT_USDC, BRETT_USDC]
+  binance: [ETH_USDT, ZORA_USDT, BRETT_USDT]
+  hyperliquid: [ETH_USDC, ZORA_USDC, BRETT_USDC]
 
 sample_interval_ms: 10
 
@@ -17,9 +17,9 @@ fair_price:
       reference_exchange: binance
       reference_symbol: PERP_ETH_USDT
     - target_exchange: hyperliquid
-      target_symbol: PERP_AIXBT_USDC
+      target_symbol: PERP_ZORA_USDC
       reference_exchange: binance
-      reference_symbol: PERP_AIXBT_USDT
+      reference_symbol: PERP_ZORA_USDT
     - target_exchange: hyperliquid
       target_symbol: PERP_BRETT_USDC
       reference_exchange: binance
@@ -39,6 +39,8 @@ inventory:
         - "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"
       AIXBT:
         - "0x4F9Fd6Be4a90f2620860d680c0d4d5Fb53d1A825"
+      ZORA:
+        - "0x1111111111166b7FE7bd91427724B487980aFc69"
 
 vol_models:
   params_dir: "../botfed-params/vol"
@@ -65,7 +67,7 @@ symbols:
     warmup_secs: 10
     max_feed_age_ms: 10000
     stray_order_age_ms: 6000
-  - symbol: PERP_AIXBT_USDC
+  - symbol: PERP_ZORA_USDC
     max_stale_ms: 2000
     order_notional_usd: 100.0
     max_position_usd: 10000.0
@@ -77,7 +79,7 @@ symbols:
     ref_vol: 1.00
     vol_mult_floor: 0.3
     vol_mult_cap: 5.0
-    vol_symbol: "AIXBT"
+    vol_symbol: "ZORA"
     quote_interval_ms: 150
     post_only: false
     warmup_secs: 10
