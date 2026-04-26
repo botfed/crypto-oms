@@ -812,17 +812,18 @@ impl MmEngine {
 
         let mid = self.skewed_mid(fair);
         let min_edge = self.config.min_edge_bps * fair / 10_000.0;
-        let min_spread =
-            (self.config.ref_min_spread_bps * self.cached_vol_mult * fair / 10_000.0).max(min_edge);
+        let min_spread = self.config.ref_min_spread_bps * self.cached_vol_mult * fair / 10_000.0;
+        let max_bid = (mid - min_spread).min(fair - min_edge);
+        let min_ask = (mid + min_spread).max(fair + min_edge);
 
-        // Check bid: inside min_spread from skewed mid?
+        // Check bid: above max allowed bid?
         if let Some(ref q) = self.bid_quote {
             let state = oms_state.get_order(q.client_id).map(|h| h.state);
             let can_cancel = matches!(
                 state,
                 Some(OrderState::Accepted) | Some(OrderState::PartiallyFilled)
             );
-            if can_cancel && q.price > self.oms.round_price(mid - min_spread) {
+            if can_cancel && q.price > self.oms.round_price(max_bid) {
                 #[cfg(feature = "profiling")]
                 let sign_start = Instant::now();
                 let signed = if let Some(s) = self.presigned_cancels.remove(&q.client_id) {
@@ -854,14 +855,14 @@ impl MmEngine {
             }
         }
 
-        // Check ask: inside min_spread from skewed mid?
+        // Check ask: below min allowed ask?
         if let Some(ref q) = self.ask_quote {
             let state = oms_state.get_order(q.client_id).map(|h| h.state);
             let can_cancel = matches!(
                 state,
                 Some(OrderState::Accepted) | Some(OrderState::PartiallyFilled)
             );
-            if can_cancel && q.price < self.oms.round_price(mid + min_spread) {
+            if can_cancel && q.price < self.oms.round_price(min_ask) {
                 #[cfg(feature = "profiling")]
                 let sign_start = Instant::now();
                 let signed = if let Some(s) = self.presigned_cancels.remove(&q.client_id) {
