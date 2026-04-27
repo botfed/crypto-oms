@@ -232,6 +232,10 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
         None
     };
 
+    // Display channel (feature = "display")
+    #[cfg(feature = "display")]
+    let (display_tx, display_rx) = crossbeam_channel::bounded::<crypto_oms::mm::display::DisplayMsg>(256);
+
     // Build N engines — one per symbol
     let mut engines: Vec<MmEngine> = Vec::with_capacity(symbols.len());
     for (i, sym_cfg) in symbols.iter().enumerate() {
@@ -244,6 +248,8 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
             sym_cfg.clone(),
             ghost,
             i,
+            #[cfg(feature = "display")]
+            display_tx.clone(),
         )?;
         engines.push(engine);
     }
@@ -259,6 +265,13 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
 
     // Get OMS event receiver
     let oms_events = oms.event_receiver();
+
+    // Start display task (feature = "display")
+    #[cfg(feature = "display")]
+    {
+        let sd = shutdown.clone();
+        tokio::spawn(crypto_oms::mm::display::run_display(display_rx, sd));
+    }
 
     // Run the spin loop on a dedicated thread
     tokio::task::spawn_blocking(move || {

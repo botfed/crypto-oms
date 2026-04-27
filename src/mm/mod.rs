@@ -1,4 +1,6 @@
 pub mod config;
+#[cfg(feature = "display")]
+pub mod display;
 pub mod fair_price;
 pub mod inventory;
 
@@ -251,6 +253,8 @@ pub struct MmEngine {
     cached_vol_mult: f64,
     cached_skew_bps: f64,
     presigned_cancels: HashMap<ClientOrderId, SignedPayload>,
+    #[cfg(feature = "display")]
+    display_tx: crossbeam_channel::Sender<display::DisplayMsg>,
     // TODO: per-engine profiling files for multi-ticker
     #[cfg(feature = "profiling")]
     latency: latency::LatencyRecorder,
@@ -268,6 +272,8 @@ impl MmEngine {
         config: StrategyConfig,
         ghost: bool,
         vol_group_idx: usize,
+        #[cfg(feature = "display")]
+        display_tx: crossbeam_channel::Sender<display::DisplayMsg>,
     ) -> Result<Self> {
         // Resolve the HL symbol to a SymbolId for fair price lookups
         let itype = if config.symbol.starts_with("PERP_") {
@@ -370,6 +376,8 @@ impl MmEngine {
             cached_vol_mult: 1.0,
             cached_skew_bps: 0.0,
             presigned_cancels: HashMap::new(),
+            #[cfg(feature = "display")]
+            display_tx,
             #[cfg(feature = "profiling")]
             latency,
         })
@@ -481,13 +489,15 @@ impl MmEngine {
             self.last_quote_eval = Instant::now();
         }
 
-        // ── STATUS LOG ──
-        #[cfg(any(feature = "log_status", feature = "log_state"))]
+        // ── STATUS LOG / DISPLAY ──
+        #[cfg(any(feature = "log_status", feature = "log_state", feature = "display"))]
         if self.last_status_log.elapsed() >= Duration::from_secs(1) {
             #[cfg(feature = "log_status")]
             self.log_status(oms_state, vol_provider);
             #[cfg(feature = "log_state")]
             self.log_state(oms_state);
+            #[cfg(feature = "display")]
+            self.send_display_status(oms_state, vol_provider);
             self.last_status_log = Instant::now();
         }
 
@@ -824,12 +834,15 @@ impl MmEngine {
                 Some(OrderState::Accepted) | Some(OrderState::PartiallyFilled)
             );
             if can_cancel && q.price > self.oms.round_price(max_bid) {
-                warn!(
+                let cancel_msg = format!(
                     "[{}] fast cancel BID cid={} price={:.6} > max_bid={:.6} | fair={:.6} skew={:+.2}bps mid={:.6} min_spread={:.6} min_edge={:.6} bound=[mid-spread={:.6}, fair-edge={:.6}]",
                     self.config.symbol, q.client_id.0, q.price, max_bid,
                     fair, self.cached_skew_bps, mid, min_spread, min_edge,
                     mid - min_spread, fair - min_edge,
                 );
+                warn!("{}", cancel_msg);
+                #[cfg(feature = "display")]
+                self.display_log(cancel_msg);
                 #[cfg(feature = "profiling")]
                 let sign_start = Instant::now();
                 let signed = if let Some(s) = self.presigned_cancels.remove(&q.client_id) {
@@ -869,12 +882,15 @@ impl MmEngine {
                 Some(OrderState::Accepted) | Some(OrderState::PartiallyFilled)
             );
             if can_cancel && q.price < self.oms.round_price(min_ask) {
-                warn!(
+                let cancel_msg = format!(
                     "[{}] fast cancel ASK cid={} price={:.6} < min_ask={:.6} | fair={:.6} skew={:+.2}bps mid={:.6} min_spread={:.6} min_edge={:.6} bound=[mid+spread={:.6}, fair+edge={:.6}]",
                     self.config.symbol, q.client_id.0, q.price, min_ask,
                     fair, self.cached_skew_bps, mid, min_spread, min_edge,
                     mid + min_spread, fair + min_edge,
                 );
+                warn!("{}", cancel_msg);
+                #[cfg(feature = "display")]
+                self.display_log(cancel_msg);
                 #[cfg(feature = "profiling")]
                 let sign_start = Instant::now();
                 let signed = if let Some(s) = self.presigned_cancels.remove(&q.client_id) {
@@ -1297,6 +1313,101 @@ impl MmEngine {
             ref_feed,
             exch_age_ms,
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Display
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "display")]
+    fn send_display_status(
+        &self,
+        oms_state: &OmsStateTracker,
+        vol_provider: &Option<crypto_feeds::vol_provider::VolProvider>,
+    ) {
+        let fair = self
+            .fair_price
+            .get_fair_price(ExchangeId::Hyperliquid, self.hl_symbol_id);
+        let basis = self
+            .fair_price
+            .get_basis(ExchangeId::Hyperliquid, self.hl_symbol_id);
+        let position = self.get_position(oms_state);
+        let target_usd = self.target_position_rx.as_ref().map(|rx| *rx.borrow()).unwrap_or(0.0);
+        let fair_val = fair.unwrap_or(0.0);
+        let target = if fair_val != 0.0 { target_usd / fair_val } else { 0.0 };
+        let max_pos = if fair_val != 0.0 { self.config.max_position_usd / fair_val } else { 0.0 };
+
+        let basis_bps = match (basis, fair) {
+            (Some(b), Some(f)) if f != 0.0 => b / f * 10_000.0,
+            _ => 0.0,
+        };
+
+        let hl_mid = self
+            .fair_price
+            .get_mid(ExchangeId::Hyperliquid, self.hl_symbol_id);
+        let residual_bps = match (hl_mid, fair) {
+            (Some(hl), Some(f)) if f != 0.0 => (hl - f) / f * 10_000.0,
+            _ => 0.0,
+        };
+
+        let factor_bps = match (fair, &self.factor_model) {
+            (Some(f), Some(fm)) if fm.seeded && f != 0.0 => {
+                let mut sum = 0.0f64;
+                for fac in &fm.factors {
+                    if let Some((mid, _, _)) = factor_mid(&self.market_data, fac) {
+                        sum += fac.beta * (mid.ln() - fac.snapshot_log_mid);
+                    }
+                }
+                sum * 10_000.0
+            }
+            _ => 0.0,
+        };
+
+        let vol_mult = self.cached_vol_mult;
+
+        let (ref_age_ms, ref_feed) = self
+            .fair_price
+            .get_fair_price_detail(ExchangeId::Hyperliquid, self.hl_symbol_id)
+            .map(|(_, ex_ts_ms, feed, _, _)| {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                (now_ms - ex_ts_ms, feed.to_string())
+            })
+            .unwrap_or((-1, "none".into()));
+
+        let pred_vol_ann = vol_provider
+            .as_ref()
+            .map(|vp| vp.ann_vol(self.vol_group_idx))
+            .unwrap_or(0.0);
+
+        let _ = self.display_tx.try_send(display::DisplayMsg::Status(display::SymbolStatus {
+            symbol: self.config.symbol.clone(),
+            fair: fair_val,
+            hl_mid: hl_mid.unwrap_or(0.0),
+            residual_bps,
+            basis_bps,
+            factor_bps,
+            skew_bps: self.cached_skew_bps,
+            vol_ann_pct: pred_vol_ann * 100.0,
+            vol_mult,
+            band_min_bps: self.config.ref_min_spread_bps * vol_mult,
+            band_spread_bps: self.config.ref_half_spread_bps * vol_mult,
+            band_requote_bps: self.config.ref_requote_tolerance_bps * vol_mult,
+            min_edge_bps: self.config.min_edge_bps,
+            position,
+            target,
+            max_pos,
+            want_bid: position - target < max_pos,
+            want_ask: position - target > -max_pos,
+            bid_price: self.bid_quote.as_ref().map(|q| q.price),
+            ask_price: self.ask_quote.as_ref().map(|q| q.price),
+            ref_feed,
+            ref_age_ms,
+        }));
+    }
+
+    #[cfg(feature = "display")]
+    fn display_log(&self, msg: String) {
+        let _ = self.display_tx.try_send(display::DisplayMsg::Log(msg));
     }
 
     // -----------------------------------------------------------------------

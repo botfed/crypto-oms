@@ -10,6 +10,7 @@ edition = "2024"
 profiling = []
 log_status = []
 log_state = []
+display = []
 sched_fifo = []
 
 [dependencies]
