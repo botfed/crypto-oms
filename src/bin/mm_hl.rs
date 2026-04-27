@@ -132,8 +132,11 @@ async fn async_main(
         std::process::exit(1);
     });
 
-    // Start crypto-feeds
+    // Seed symbol registry with base assets from config before any REGISTRY access
     let feeds_config = config.to_feeds_config();
+    crypto_feeds::symbol_registry::seed_extra_bases(feeds_config.base_assets());
+
+    // Start crypto-feeds
     let market_data = Arc::new(AllMarketData::new());
     let mut handles = Vec::new();
     load_spot(&mut handles, &feeds_config, &market_data, &shutdown)?;
