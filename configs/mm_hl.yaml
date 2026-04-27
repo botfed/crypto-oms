@@ -56,11 +56,11 @@ symbols:
     max_stale_ms: 2000
     order_notional_usd: 100.0
     max_position_usd: 100000.0
-    ref_half_spread_bps: 2
+    ref_half_spread_bps: 1.0
     ref_min_spread_bps: 0.2
-    max_skew_bps: 1.8
+    max_skew_bps: 0.9
     min_edge_bps: -2.0
-    ref_requote_tolerance_bps: 1.0
+    ref_requote_tolerance_bps: 0.5
     ref_vol: 0.35
     vol_mult_floor: 0.3
     vol_mult_cap: 5.0
