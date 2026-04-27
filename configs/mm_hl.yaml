@@ -42,7 +42,7 @@ inventory:
       ZORA:
         - "0x1111111111166b7FE7bd91427724B487980aFc69"
 
-skew_scale_usd: 100.0
+skew_scale_usd: 200.0
 post_only: true
 
 vol_models:
