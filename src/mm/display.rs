@@ -21,7 +21,7 @@ const ERASE_EOL: &str = "\x1B[K";
 const GREEN: &str = "\x1B[32m";
 const RED: &str = "\x1B[31m";
 const YELLOW: &str = "\x1B[33m";
-const DIM: &str = "\x1B[2m";
+const DIM: &str = "\x1B[38;5;245m"; // light gray (256-color)
 const CYAN: &str = "\x1B[36m";
 const RESET: &str = "\x1B[0m";
 
@@ -207,7 +207,13 @@ pub async fn run_display(
 // Rendering
 // ---------------------------------------------------------------------------
 
-const HDR: &str = "  Symbol                 Fair        HlMid   Resid   Basis  Factor    Skew    Vol%  VMul           Band MinEdge          Bid          Ask        Pos     Target  Want  FeedAge";
+fn header() -> String {
+    format!(
+        "  {:<16} {:>12} {:>12} {:>7} {:>7} {:>7} {:>7} {:>7} {:>5} {:>14} {:>8} {:>12} {:>12} {:>10} {:>10} {:>4} {:>8}",
+        "Symbol", "Fair", "HlMid", "Resid", "Basis", "Factor", "Skew", "Vol%", "VMul",
+        "Band", "MinEdge", "Bid", "Ask", "Pos", "Target", "Want", "FeedAge",
+    )
+}
 
 fn render_frame(
     statuses: &BTreeMap<String, SymbolStatus>,
@@ -227,7 +233,7 @@ fn render_frame(
         Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
     );
     let _ = writeln!(buf);
-    let _ = writeln!(buf, "  {CYAN}{HDR}{RESET}");
+    let _ = writeln!(buf, "{CYAN}{}{RESET}", header());
 
     for st in statuses.values() {
         let bid_str = st.bid_price
