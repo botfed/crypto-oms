@@ -21,6 +21,8 @@ const GREEN: &str = "\x1B[32m";
 const RED: &str = "\x1B[31m";
 const YELLOW: &str = "\x1B[33m";
 const DIM: &str = "\x1B[2m";
+const BOLD: &str = "\x1B[1m";
+const CYAN: &str = "\x1B[36m";
 const RESET: &str = "\x1B[0m";
 
 const MAX_LOG_LINES: usize = 200;
@@ -51,8 +53,7 @@ pub struct SymbolStatus {
     pub want_ask: bool,
     pub bid_price: Option<f64>,
     pub ask_price: Option<f64>,
-    pub ref_feed: String,
-    pub ref_age_ms: i64,
+    pub feed_age_ms: i64,
 }
 
 pub enum DisplayMsg {
@@ -112,6 +113,14 @@ pub async fn run_display(
 // Rendering
 // ---------------------------------------------------------------------------
 
+//  Column widths (visible chars, right-aligned unless noted)
+//  Symbol: 16 left-aligned
+//  Fair: 12  HlMid: 12  Resid: 7  Basis: 7  Factor: 7  Skew: 7
+//  Vol%: 7  VMul: 6  Band: 14  MinEdge: 8  Bid: 12  Ask: 12
+//  Pos: 12  Target: 12  Want: 5  FeedAge: 8
+
+const HDR: &str = "  Symbol                 Fair        HlMid   Resid   Basis  Factor    Skew    Vol%  VMul           Band  MinEdge          Bid          Ask        Pos     Target  Want  FeedAge";
+
 fn render_frame(
     statuses: &BTreeMap<String, SymbolStatus>,
     logs: &VecDeque<String>,
@@ -133,12 +142,7 @@ fn render_frame(
     let _ = writeln!(buf);
 
     // Table header
-    let _ = writeln!(
-        buf,
-        "  {DIM}{:<14} {:>10} {:>10} {:>6} {:>6} {:>6} {:>6} {:>6} {:>5} {:>12} {:>6} {:>10} {:>10} {:>9} {:>9} {:>4} {:>5}{RESET}",
-        "Symbol", "Fair", "HlMid", "Resid", "Basis", "Factr", "Skew", "Vol%", "VMul",
-        "Band", "Edge", "Bid", "Ask", "Pos", "Target", "Want", "Age",
-    );
+    let _ = writeln!(buf, "  {CYAN}{HDR}{RESET}");
 
     // Table rows
     for st in statuses.values() {
@@ -150,24 +154,24 @@ fn render_frame(
             .unwrap_or_else(|| "-".into());
 
         let want = match (st.want_bid, st.want_ask) {
-            (true, true) => format!("{GREEN}B+A{RESET}"),
-            (true, false) => format!("{YELLOW}B{RESET}  "),
-            (false, true) => format!("{YELLOW}  A{RESET}"),
-            (false, false) => format!("{RED} - {RESET}"),
+            (true, true) => format!("{GREEN} B+A{RESET}"),
+            (true, false) => format!("{YELLOW} B  {RESET}"),
+            (false, true) => format!("{YELLOW}   A{RESET}"),
+            (false, false) => format!("{RED}  - {RESET}"),
         };
 
         let band = format!("{:.1}/{:.1}/{:.1}",
             st.band_min_bps, st.band_spread_bps, st.band_requote_bps);
 
-        let age_str = if st.ref_age_ms >= 0 {
-            format!("{}ms", st.ref_age_ms)
+        let age_str = if st.feed_age_ms >= 0 {
+            format!("{:>5}ms", st.feed_age_ms)
         } else {
-            "-".into()
+            "      -".into()
         };
 
         let _ = writeln!(
             buf,
-            "  {:<14} {:>10} {:>10} {:>+6.1} {:>+6.1} {:>+6.1} {:>+6.1} {:>6.1} {:>5.2} {:>12} {:>+6.1} {:>10} {:>10} {:>+9.4} {:>+9.4} {} {:>5}",
+            "  {:<16} {:>12} {:>12} {:>+7.1} {:>+7.1} {:>+7.1} {:>+7.1} {:>7.1} {:>5.2} {:>14} {:>+8.1} {:>12} {:>12} {:>10} {:>10} {} {:>8}",
             st.symbol,
             fmt_price(st.fair),
             fmt_price(st.hl_mid),
@@ -181,8 +185,8 @@ fn render_frame(
             st.min_edge_bps,
             bid_str,
             ask_str,
-            st.position,
-            st.target,
+            fmt_qty_compact(st.position),
+            fmt_qty_compact(st.target),
             want,
             age_str,
         );
@@ -202,6 +206,22 @@ fn render_frame(
 
     let frame = prepare_frame(&buf);
     format!("{CURSOR_HOME}{frame}{CLEAR_BELOW}")
+}
+
+fn fmt_qty_compact(v: f64) -> String {
+    let abs = v.abs();
+    let sign = if v < 0.0 { "-" } else { "+" };
+    if abs >= 1_000_000.0 {
+        format!("{sign}{:.1}M", abs / 1_000_000.0)
+    } else if abs >= 1_000.0 {
+        format!("{sign}{:.1}k", abs / 1_000.0)
+    } else if abs >= 1.0 {
+        format!("{sign}{:.2}", abs)
+    } else if abs < 1e-12 {
+        "0".into()
+    } else {
+        format!("{sign}{:.4}", abs)
+    }
 }
 
 fn fmt_price(v: f64) -> String {

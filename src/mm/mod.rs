@@ -840,9 +840,10 @@ impl MmEngine {
                     fair, self.cached_skew_bps, mid, min_spread, min_edge,
                     mid - min_spread, fair - min_edge,
                 );
-                warn!("{}", cancel_msg);
                 #[cfg(feature = "display")]
-                self.display_log(cancel_msg);
+                self.display_log(cancel_msg.clone());
+                #[cfg(not(feature = "display"))]
+                warn!("{}", cancel_msg);
                 #[cfg(feature = "profiling")]
                 let sign_start = Instant::now();
                 let signed = if let Some(s) = self.presigned_cancels.remove(&q.client_id) {
@@ -888,9 +889,10 @@ impl MmEngine {
                     fair, self.cached_skew_bps, mid, min_spread, min_edge,
                     mid + min_spread, fair + min_edge,
                 );
-                warn!("{}", cancel_msg);
                 #[cfg(feature = "display")]
-                self.display_log(cancel_msg);
+                self.display_log(cancel_msg.clone());
+                #[cfg(not(feature = "display"))]
+                warn!("{}", cancel_msg);
                 #[cfg(feature = "profiling")]
                 let sign_start = Instant::now();
                 let signed = if let Some(s) = self.presigned_cancels.remove(&q.client_id) {
@@ -1365,14 +1367,13 @@ impl MmEngine {
 
         let vol_mult = self.cached_vol_mult;
 
-        let (ref_age_ms, ref_feed) = self
+        let feed_age_ms = self
             .fair_price
             .get_fair_price_detail(ExchangeId::Hyperliquid, self.hl_symbol_id)
-            .map(|(_, ex_ts_ms, feed, _, _)| {
-                let now_ms = chrono::Utc::now().timestamp_millis();
-                (now_ms - ex_ts_ms, feed.to_string())
+            .map(|(_, ex_ts_ms, _, _, _)| {
+                chrono::Utc::now().timestamp_millis() - ex_ts_ms
             })
-            .unwrap_or((-1, "none".into()));
+            .unwrap_or(-1);
 
         let pred_vol_ann = vol_provider
             .as_ref()
@@ -1400,8 +1401,7 @@ impl MmEngine {
             want_ask: position - target > -max_pos,
             bid_price: self.bid_quote.as_ref().map(|q| q.price),
             ask_price: self.ask_quote.as_ref().map(|q| q.price),
-            ref_feed,
-            ref_age_ms,
+            feed_age_ms,
         }));
     }
 
