@@ -83,7 +83,7 @@ symbols:
     ref_half_spread_bps: 4
     ref_min_spread_bps: 2
     max_skew_bps: 10.0
-    min_edge_bps: -5.0
+    min_edge_bps: -3.0
     ref_vol: 1.00
     vol_mult_floor: 0.5
     vol_mult_cap: 2.0
@@ -107,7 +107,7 @@ symbols:
     ref_half_spread_bps: 4
     ref_min_spread_bps: 2
     max_skew_bps: 10.0
-    min_edge_bps: -5.0
+    min_edge_bps: -3.0
     ref_vol: 1.00
     vol_mult_floor: 0.5
     vol_mult_cap: 2.0
