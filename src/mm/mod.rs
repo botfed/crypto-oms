@@ -824,6 +824,12 @@ impl MmEngine {
                 Some(OrderState::Accepted) | Some(OrderState::PartiallyFilled)
             );
             if can_cancel && q.price > self.oms.round_price(max_bid) {
+                warn!(
+                    "[{}] fast cancel BID cid={} price={:.6} > max_bid={:.6} | fair={:.6} skew={:+.2}bps mid={:.6} min_spread={:.6} min_edge={:.6} bound=[mid-spread={:.6}, fair-edge={:.6}]",
+                    self.config.symbol, q.client_id.0, q.price, max_bid,
+                    fair, self.cached_skew_bps, mid, min_spread, min_edge,
+                    mid - min_spread, fair - min_edge,
+                );
                 #[cfg(feature = "profiling")]
                 let sign_start = Instant::now();
                 let signed = if let Some(s) = self.presigned_cancels.remove(&q.client_id) {
@@ -863,6 +869,12 @@ impl MmEngine {
                 Some(OrderState::Accepted) | Some(OrderState::PartiallyFilled)
             );
             if can_cancel && q.price < self.oms.round_price(min_ask) {
+                warn!(
+                    "[{}] fast cancel ASK cid={} price={:.6} < min_ask={:.6} | fair={:.6} skew={:+.2}bps mid={:.6} min_spread={:.6} min_edge={:.6} bound=[mid+spread={:.6}, fair+edge={:.6}]",
+                    self.config.symbol, q.client_id.0, q.price, min_ask,
+                    fair, self.cached_skew_bps, mid, min_spread, min_edge,
+                    mid + min_spread, fair + min_edge,
+                );
                 #[cfg(feature = "profiling")]
                 let sign_start = Instant::now();
                 let signed = if let Some(s) = self.presigned_cancels.remove(&q.client_id) {
