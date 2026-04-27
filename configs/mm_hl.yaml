@@ -63,7 +63,7 @@ symbols:
     ref_requote_tolerance_bps: 0.5
     ref_vol: 0.35
     vol_mult_floor: 0.3
-    vol_mult_cap: 1.0
+    vol_mult_cap: 2.0
     vol_symbol: "ETH"
     quote_interval_ms: 150
     warmup_secs: 10
