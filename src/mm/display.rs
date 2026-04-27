@@ -276,13 +276,15 @@ fn render_frame(
         );
     }
 
-    // Log section
+    // Log section — strictly cap total output to terminal height
     let (_, rows) = term_size();
     let used = buf.lines().count();
-    let remaining = rows.saturating_sub(used).saturating_sub(2);
-    if !logs.is_empty() {
+    // Reserve 3 lines: blank, "--- Log ---" header, and bottom margin
+    let log_capacity = rows.saturating_sub(used).saturating_sub(3);
+    if log_capacity > 0 && !logs.is_empty() {
         let _ = writeln!(buf, "\n  {DIM}--- Log ---{RESET}");
-        let skip = logs.len().saturating_sub(remaining);
+        let show = logs.len().min(log_capacity);
+        let skip = logs.len() - show;
         for line in logs.iter().skip(skip) {
             let _ = writeln!(buf, "  {DIM}{line}{RESET}");
         }
