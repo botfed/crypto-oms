@@ -83,7 +83,7 @@ symbols:
     vol_mult_cap: 2.0
     vol_symbol: "ZORA"
     quote_interval_ms: 150
-    post_only: false
+    post_only: true
     warmup_secs: 1
     max_feed_age_ms: 10000
     stray_order_age_ms: 6000
