@@ -22,7 +22,6 @@ const GREEN: &str = "\x1B[32m";
 const RED: &str = "\x1B[31m";
 const YELLOW: &str = "\x1B[33m";
 const DIM: &str = "\x1B[2m";
-const BOLD: &str = "\x1B[1m";
 const CYAN: &str = "\x1B[36m";
 const RESET: &str = "\x1B[0m";
 
