@@ -69,30 +69,30 @@ symbols:
     warmup_secs: 1
     max_feed_age_ms: 10000
     stray_order_age_ms: 6000
-  # - symbol: PERP_ZORA_USDC
-  #   max_stale_ms: 2000
-  #   order_notional_usd: 100.0
-  #   max_position_usd: 10000.0
-  #   ref_half_spread_bps: 12
-  #   ref_min_spread_bps: 6
-  #   ref_requote_tolerance_bps: 10.0
-  #   max_skew_bps: 10.0
-  #   min_edge_bps: 3.5
-  #   ref_vol: 1.00
-  #   vol_mult_floor: 0.3
-  #   vol_mult_cap: 5.0
-  #   vol_symbol: "ZORA"
-  #   quote_interval_ms: 150
-  #   post_only: false
-  #   warmup_secs: 10
-  #   max_feed_age_ms: 10000
-  #   stray_order_age_ms: 6000
-  #   factor_model:
-  #     enabled: true
-  #     factors:
-  #       - symbol: PERP_ETH_USDT
-  #         exchanges: [binance]
-  #         beta: 0.97
+  - symbol: PERP_ZORA_USDC
+    max_stale_ms: 2000
+    order_notional_usd: 200.0
+    max_position_usd: 10000.0
+    ref_half_spread_bps: 3
+    ref_min_spread_bps: 1
+    ref_requote_tolerance_bps: 3.0
+    max_skew_bps: 2.0
+    min_edge_bps: -1.0
+    ref_vol: 1.00
+    vol_mult_floor: 0.5
+    vol_mult_cap: 2.0
+    vol_symbol: "ZORA"
+    quote_interval_ms: 150
+    post_only: false
+    warmup_secs: 1
+    max_feed_age_ms: 10000
+    stray_order_age_ms: 6000
+    factor_model:
+      enabled: true
+      factors:
+        - symbol: PERP_ETH_USDT
+          exchanges: [binance]
+          beta: 1.0
   # - symbol: PERP_BRETT_USDC
   #   max_stale_ms: 2000
   #   order_notional_usd: 100.0
