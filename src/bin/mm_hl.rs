@@ -165,7 +165,7 @@ async fn async_main(
         .map(|v| v.model.clone())
         .unwrap_or_else(|| "har_qlike".to_string());
 
-    let mut vol_provider = if let Some(ref vol_cfg) = config.vol_models {
+    let (mut vol_provider, has_vol_params) = if let Some(ref vol_cfg) = config.vol_models {
         info!("initializing vol provider from {}", vol_cfg.params_dir);
 
         let params_dir = Path::new(&vol_cfg.params_dir);
@@ -220,6 +220,9 @@ async fn async_main(
             }
         }
 
+        // Track which symbols have real HAR params
+        let has_vol_params: Vec<bool> = har_groups.iter().map(|g| g.is_some()).collect();
+
         // Build provider with one group per symbol
         let final_groups: Vec<_> = har_groups.into_iter().enumerate().map(|(i, g)| {
             g.unwrap_or_else(|| {
@@ -238,10 +241,10 @@ async fn async_main(
         let provider = VolProvider::new_har(final_groups);
         info!("vol provider ready (model={}, {} groups)", vol_model_name, provider.group_count());
 
-        Some(provider)
+        (Some(provider), has_vol_params)
     } else {
         info!("no vol_models configured, vol_mult=1.0");
-        None
+        (None, vec![false; symbols.len()])
     };
 
     // Build N engines — one per symbol, each with its own inventory manager
@@ -264,6 +267,7 @@ async fn async_main(
             sym_cfg.clone(),
             ghost,
             i,
+            has_vol_params[i],
             display_bus.clone(),
         )?;
         engines.push(engine);

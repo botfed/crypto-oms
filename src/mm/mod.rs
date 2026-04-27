@@ -251,6 +251,7 @@ pub struct MmEngine {
     factor_model: Option<FactorModelState>,
     cached_vol_mult: f64,
     cached_skew_bps: f64,
+    has_vol_params: bool,
     presigned_cancels: HashMap<ClientOrderId, SignedPayload>,
     display: Option<display::DisplayBus>,
     // TODO: per-engine profiling files for multi-ticker
@@ -270,6 +271,7 @@ impl MmEngine {
         config: StrategyConfig,
         ghost: bool,
         vol_group_idx: usize,
+        has_vol_params: bool,
         display: Option<display::DisplayBus>,
     ) -> Result<Self> {
         // Resolve the HL symbol to a SymbolId for fair price lookups
@@ -372,6 +374,7 @@ impl MmEngine {
             factor_model,
             cached_vol_mult: 1.0,
             cached_skew_bps: 0.0,
+            has_vol_params,
             presigned_cancels: HashMap::new(),
             display,
             #[cfg(feature = "profiling")]
@@ -1167,6 +1170,9 @@ impl MmEngine {
         exchange_ts_ms: i64,
         vol_provider: &mut Option<crypto_feeds::vol_provider::VolProvider>,
     ) -> f64 {
+        if !self.has_vol_params {
+            return 1.0;
+        }
         let Some(ref mut vp) = *vol_provider else {
             return 1.0;
         };
