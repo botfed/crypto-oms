@@ -929,11 +929,12 @@ impl MmEngine {
 
         self.cached_skew_bps = self.compute_skew_bps(fair, position, target);
         let skewed_mid = self.skewed_mid(fair);
+        let place_floor_bps = self.config.ref_min_spread_bps * self.cached_vol_mult;
         let (desired_bid, desired_ask) = Self::clamp_to_fair(
             fair,
             skewed_mid - half_spread,
             skewed_mid + half_spread,
-            self.config.min_edge_bps,
+            place_floor_bps,
         );
 
         // Determine if we should quote each side (position limits)
