@@ -4,7 +4,7 @@ hyperliquid:
 
 perp:
   binance: [ETH_USDT, ZORA_USDT, BRETT_USDT, ZEN_USDT]
-  hyperliquid: [ETH_USDC, ZORA_USDC, BRETT_USDC, ZEN_USDT]
+  hyperliquid: [ETH_USDC, ZORA_USDC, BRETT_USDC, ZEN_USDC]
 
 sample_interval_ms: 10
 
