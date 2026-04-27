@@ -154,20 +154,6 @@ async fn async_main(
     // FairPriceEngine — basis updated by engine in slow path, no background task
     let fair_price = Arc::new(FairPriceEngine::new(market_data.clone(), config.fair_price)?);
 
-    // Start inventory manager (uses first symbol's asset)
-    let first_symbol = &symbols[0].symbol;
-    let asset = first_symbol
-        .strip_prefix("PERP_")
-        .or_else(|| first_symbol.strip_prefix("SPOT_"))
-        .and_then(|s| s.split('_').next())
-        .unwrap_or("BTC");
-    let (target_rx, _inv_handle) = start_inventory_manager(
-        &config.inventory,
-        asset,
-        shutdown.clone(),
-    );
-
-    // target_rx comes from inventory manager — only used when hedge mode is active
     let use_target_rx = config.inventory.mode == crypto_oms::mm::config::InventoryMode::Hedge;
 
     // Initialize vol provider if vol_models is configured
@@ -255,10 +241,18 @@ async fn async_main(
         None
     };
 
-    // Build N engines — one per symbol
+    // Build N engines — one per symbol, each with its own inventory manager
     let mut engines: Vec<MmEngine> = Vec::with_capacity(symbols.len());
     for (i, sym_cfg) in symbols.iter().enumerate() {
-        let target_rx = if use_target_rx { Some(target_rx.clone()) } else { None };
+        let asset = sym_cfg.symbol
+            .strip_prefix("PERP_")
+            .or_else(|| sym_cfg.symbol.strip_prefix("SPOT_"))
+            .and_then(|s| s.split('_').next())
+            .unwrap_or("BTC");
+        let (target_rx, _handle) = start_inventory_manager(
+            &config.inventory, asset, shutdown.clone(),
+        );
+        let target_rx = if use_target_rx { Some(target_rx) } else { None };
         let engine = MmEngine::new(
             Arc::clone(&oms),
             Arc::clone(&fair_price),
