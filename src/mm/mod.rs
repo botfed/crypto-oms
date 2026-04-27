@@ -1,5 +1,4 @@
 pub mod config;
-#[cfg(feature = "display")]
 pub mod display;
 pub mod fair_price;
 pub mod inventory;
@@ -253,8 +252,7 @@ pub struct MmEngine {
     cached_vol_mult: f64,
     cached_skew_bps: f64,
     presigned_cancels: HashMap<ClientOrderId, SignedPayload>,
-    #[cfg(feature = "display")]
-    display_tx: crossbeam_channel::Sender<display::DisplayMsg>,
+    display: Option<display::DisplayBus>,
     // TODO: per-engine profiling files for multi-ticker
     #[cfg(feature = "profiling")]
     latency: latency::LatencyRecorder,
@@ -272,8 +270,7 @@ impl MmEngine {
         config: StrategyConfig,
         ghost: bool,
         vol_group_idx: usize,
-        #[cfg(feature = "display")]
-        display_tx: crossbeam_channel::Sender<display::DisplayMsg>,
+        display: Option<display::DisplayBus>,
     ) -> Result<Self> {
         // Resolve the HL symbol to a SymbolId for fair price lookups
         let itype = if config.symbol.starts_with("PERP_") {
@@ -376,8 +373,7 @@ impl MmEngine {
             cached_vol_mult: 1.0,
             cached_skew_bps: 0.0,
             presigned_cancels: HashMap::new(),
-            #[cfg(feature = "display")]
-            display_tx,
+            display,
             #[cfg(feature = "profiling")]
             latency,
         })
@@ -490,13 +486,15 @@ impl MmEngine {
         }
 
         // ── STATUS LOG / DISPLAY ──
-        #[cfg(any(feature = "log_status", feature = "log_state", feature = "display"))]
+        #[cfg(any(feature = "log_status", feature = "log_state"))]
         if self.last_status_log.elapsed() >= Duration::from_secs(1) {
             #[cfg(feature = "log_status")]
             self.log_status(oms_state, vol_provider);
             #[cfg(feature = "log_state")]
             self.log_state(oms_state);
-            #[cfg(feature = "display")]
+            self.last_status_log = Instant::now();
+        }
+        if self.display.is_some() && self.last_status_log.elapsed() >= Duration::from_secs(1) {
             self.send_display_status(oms_state, vol_provider);
             self.last_status_log = Instant::now();
         }
@@ -840,9 +838,6 @@ impl MmEngine {
                     fair, self.cached_skew_bps, mid, min_spread, min_edge,
                     mid - min_spread, fair - min_edge,
                 );
-                #[cfg(feature = "display")]
-                self.display_log(cancel_msg.clone());
-                #[cfg(not(feature = "display"))]
                 warn!("{}", cancel_msg);
                 #[cfg(feature = "profiling")]
                 let sign_start = Instant::now();
@@ -889,9 +884,6 @@ impl MmEngine {
                     fair, self.cached_skew_bps, mid, min_spread, min_edge,
                     mid + min_spread, fair + min_edge,
                 );
-                #[cfg(feature = "display")]
-                self.display_log(cancel_msg.clone());
-                #[cfg(not(feature = "display"))]
                 warn!("{}", cancel_msg);
                 #[cfg(feature = "profiling")]
                 let sign_start = Instant::now();
@@ -1321,12 +1313,15 @@ impl MmEngine {
     // Display
     // -----------------------------------------------------------------------
 
-    #[cfg(feature = "display")]
     fn send_display_status(
         &self,
         oms_state: &OmsStateTracker,
         vol_provider: &Option<crypto_feeds::vol_provider::VolProvider>,
     ) {
+        let bus = match &self.display {
+            Some(b) => b,
+            None => return,
+        };
         let fair = self
             .fair_price
             .get_fair_price(ExchangeId::Hyperliquid, self.hl_symbol_id);
@@ -1380,7 +1375,7 @@ impl MmEngine {
             .map(|vp| vp.ann_vol(self.vol_group_idx))
             .unwrap_or(0.0);
 
-        let _ = self.display_tx.try_send(display::DisplayMsg::Status(display::SymbolStatus {
+        bus.send_status(display::SymbolStatus {
             symbol: self.config.symbol.clone(),
             fair: fair_val,
             hl_mid: hl_mid.unwrap_or(0.0),
@@ -1402,12 +1397,7 @@ impl MmEngine {
             bid_price: self.bid_quote.as_ref().map(|q| q.price),
             ask_price: self.ask_quote.as_ref().map(|q| q.price),
             feed_age_ms,
-        }));
-    }
-
-    #[cfg(feature = "display")]
-    fn display_log(&self, msg: String) {
-        let _ = self.display_tx.try_send(display::DisplayMsg::Log(msg));
+        });
     }
 
     // -----------------------------------------------------------------------

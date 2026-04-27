@@ -5,6 +5,7 @@ use std::io::{Write, stdout};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use tracing_subscriber::Layer;
 
 // ---------------------------------------------------------------------------
 // Terminal escape sequences
@@ -41,7 +42,6 @@ pub struct SymbolStatus {
     pub skew_bps: f64,
     pub vol_ann_pct: f64,
     pub vol_mult: f64,
-    /// [min_spread, half_spread, requote] in bps (vol-adjusted)
     pub band_min_bps: f64,
     pub band_spread_bps: f64,
     pub band_requote_bps: f64,
@@ -59,6 +59,102 @@ pub struct SymbolStatus {
 pub enum DisplayMsg {
     Status(SymbolStatus),
     Log(String),
+}
+
+// ---------------------------------------------------------------------------
+// DisplayBus — single abstraction for engine → display communication
+// ---------------------------------------------------------------------------
+
+/// Wraps the display channel. When display feature is active, sends to the
+/// TUI. Clone is cheap (crossbeam sender clone).
+#[derive(Clone)]
+pub struct DisplayBus {
+    tx: crossbeam_channel::Sender<DisplayMsg>,
+}
+
+impl DisplayBus {
+    pub fn send_status(&self, status: SymbolStatus) {
+        let _ = self.tx.try_send(DisplayMsg::Status(status));
+    }
+
+    pub fn send_log(&self, msg: String) {
+        let _ = self.tx.try_send(DisplayMsg::Log(msg));
+    }
+}
+
+/// Initialize the display system: creates the channel, installs a tracing
+/// layer that redirects all logs to the display, and returns the bus + receiver.
+/// Call `run_display` with the receiver on a tokio task.
+pub fn init() -> (DisplayBus, crossbeam_channel::Receiver<DisplayMsg>) {
+    let (tx, rx) = crossbeam_channel::bounded(4096);
+
+    // Install tracing layer that redirects logs to the display channel
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(DisplayLayer { tx: tx.clone() })
+        .init();
+
+    (DisplayBus { tx }, rx)
+}
+
+// ---------------------------------------------------------------------------
+// Tracing layer — redirects all logs to the display channel
+// ---------------------------------------------------------------------------
+
+struct DisplayLayer {
+    tx: crossbeam_channel::Sender<DisplayMsg>,
+}
+
+impl<S: tracing::Subscriber> Layer<S> for DisplayLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let meta = event.metadata();
+        let level = meta.level();
+
+        let mut visitor = MessageVisitor(String::new());
+        event.record(&mut visitor);
+
+        let line = format!(
+            "{} {:<5} {}",
+            Utc::now().format("%H:%M:%S"),
+            level,
+            visitor.0,
+        );
+        let _ = self.tx.try_send(DisplayMsg::Log(line));
+    }
+}
+
+struct MessageVisitor(String);
+
+impl tracing::field::Visit for MessageVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            let _ = write!(self.0, "{:?}", value);
+        } else {
+            if !self.0.is_empty() {
+                self.0.push(' ');
+            }
+            let _ = write!(self.0, "{}={:?}", field.name(), value);
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.0.push_str(value);
+        } else {
+            if !self.0.is_empty() {
+                self.0.push(' ');
+            }
+            let _ = write!(self.0, "{}={}", field.name(), value);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -85,7 +181,6 @@ pub async fn run_display(
         tokio::select! {
             _ = &mut shutdown_fut => break,
             _ = interval.tick() => {
-                // Drain all pending messages
                 while let Ok(msg) = rx.try_recv() {
                     match msg {
                         DisplayMsg::Status(s) => {
@@ -113,13 +208,7 @@ pub async fn run_display(
 // Rendering
 // ---------------------------------------------------------------------------
 
-//  Column widths (visible chars, right-aligned unless noted)
-//  Symbol: 16 left-aligned
-//  Fair: 12  HlMid: 12  Resid: 7  Basis: 7  Factor: 7  Skew: 7
-//  Vol%: 7  VMul: 6  Band: 14  MinEdge: 8  Bid: 12  Ask: 12
-//  Pos: 12  Target: 12  Want: 5  FeedAge: 8
-
-const HDR: &str = "  Symbol                 Fair        HlMid   Resid   Basis  Factor    Skew    Vol%  VMul           Band  MinEdge          Bid          Ask        Pos     Target  Want  FeedAge";
+const HDR: &str = "  Symbol                 Fair        HlMid   Resid   Basis  Factor    Skew    Vol%  VMul           Band MinEdge          Bid          Ask        Pos     Target  Want  FeedAge";
 
 fn render_frame(
     statuses: &BTreeMap<String, SymbolStatus>,
@@ -133,18 +222,14 @@ fn render_frame(
 
     let mut buf = String::with_capacity(8192);
 
-    // Header
     let _ = writeln!(
         buf,
         "  MM Engine   uptime: {h:02}:{m:02}:{s:02}   {DIM}{}{RESET}",
         Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
     );
     let _ = writeln!(buf);
-
-    // Table header
     let _ = writeln!(buf, "  {CYAN}{HDR}{RESET}");
 
-    // Table rows
     for st in statuses.values() {
         let bid_str = st.bid_price
             .map(|p| fmt_price(p))
@@ -161,7 +246,7 @@ fn render_frame(
         };
 
         let band = format!("{:.1}/{:.1}/{:.1}",
-            st.band_min_bps, st.band_spread_bps, st.band_requote_bps);
+            st.band_min_bps, st.band_spread_bps, st.band_spread_bps + st.band_requote_bps);
 
         let age_str = if st.feed_age_ms >= 0 {
             format!("{:>5}ms", st.feed_age_ms)

@@ -18,15 +18,32 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tracing::{info, warn};
 
+use crypto_oms::mm::display::{self, DisplayBus, DisplayMsg};
+
+type DisplayState = (Option<DisplayBus>, Option<crossbeam_channel::Receiver<DisplayMsg>>);
+
+fn init_logging() -> DisplayState {
+    #[cfg(feature = "display")]
+    {
+        let (bus, rx) = display::init();
+        return (Some(bus), Some(rx));
+    }
+    #[cfg(not(feature = "display"))]
+    {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .init();
+        (None, None)
+    }
+}
+
 fn main() -> Result<()> {
     let _ = dotenv::dotenv();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    let (display_bus, display_rx) = init_logging();
 
     // Parse CLI args: mm_hl [--ghost] [--spin-core N] [--tokio-cores 2,3] [config_path]
     let mut ghost = false;
@@ -72,10 +89,16 @@ fn main() -> Result<()> {
     }
     let rt = rt_builder.build().context("failed to build tokio runtime")?;
 
-    rt.block_on(async_main(ghost, spin_core, config_path))
+    rt.block_on(async_main(ghost, spin_core, config_path, display_bus, display_rx))
 }
 
-async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) -> Result<()> {
+async fn async_main(
+    ghost: bool,
+    spin_core: Option<usize>,
+    config_path: String,
+    display_bus: Option<DisplayBus>,
+    display_rx: Option<crossbeam_channel::Receiver<DisplayMsg>>,
+) -> Result<()> {
 
     if ghost {
         info!("*** GHOST MODE — no orders will be sent ***");
@@ -232,10 +255,6 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
         None
     };
 
-    // Display channel (feature = "display")
-    #[cfg(feature = "display")]
-    let (display_tx, display_rx) = crossbeam_channel::bounded::<crypto_oms::mm::display::DisplayMsg>(256);
-
     // Build N engines — one per symbol
     let mut engines: Vec<MmEngine> = Vec::with_capacity(symbols.len());
     for (i, sym_cfg) in symbols.iter().enumerate() {
@@ -248,8 +267,7 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
             sym_cfg.clone(),
             ghost,
             i,
-            #[cfg(feature = "display")]
-            display_tx.clone(),
+            display_bus.clone(),
         )?;
         engines.push(engine);
     }
@@ -267,10 +285,10 @@ async fn async_main(ghost: bool, spin_core: Option<usize>, config_path: String) 
     let oms_events = oms.event_receiver();
 
     // Start display task (feature = "display")
-    #[cfg(feature = "display")]
-    {
+    // Start display task if active
+    if let Some(rx) = display_rx {
         let sd = shutdown.clone();
-        tokio::spawn(crypto_oms::mm::display::run_display(display_rx, sd));
+        tokio::spawn(crypto_oms::mm::display::run_display(rx, sd));
     }
 
     // Run the spin loop on a dedicated thread
