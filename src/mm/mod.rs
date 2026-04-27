@@ -922,10 +922,8 @@ impl MmEngine {
         let order_size = notional / fair;
         let max_pos = self.config.max_position_usd / fair;
 
-        let min_edge = self.config.min_edge_bps * fair / 10_000.0;
-        let half_spread = (self.config.ref_half_spread_bps * self.cached_vol_mult * fair
-            / 10_000.0)
-            .max(min_edge);
+        let half_spread =
+            self.config.ref_half_spread_bps * self.cached_vol_mult * fair / 10_000.0;
         let requote_thresh =
             self.config.ref_requote_tolerance_bps * self.cached_vol_mult * fair / 10_000.0;
 
@@ -1262,9 +1260,8 @@ impl MmEngine {
         };
 
         let vol_mult = self.cached_vol_mult;
-        let adj_min_bps = (self.config.ref_min_spread_bps * vol_mult).max(self.config.min_edge_bps);
-        let adj_spread_bps =
-            (self.config.ref_half_spread_bps * vol_mult).max(self.config.min_edge_bps);
+        let adj_min_bps = self.config.ref_min_spread_bps * vol_mult;
+        let adj_spread_bps = self.config.ref_half_spread_bps * vol_mult;
         let adj_requote_bps = self.config.ref_requote_tolerance_bps * vol_mult;
 
         let pred_vol_ann = vol_provider
