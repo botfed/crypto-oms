@@ -290,6 +290,8 @@ pub struct FactorConfig {
     pub beta: f64,
 }
 
+fn default_ref_half_spread() -> f64 { 3.0 }
+fn default_ref_min_spread() -> f64 { 1.0 }
 fn default_max_skew() -> f64 { 5.0 }
 fn default_skew_scale_usd() -> f64 { 100.0 }
 fn default_min_edge_bps() -> f64 { 0.1 }

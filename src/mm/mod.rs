@@ -823,8 +823,8 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
         }
 
         let mid = self.skewed_mid(fair);
-        let min_edge = self.config.min_edge_bps * fair / 10_000.0;
-        let min_spread = self.config.ref_min_spread_bps * self.cached_vol_mult * fair / 10_000.0;
+        let min_edge = self.config.min_edge_bps.unwrap() * fair / 10_000.0;
+        let min_spread = self.config.ref_min_spread_bps.unwrap() * self.cached_vol_mult * fair / 10_000.0;
         let max_bid = (mid - min_spread).min(fair - min_edge);
         let min_ask = (mid + min_spread).max(fair + min_edge);
 
@@ -937,13 +937,13 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
         let max_pos = self.config.max_position_usd / fair;
 
         let half_spread =
-            self.config.ref_half_spread_bps * self.cached_vol_mult * fair / 10_000.0;
+            self.config.ref_half_spread_bps.unwrap() * self.cached_vol_mult * fair / 10_000.0;
         let requote_thresh =
-            self.config.ref_requote_tolerance_bps * self.cached_vol_mult * fair / 10_000.0;
+            self.config.ref_requote_tolerance_bps.unwrap() * self.cached_vol_mult * fair / 10_000.0;
 
         self.cached_skew_bps = self.compute_skew_bps(fair, position, target);
         let skewed_mid = self.skewed_mid(fair);
-        let place_floor_bps = self.config.ref_min_spread_bps * self.cached_vol_mult;
+        let place_floor_bps = self.config.ref_min_spread_bps.unwrap() * self.cached_vol_mult;
         let (desired_bid, desired_ask) = Self::clamp_to_fair(
             fair,
             skewed_mid - half_spread,
@@ -1146,8 +1146,8 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
     fn compute_skew_bps(&self, fair_value: f64, position: f64, target: f64) -> f64 {
         let diff_usd = (target - position) * fair_value;
         let scale = self.config.skew_scale_usd.unwrap_or(100.0);
-        (diff_usd / scale * self.config.max_skew_bps)
-            .clamp(-self.config.max_skew_bps, self.config.max_skew_bps)
+        (diff_usd / scale * self.config.max_skew_bps.unwrap())
+            .clamp(-self.config.max_skew_bps.unwrap(), self.config.max_skew_bps.unwrap())
     }
 
     #[inline]
@@ -1278,9 +1278,9 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
         };
 
         let vol_mult = self.cached_vol_mult;
-        let adj_min_bps = self.config.ref_min_spread_bps * vol_mult;
-        let adj_spread_bps = self.config.ref_half_spread_bps * vol_mult;
-        let adj_requote_bps = self.config.ref_requote_tolerance_bps * vol_mult;
+        let adj_min_bps = self.config.ref_min_spread_bps.unwrap() * vol_mult;
+        let adj_spread_bps = self.config.ref_half_spread_bps.unwrap() * vol_mult;
+        let adj_requote_bps = self.config.ref_requote_tolerance_bps.unwrap() * vol_mult;
 
         let pred_vol_ann = vol_provider
             .as_ref()
@@ -1392,10 +1392,10 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
             skew_bps: self.cached_skew_bps,
             vol_ann_pct: pred_vol_ann * 100.0,
             vol_mult,
-            band_min_bps: self.config.ref_min_spread_bps * vol_mult,
-            band_spread_bps: self.config.ref_half_spread_bps * vol_mult,
-            band_requote_bps: self.config.ref_requote_tolerance_bps * vol_mult,
-            min_edge_bps: self.config.min_edge_bps,
+            band_min_bps: self.config.ref_min_spread_bps.unwrap() * vol_mult,
+            band_spread_bps: self.config.ref_half_spread_bps.unwrap() * vol_mult,
+            band_requote_bps: self.config.ref_requote_tolerance_bps.unwrap() * vol_mult,
+            min_edge_bps: self.config.min_edge_bps.unwrap(),
             position,
             target,
             max_pos,

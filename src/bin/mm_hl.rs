@@ -152,6 +152,11 @@ async fn async_main(
     for sym in &mut symbols {
         sym.skew_scale_usd.get_or_insert(config.skew_scale_usd);
         sym.post_only.get_or_insert(config.post_only);
+        sym.ref_half_spread_bps.get_or_insert(config.ref_half_spread_bps);
+        sym.ref_min_spread_bps.get_or_insert(config.ref_min_spread_bps);
+        sym.max_skew_bps.get_or_insert(config.max_skew_bps);
+        sym.min_edge_bps.get_or_insert(config.min_edge_bps);
+        sym.ref_requote_tolerance_bps.get_or_insert(config.ref_requote_tolerance_bps);
     }
 
     // FairPriceEngine — basis updated by engine in slow path, no background task
