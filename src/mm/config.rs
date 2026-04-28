@@ -2,6 +2,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::Duration;
 
+use crate::hibachi::HibachiOmsConfig;
 use crate::hyperliquid::HyperliquidOmsConfig;
 use crypto_feeds::app_config::AppConfig;
 use crypto_feeds::market_data::ClockCorrectionConfig;
@@ -12,7 +13,14 @@ use crypto_feeds::market_data::ClockCorrectionConfig;
 
 #[derive(Debug, Deserialize)]
 pub struct MmConfig {
-    pub hyperliquid: HlConfig,
+    /// Target exchange: "hyperliquid" or "hibachi"
+    #[serde(default = "default_exchange")]
+    pub exchange: String,
+
+    #[serde(default)]
+    pub hyperliquid: Option<HlConfig>,
+    #[serde(default)]
+    pub hibachi: Option<HibachiExchangeConfig>,
 
     #[serde(default)]
     pub perp: HashMap<String, Vec<String>>,
@@ -33,6 +41,18 @@ pub struct MmConfig {
     #[serde(default = "default_post_only")]
     pub post_only: bool,
 
+    /// Global defaults for spread/edge params (per-symbol overrides if set)
+    #[serde(default = "default_ref_half_spread")]
+    pub ref_half_spread_bps: f64,
+    #[serde(default = "default_ref_min_spread")]
+    pub ref_min_spread_bps: f64,
+    #[serde(default = "default_max_skew")]
+    pub max_skew_bps: f64,
+    #[serde(default = "default_min_edge_bps")]
+    pub min_edge_bps: f64,
+    #[serde(default = "default_requote_tolerance")]
+    pub ref_requote_tolerance_bps: f64,
+
     /// Optional vol model config for vol-adjusted spreads
     #[serde(default)]
     pub vol_models: Option<crypto_feeds::app_config::VolModelConfig>,
@@ -47,9 +67,23 @@ pub struct HlConfig {
     pub inflight_timeout_ms: u64,
 }
 
+fn default_exchange() -> String { "hyperliquid".to_string() }
 fn default_sample_interval() -> u64 { 10 }
 fn default_poll_interval() -> u64 { 3000 }
 fn default_inflight_timeout() -> u64 { 5000 }
+fn default_max_fees_percent() -> f64 { 0.001 }
+
+#[derive(Debug, Deserialize)]
+pub struct HibachiExchangeConfig {
+    pub api_url: Option<String>,
+    pub data_api_url: Option<String>,
+    #[serde(default = "default_poll_interval")]
+    pub poll_interval_ms: u64,
+    #[serde(default = "default_inflight_timeout")]
+    pub inflight_timeout_ms: u64,
+    #[serde(default = "default_max_fees_percent")]
+    pub max_fees_percent: f64,
+}
 
 impl MmConfig {
     pub fn to_feeds_config(&self) -> AppConfig {
@@ -65,16 +99,35 @@ impl MmConfig {
         }
     }
 
-    pub fn to_oms_config(&self, private_key: String, account_address: String) -> HyperliquidOmsConfig {
+    pub fn to_hl_oms_config(&self, private_key: String, account_address: String) -> HyperliquidOmsConfig {
+        let hl = self.hyperliquid.as_ref().expect("hyperliquid config required");
         HyperliquidOmsConfig {
             private_key,
             account_address,
-            base_url: self.hyperliquid.base_url.clone(),
-            poll_interval: Duration::from_millis(self.hyperliquid.poll_interval_ms),
-            inflight_timeout: Duration::from_millis(self.hyperliquid.inflight_timeout_ms),
+            base_url: hl.base_url.clone(),
+            poll_interval: Duration::from_millis(hl.poll_interval_ms),
+            inflight_timeout: Duration::from_millis(hl.inflight_timeout_ms),
             stray_order_age: Duration::from_millis(
                 self.symbols.first().map(|s| s.stray_order_age_ms).unwrap_or(5000)
             ),
+        }
+    }
+
+    pub fn to_hibachi_oms_config(&self, api_key: String, private_key: String, account_id: u64) -> HibachiOmsConfig {
+        let hb = self.hibachi.as_ref().expect("hibachi config required");
+        let stray = Duration::from_millis(
+            self.symbols.first().map(|s| s.stray_order_age_ms).unwrap_or(5000)
+        );
+        HibachiOmsConfig {
+            api_key,
+            private_key,
+            account_id,
+            api_url: hb.api_url.clone(),
+            data_api_url: hb.data_api_url.clone(),
+            poll_interval: Duration::from_millis(hb.poll_interval_ms),
+            inflight_timeout: Duration::from_millis(hb.inflight_timeout_ms),
+            stray_order_age: stray,
+            max_fees_percent: hb.max_fees_percent,
         }
     }
 }
@@ -163,21 +216,23 @@ pub struct StrategyConfig {
     /// Max absolute position before hard pause
     pub max_position_usd: f64,
     /// Max inventory skew in bps (linear ramp, clamped at this value)
-    #[serde(default = "default_max_skew")]
-    pub max_skew_bps: f64,
+    #[serde(default)]
+    pub max_skew_bps: Option<f64>,
     /// USD deviation from target at which skew hits max_skew_bps (overrides global)
     #[serde(default)]
     pub skew_scale_usd: Option<f64>,
     /// Absolute minimum edge from fair in bps — hard floor, never quotes closer
-    #[serde(default = "default_min_edge_bps")]
-    pub min_edge_bps: f64,
+    #[serde(default)]
+    pub min_edge_bps: Option<f64>,
     /// Quote placement distance from skewed mid in bps (at ref_vol)
-    pub ref_half_spread_bps: f64,
+    #[serde(default)]
+    pub ref_half_spread_bps: Option<f64>,
     /// Cancel line: min distance from fair in bps (at ref_vol). Fast cancel fires inside this.
-    pub ref_min_spread_bps: f64,
+    #[serde(default)]
+    pub ref_min_spread_bps: Option<f64>,
     /// Outer-side drift in bps before slow-path requote (at ref_vol, scaled by vol_mult)
-    #[serde(default = "default_requote_tolerance")]
-    pub ref_requote_tolerance_bps: f64,
+    #[serde(default)]
+    pub ref_requote_tolerance_bps: Option<f64>,
     // -- Vol adjustment --
     /// Mean annualized vol — calibration anchor for spread scaling
     #[serde(default = "default_ref_vol")]

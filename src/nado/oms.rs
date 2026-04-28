@@ -805,8 +805,15 @@ impl NadoOms {
 // ExchangeOms trait implementation
 // ---------------------------------------------------------------------------
 
+/// Nado hot-path types — not used for MM yet (async signing doesn't fit sync split).
+pub struct NadoPreparedOrder;
+pub struct NadoSignedPayload;
+
 #[async_trait]
 impl ExchangeOms for NadoOms {
+    type PreparedOrder = NadoPreparedOrder;
+    type SignedPayload = NadoSignedPayload;
+
     fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
     }
@@ -1175,8 +1182,30 @@ impl ExchangeOms for NadoOms {
     }
 
     fn round_price(&self, price: f64) -> f64 {
-        // TODO: implement Nado-specific price rounding
         price
+    }
+
+    fn prepare_place_order(&self, _req: &OrderRequest) -> Result<(ClientOrderId, Self::PreparedOrder)> {
+        bail!("Nado hot-path not implemented — use place_order()")
+    }
+    fn sign_order(&self, _prepared: Self::PreparedOrder) -> Result<Self::SignedPayload> {
+        bail!("Nado hot-path not implemented")
+    }
+    async fn post_order(&self, _cid: u64, _signed: Self::SignedPayload) {}
+    fn sign_cancel(&self, _id: &ClientOrderId) -> Result<Self::SignedPayload> {
+        bail!("Nado hot-path not implemented — use cancel_order()")
+    }
+    fn presign_cancel(&self, _id: &ClientOrderId) -> Result<Self::SignedPayload> {
+        bail!("Nado hot-path not implemented")
+    }
+    fn mark_cancelling(&self, id: &ClientOrderId) {
+        if let Some(mut h) = self.state.orders.get_mut(&id.0) {
+            h.state = OrderState::Cancelling;
+        }
+    }
+    async fn post_cancel(&self, _id: &ClientOrderId, _signed: Self::SignedPayload) {}
+    async fn shutdown_cancel_all(&self, symbol: Option<&str>) -> Result<()> {
+        self.cancel_all(symbol).await
     }
 }
 

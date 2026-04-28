@@ -70,6 +70,10 @@ name = "hibachi_demo"
 path = "src/bin/hibachi_demo.rs"
 
 [[bin]]
+name = "mm"
+path = "src/bin/mm.rs"
+
+[[bin]]
 name = "mm_hl"
 path = "src/bin/mm_hl.rs"
 

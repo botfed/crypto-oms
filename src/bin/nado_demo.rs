@@ -78,6 +78,7 @@ impl DemoConfig {
         AppConfig {
             spot: self.spot.clone(),
             perp: self.perp.clone(),
+            trades: Default::default(),
             sample_interval_ms: self.sample_interval_ms,
             onchain: None,
             fair_price: Default::default(),

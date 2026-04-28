@@ -12,7 +12,7 @@ use oms_core::state_tracker::OmsStateTracker;
 use oms_core::*;
 use tracing::{debug, info, warn};
 
-use crate::hyperliquid::{HyperliquidOms, SignedPayload};
+use crate::ExchangeOms;
 use config::StrategyConfig;
 use crypto_feeds::MarketDataCollection;
 use crypto_feeds::market_data::InstrumentType;
@@ -179,6 +179,7 @@ fn collection_for(
         ExchangeId::Bybit => &market_data.bybit,
         ExchangeId::Okx => &market_data.okx,
         ExchangeId::Hyperliquid => &market_data.hyperliquid,
+        ExchangeId::Hibachi => &market_data.hibachi,
     }
 }
 
@@ -224,8 +225,8 @@ fn factor_mid(
 // MmEngine — one per symbol
 // ---------------------------------------------------------------------------
 
-pub struct MmEngine {
-    oms: Arc<HyperliquidOms>,
+pub struct MmEngine<O: ExchangeOms> {
+    oms: Arc<O>,
     fair_price: Arc<FairPriceEngine>,
     market_data: Arc<crypto_feeds::AllMarketData>,
     target_position_rx: Option<tokio::sync::watch::Receiver<f64>>,
@@ -252,7 +253,7 @@ pub struct MmEngine {
     cached_vol_mult: f64,
     cached_skew_bps: f64,
     has_vol_params: bool,
-    presigned_cancels: HashMap<ClientOrderId, SignedPayload>,
+    presigned_cancels: HashMap<ClientOrderId, O::SignedPayload>,
     display: Option<display::DisplayBus>,
     // TODO: per-engine profiling files for multi-ticker
     #[cfg(feature = "profiling")]
@@ -262,9 +263,9 @@ pub struct MmEngine {
 const MAX_CONSECUTIVE_REJECTS: u32 = 5;
 const REJECT_COOLDOWN: Duration = Duration::from_secs(1);
 
-impl MmEngine {
+impl<O: ExchangeOms + 'static> MmEngine<O> {
     pub fn new(
-        oms: Arc<HyperliquidOms>,
+        oms: Arc<O>,
         fair_price: Arc<FairPriceEngine>,
         market_data: Arc<crypto_feeds::AllMarketData>,
         target_position_rx: Option<tokio::sync::watch::Receiver<f64>>,
@@ -848,7 +849,7 @@ impl MmEngine {
                     self.oms.mark_cancelling(&q.client_id);
                     Ok(s)
                 } else {
-                    self.oms.sign_cancel_order(&q.client_id)
+                    self.oms.sign_cancel(&q.client_id)
                 };
                 match signed {
                     Ok(signed) => {
@@ -864,7 +865,7 @@ impl MmEngine {
                             self.bid_quote = None;
                         } else {
                             tokio::spawn(async move {
-                                oms.post_cancel_order(&cid, signed).await;
+                                oms.post_cancel(&cid, signed).await;
                             });
                         }
                     }
@@ -894,7 +895,7 @@ impl MmEngine {
                     self.oms.mark_cancelling(&q.client_id);
                     Ok(s)
                 } else {
-                    self.oms.sign_cancel_order(&q.client_id)
+                    self.oms.sign_cancel(&q.client_id)
                 };
                 match signed {
                     Ok(signed) => {
@@ -910,7 +911,7 @@ impl MmEngine {
                             self.ask_quote = None;
                         } else {
                             tokio::spawn(async move {
-                                oms.post_cancel_order(&cid, signed).await;
+                                oms.post_cancel(&cid, signed).await;
                             });
                         }
                     }
@@ -1070,8 +1071,8 @@ impl MmEngine {
                     });
                     let oms = Arc::clone(&self.oms);
                     tokio::spawn(async move {
-                        match oms.sign_place_order(sdk_req) {
-                            Ok(signed) => oms.post_place_order(cid.0, signed).await,
+                        match oms.sign_order(sdk_req) {
+                            Ok(signed) => oms.post_order(cid.0, signed).await,
                             Err(e) => warn!("failed to sign bid {}: {e}", cid.0),
                         }
                     });
@@ -1127,8 +1128,8 @@ impl MmEngine {
                     });
                     let oms = Arc::clone(&self.oms);
                     tokio::spawn(async move {
-                        match oms.sign_place_order(sdk_req) {
-                            Ok(signed) => oms.post_place_order(cid.0, signed).await,
+                        match oms.sign_order(sdk_req) {
+                            Ok(signed) => oms.post_order(cid.0, signed).await,
                             Err(e) => warn!("failed to sign ask {}: {e}", cid.0),
                         }
                     });
@@ -1431,7 +1432,7 @@ impl MmEngine {
                     self.consecutive_rejects = 0;
                     self.reject_pause_until = None;
                     // Pre-sign cancel for fast path
-                    match self.oms.presign_cancel_order(client_id) {
+                    match self.oms.presign_cancel(client_id) {
                         Ok(signed) => {
                             self.presigned_cancels.insert(*client_id, signed);
                         }

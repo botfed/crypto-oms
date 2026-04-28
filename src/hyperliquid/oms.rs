@@ -1219,6 +1219,9 @@ impl HyperliquidOms {
 
 #[async_trait]
 impl ExchangeOms for HyperliquidOms {
+    type PreparedOrder = ClientOrderRequest;
+    type SignedPayload = SignedPayload;
+
     fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
     }
@@ -1232,8 +1235,8 @@ impl ExchangeOms for HyperliquidOms {
     }
 
     async fn place_order(&self, req: OrderRequest) -> Result<ClientOrderId> {
-        let (cid, sdk_req) = self.prepare_place_order(&req)?;
-        let signed = self.sign_place_order(sdk_req)?;
+        let (cid, prepared) = self.prepare_place_order(&req)?;
+        let signed = self.sign_place_order(prepared)?;
         self.post_place_order(cid.0, signed).await;
         Ok(cid)
     }
@@ -1453,6 +1456,42 @@ impl ExchangeOms for HyperliquidOms {
 
     fn round_price(&self, price: f64) -> f64 {
         round_price_for_hl(price)
+    }
+
+    // -- Hot-path split order placement --
+
+    fn prepare_place_order(&self, req: &OrderRequest) -> Result<(ClientOrderId, Self::PreparedOrder)> {
+        HyperliquidOms::prepare_place_order(self, req)
+    }
+
+    fn sign_order(&self, prepared: Self::PreparedOrder) -> Result<Self::SignedPayload> {
+        self.sign_place_order(prepared)
+    }
+
+    async fn post_order(&self, cid: u64, signed: Self::SignedPayload) {
+        self.post_place_order(cid, signed).await
+    }
+
+    // -- Hot-path split cancel --
+
+    fn sign_cancel(&self, id: &ClientOrderId) -> Result<Self::SignedPayload> {
+        self.sign_cancel_order(id)
+    }
+
+    fn presign_cancel(&self, id: &ClientOrderId) -> Result<Self::SignedPayload> {
+        self.presign_cancel_order(id)
+    }
+
+    fn mark_cancelling(&self, id: &ClientOrderId) {
+        HyperliquidOms::mark_cancelling(self, id)
+    }
+
+    async fn post_cancel(&self, id: &ClientOrderId, signed: Self::SignedPayload) {
+        self.post_cancel_order(id, signed).await
+    }
+
+    async fn shutdown_cancel_all(&self, symbol: Option<&str>) -> Result<()> {
+        HyperliquidOms::shutdown_cancel_all(self, symbol).await
     }
 }
 

@@ -800,11 +800,36 @@ impl HibachiOms {
 }
 
 // ---------------------------------------------------------------------------
+// Hot-path types
+// ---------------------------------------------------------------------------
+
+/// Prepared order ready for signing.
+pub struct HibachiPreparedOrder {
+    pub cid: u64,
+    pub nonce: u64,
+    pub contract: ContractInfo,
+    pub req: OrderRequest,
+    pub quantity_raw: u64,
+    pub side_code: u32,
+    pub price_raw: Option<u64>,
+    pub max_fees_raw: u64,
+}
+
+/// Signed payload ready for HTTP post (order or cancel).
+pub enum HibachiSignedPayload {
+    Order { body: serde_json::Value },
+    Cancel { body: serde_json::Value, exchange_id: String },
+}
+
+// ---------------------------------------------------------------------------
 // ExchangeOms trait implementation
 // ---------------------------------------------------------------------------
 
 #[async_trait]
 impl ExchangeOms for HibachiOms {
+    type PreparedOrder = HibachiPreparedOrder;
+    type SignedPayload = HibachiSignedPayload;
+
     fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
     }
@@ -1095,13 +1120,223 @@ impl ExchangeOms for HibachiOms {
     }
 
     fn round_price(&self, price: f64) -> f64 {
-        // Use the first contract's tick size as default.
-        // In practice, caller should use the correct contract.
         let contracts = self.contracts.read();
         if let Some(c) = contracts.values().next() {
             Self::round_to_tick(price, c.tick_size)
         } else {
             price
         }
+    }
+
+    // -- Hot-path split order placement --
+
+    fn prepare_place_order(&self, req: &OrderRequest) -> Result<(ClientOrderId, Self::PreparedOrder)> {
+        self.check_ready()?;
+
+        let contract = self.get_contract(&req.symbol)?;
+        let cid = self.next_client_id.fetch_add(1, Ordering::Relaxed);
+        let nonce = HibachiClient::gen_nonce();
+
+        let side_code: u32 = if req.side == Side::Buy { 1 } else { 0 };
+        let rounded_size = Self::round_to_lot(req.size, contract.lot_size);
+        let quantity_raw = (rounded_size * 10f64.powi(contract.underlying_decimals as i32)) as u64;
+        let max_fees_raw = (self.config.max_fees_percent * 1e8) as u64;
+
+        let price_raw = match req.order_type {
+            OrderType::Limit { price, .. } => {
+                let rounded = Self::round_to_tick(price, contract.tick_size);
+                let dec_diff = contract.settlement_decimals as i32 - contract.underlying_decimals as i32;
+                Some((rounded * (1u64 << 32) as f64 * 10f64.powi(dec_diff)) as u64)
+            }
+            _ => None,
+        };
+
+        // Insert inflight handle
+        let handle = OrderHandle {
+            client_id: ClientOrderId(cid),
+            exchange_id: None,
+            symbol: req.symbol.clone(),
+            side: req.side,
+            order_type: req.order_type,
+            size: req.size,
+            filled_size: 0.0,
+            avg_fill_price: None,
+            state: OrderState::Inflight,
+            reduce_only: req.reduce_only,
+            reject_reason: None,
+            exchange_ts: None,
+            submitted_at: Some(Instant::now()),
+            last_modified: Some(Instant::now()),
+        };
+        self.state.orders.insert(cid, handle);
+        let _ = self.event_tx.send(OmsEvent::OrderInflight(ClientOrderId(cid)));
+
+        Ok((ClientOrderId(cid), HibachiPreparedOrder {
+            cid, nonce, contract, req: req.clone(),
+            quantity_raw, side_code, price_raw, max_fees_raw,
+        }))
+    }
+
+    fn sign_order(&self, prepared: Self::PreparedOrder) -> Result<Self::SignedPayload> {
+        let payload = self.client.build_order_payload(
+            prepared.nonce, prepared.contract.id,
+            prepared.quantity_raw, prepared.side_code,
+            prepared.price_raw, prepared.max_fees_raw,
+        );
+        let signature = self.client.sign(&payload)?;
+
+        let rounded_size = Self::round_to_lot(prepared.req.size, prepared.contract.lot_size);
+        let native_symbol = canonical_to_hibachi(&prepared.req.symbol);
+        let side_str = if prepared.req.side == Side::Buy { "BID" } else { "ASK" };
+
+        let mut body = serde_json::json!({
+            "accountId": self.client.account_id,
+            "nonce": prepared.nonce,
+            "symbol": native_symbol,
+            "quantity": format!("{rounded_size}"),
+            "side": side_str,
+            "maxFeesPercent": format!("{}", self.config.max_fees_percent),
+            "signature": signature,
+        });
+
+        match prepared.req.order_type {
+            OrderType::Limit { price, tif } => {
+                let rounded = Self::round_to_tick(price, prepared.contract.tick_size);
+                body["orderType"] = serde_json::json!("LIMIT");
+                body["price"] = serde_json::json!(format!("{rounded}"));
+                match tif {
+                    TimeInForce::PostOnly => { body["orderFlags"] = serde_json::json!("POST_ONLY"); }
+                    TimeInForce::IOC => { body["orderFlags"] = serde_json::json!("IOC"); }
+                    _ => {}
+                }
+            }
+            OrderType::Market => {
+                body["orderType"] = serde_json::json!("MARKET");
+            }
+            _ => {}
+        }
+        if prepared.req.reduce_only {
+            body["orderFlags"] = serde_json::json!("REDUCE_ONLY");
+        }
+
+        Ok(HibachiSignedPayload::Order { body })
+    }
+
+    async fn post_order(&self, cid: u64, signed: Self::SignedPayload) {
+        let body = match signed {
+            HibachiSignedPayload::Order { body } => body,
+            _ => { warn!("post_order called with non-order payload"); return; }
+        };
+
+        match self.client.place_order_rest(body).await {
+            Ok(resp) => {
+                let oid = resp.order_id;
+                if let Some(mut h) = self.state.orders.get_mut(&cid) {
+                    h.exchange_id = Some(oid.clone());
+                    h.state = OrderState::Accepted;
+                    h.last_modified = Some(Instant::now());
+                }
+                self.state.oid_map.insert(oid.clone(), cid);
+                let _ = self.event_tx.send(OmsEvent::OrderAccepted {
+                    client_id: ClientOrderId(cid),
+                    exchange_id: oid,
+                });
+            }
+            Err(e) => {
+                warn!("hibachi post_order failed for cid={cid}: {e}");
+                if let Some(mut h) = self.state.orders.get_mut(&cid) {
+                    h.state = OrderState::Rejected;
+                    h.reject_reason = Some(format!("{e}"));
+                    h.last_modified = Some(Instant::now());
+                }
+                let _ = self.event_tx.send(OmsEvent::OrderRejected {
+                    client_id: ClientOrderId(cid),
+                    reason: format!("{e}"),
+                });
+            }
+        }
+    }
+
+    // -- Hot-path split cancel --
+
+    fn sign_cancel(&self, id: &ClientOrderId) -> Result<Self::SignedPayload> {
+        self.check_ready()?;
+
+        let handle = self.state.orders.get(&id.0)
+            .ok_or(OmsError::OrderNotFound(id.0))?;
+        let exchange_id = handle.exchange_id.clone()
+            .ok_or_else(|| OmsError::Internal("no exchange oid yet".into()))?;
+        drop(handle);
+
+        // Mark cancelling
+        if let Some(mut h) = self.state.orders.get_mut(&id.0) {
+            h.state = OrderState::Cancelling;
+            h.last_modified = Some(Instant::now());
+        }
+        let _ = self.event_tx.send(OmsEvent::OrderCancelling(*id));
+
+        let oid_u64: u64 = exchange_id.parse().unwrap_or(0);
+        let payload = self.client.build_cancel_payload(oid_u64);
+        let signature = self.client.sign(&payload)?;
+
+        let body = serde_json::json!({
+            "accountId": self.client.account_id,
+            "orderId": &exchange_id,
+            "signature": signature,
+        });
+
+        Ok(HibachiSignedPayload::Cancel { body, exchange_id })
+    }
+
+    fn presign_cancel(&self, id: &ClientOrderId) -> Result<Self::SignedPayload> {
+        self.check_ready()?;
+
+        let handle = self.state.orders.get(&id.0)
+            .ok_or(OmsError::OrderNotFound(id.0))?;
+        let exchange_id = handle.exchange_id.clone()
+            .ok_or_else(|| OmsError::Internal("no exchange oid yet".into()))?;
+        drop(handle);
+
+        // No state change — just sign
+        let oid_u64: u64 = exchange_id.parse().unwrap_or(0);
+        let payload = self.client.build_cancel_payload(oid_u64);
+        let signature = self.client.sign(&payload)?;
+
+        let body = serde_json::json!({
+            "accountId": self.client.account_id,
+            "orderId": &exchange_id,
+            "signature": signature,
+        });
+
+        Ok(HibachiSignedPayload::Cancel { body, exchange_id })
+    }
+
+    fn mark_cancelling(&self, id: &ClientOrderId) {
+        if let Some(mut h) = self.state.orders.get_mut(&id.0) {
+            h.state = OrderState::Cancelling;
+            h.last_modified = Some(Instant::now());
+        }
+    }
+
+    async fn post_cancel(&self, id: &ClientOrderId, signed: Self::SignedPayload) {
+        let body = match signed {
+            HibachiSignedPayload::Cancel { body, .. } => body,
+            _ => { warn!("post_cancel called with non-cancel payload"); return; }
+        };
+
+        match self.client.cancel_order_rest(body).await {
+            Ok(()) => { /* Cancelling already set, REST poll will confirm */ }
+            Err(e) => {
+                warn!("hibachi cancel failed for {}: {e}, restoring to Accepted", id.0);
+                if let Some(mut h) = self.state.orders.get_mut(&id.0) {
+                    h.state = OrderState::Accepted;
+                    h.last_modified = Some(Instant::now());
+                }
+            }
+        }
+    }
+
+    async fn shutdown_cancel_all(&self, symbol: Option<&str>) -> Result<()> {
+        self.cancel_all(symbol).await
     }
 }

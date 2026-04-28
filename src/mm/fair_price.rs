@@ -21,6 +21,7 @@ pub enum ExchangeId {
     Bybit,
     Okx,
     Hyperliquid,
+    Hibachi,
 }
 
 impl fmt::Display for ExchangeId {
@@ -30,6 +31,7 @@ impl fmt::Display for ExchangeId {
             ExchangeId::Bybit => write!(f, "bybit"),
             ExchangeId::Okx => write!(f, "okx"),
             ExchangeId::Hyperliquid => write!(f, "hyperliquid"),
+            ExchangeId::Hibachi => write!(f, "hibachi"),
         }
     }
 }
@@ -205,6 +207,7 @@ impl FairPriceEngine {
                 ExchangeId::Bybit => "bybit",
                 ExchangeId::Okx => "okx",
                 ExchangeId::Hyperliquid => "hyperliquid",
+                ExchangeId::Hibachi => "hibachi",
             };
             Some((price, ex_ts, ref_name, received_instant, feed_lat))
         })
@@ -258,6 +261,7 @@ impl FairPriceEngine {
             ExchangeId::Bybit => &self.market_data.bybit,
             ExchangeId::Okx => &self.market_data.okx,
             ExchangeId::Hyperliquid => &self.market_data.hyperliquid,
+            ExchangeId::Hibachi => &self.market_data.hibachi,
         }
     }
 
@@ -310,6 +314,7 @@ pub(crate) fn parse_exchange_id(s: &str) -> anyhow::Result<ExchangeId> {
         "bybit" => Ok(ExchangeId::Bybit),
         "okx" => Ok(ExchangeId::Okx),
         "hyperliquid" | "hl" => Ok(ExchangeId::Hyperliquid),
+        "hibachi" => Ok(ExchangeId::Hibachi),
         _ => anyhow::bail!("unknown exchange: {s}"),
     }
 }

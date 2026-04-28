@@ -4,6 +4,7 @@ use crypto_feeds::historical_bars::{aggregate_bars, load_1m_bars_with_backfill};
 use crypto_feeds::vol_provider::VolProvider;
 use crypto_feeds::AllMarketData;
 use crypto_oms::ExchangeOms;
+use crypto_oms::hibachi::HibachiOms;
 use crypto_oms::hyperliquid::HyperliquidOms;
 use crypto_oms::mm::config::MmConfig;
 use crypto_oms::mm::fair_price::FairPriceEngine;
@@ -18,14 +19,14 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tracing::{info, warn};
 
-use crypto_oms::mm::display::{self, DisplayBus, DisplayMsg};
+use crypto_oms::mm::display::{DisplayBus, DisplayMsg};
 
 type DisplayState = (Option<DisplayBus>, Option<crossbeam_channel::Receiver<DisplayMsg>>);
 
 fn init_logging() -> DisplayState {
     #[cfg(feature = "display")]
     {
-        let (bus, rx) = display::init();
+        let (bus, rx) = crypto_oms::mm::display::init();
         return (Some(bus), Some(rx));
     }
     #[cfg(not(feature = "display"))]
@@ -45,11 +46,10 @@ fn main() -> Result<()> {
 
     let (display_bus, display_rx) = init_logging();
 
-    // Parse CLI args: mm_hl [--ghost] [--spin-core N] [--tokio-cores 2,3] [config_path]
     let mut ghost = false;
     let mut spin_core: Option<usize> = None;
     let mut tokio_cores: Option<Vec<usize>> = None;
-    let mut config_path = "configs/mm_hl.yaml".to_string();
+    let mut config_path = "configs/mm.yaml".to_string();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
@@ -72,7 +72,6 @@ fn main() -> Result<()> {
         i += 1;
     }
 
-    // Build tokio runtime — pin workers to specific cores if requested.
     let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
     rt_builder.enable_all();
     if let Some(ref cores) = tokio_cores {
@@ -99,23 +98,54 @@ async fn async_main(
     display_bus: Option<DisplayBus>,
     display_rx: Option<crossbeam_channel::Receiver<DisplayMsg>>,
 ) -> Result<()> {
-
     if ghost {
         info!("*** GHOST MODE — no orders will be sent ***");
     }
 
-    // Load config
     let contents = std::fs::read_to_string(&config_path)
         .with_context(|| format!("failed to read config: {config_path}"))?;
     let config: MmConfig = serde_yaml::from_str(&contents)
         .with_context(|| format!("failed to parse config: {config_path}"))?;
 
-    // HL credentials from env
-    let private_key = std::env::var("HL_PRIVATE_KEY")
-        .context("HL_PRIVATE_KEY env var not set")?;
-    let account_address = std::env::var("HL_ACCOUNT_ADDRESS")
-        .context("HL_ACCOUNT_ADDRESS env var not set")?;
+    let exchange = config.exchange.clone();
+    info!("target exchange: {exchange}");
 
+    match exchange.as_str() {
+        "hyperliquid" => {
+            let private_key = std::env::var("HL_PRIVATE_KEY")
+                .context("HL_PRIVATE_KEY env var not set")?;
+            let account_address = std::env::var("HL_ACCOUNT_ADDRESS")
+                .context("HL_ACCOUNT_ADDRESS env var not set")?;
+            let oms_config = config.to_hl_oms_config(private_key, account_address);
+            let oms = HyperliquidOms::new(oms_config)?;
+            oms.start();
+            run_mm(oms, config, ghost, spin_core, display_bus, display_rx).await
+        }
+        "hibachi" => {
+            let api_key = std::env::var("HIBACHI_API_KEY")
+                .context("HIBACHI_API_KEY env var not set")?;
+            let private_key = std::env::var("HIBACHI_PRIVATE_KEY")
+                .context("HIBACHI_PRIVATE_KEY env var not set")?;
+            let account_id: u64 = std::env::var("HIBACHI_ACCOUNT_ID")
+                .context("HIBACHI_ACCOUNT_ID env var not set")?
+                .parse().context("HIBACHI_ACCOUNT_ID must be a number")?;
+            let oms_config = config.to_hibachi_oms_config(api_key, private_key, account_id);
+            let oms = HibachiOms::new(oms_config)?;
+            oms.start();
+            run_mm(oms, config, ghost, spin_core, display_bus, display_rx).await
+        }
+        other => anyhow::bail!("unsupported exchange: {other}"),
+    }
+}
+
+async fn run_mm<O: ExchangeOms + 'static>(
+    oms: Arc<O>,
+    config: MmConfig,
+    ghost: bool,
+    spin_core: Option<usize>,
+    display_bus: Option<DisplayBus>,
+    display_rx: Option<crossbeam_channel::Receiver<DisplayMsg>>,
+) -> Result<()> {
     let shutdown = Arc::new(Notify::new());
     let engine_shutdown = Arc::new(AtomicBool::new(false));
 
@@ -132,7 +162,7 @@ async fn async_main(
         std::process::exit(1);
     });
 
-    // Seed symbol registry with base assets from config before any REGISTRY access
+    // Seed symbol registry
     let feeds_config = config.to_feeds_config();
     crypto_feeds::symbol_registry::seed_extra_bases(feeds_config.base_assets());
 
@@ -142,10 +172,8 @@ async fn async_main(
     load_spot(&mut handles, &feeds_config, &market_data, &shutdown)?;
     load_perp(&mut handles, &feeds_config, &market_data, &shutdown)?;
 
-    // Start HL OMS
-    let oms_config = config.to_hl_oms_config(private_key, account_address);
-    let oms = HyperliquidOms::new(oms_config)?;
-    oms.start();
+    // Wait for OMS ready
+    oms.wait_ready().await?;
 
     anyhow::ensure!(!config.symbols.is_empty(), "config must have at least one symbol in 'symbols'");
     let mut symbols = config.symbols;
@@ -154,12 +182,10 @@ async fn async_main(
         sym.post_only.get_or_insert(config.post_only);
     }
 
-    // FairPriceEngine — basis updated by engine in slow path, no background task
     let fair_price = Arc::new(FairPriceEngine::new(market_data.clone(), config.fair_price)?);
-
     let use_target_rx = config.inventory.mode == crypto_oms::mm::config::InventoryMode::Hedge;
 
-    // Initialize vol provider if vol_models is configured
+    // Vol provider
     let vol_model_name = config.vol_models
         .as_ref()
         .map(|v| v.model.clone())
@@ -178,7 +204,6 @@ async fn async_main(
         let target_min = all_params.values().next().map(|p| p.target_min).unwrap_or(5);
         let bar_data_dir = Path::new(&vol_cfg.bar_data_dir);
 
-        // Build HAR groups in config symbol order — group[i] matches symbols[i].vol_group_idx
         let mut har_groups = Vec::new();
         for sym_cfg in &symbols {
             let vol_sym = &sym_cfg.vol_symbol;
@@ -220,10 +245,8 @@ async fn async_main(
             }
         }
 
-        // Track which symbols have real HAR params
         let has_vol_params: Vec<bool> = har_groups.iter().map(|g| g.is_some()).collect();
 
-        // Build provider with one group per symbol
         let final_groups: Vec<_> = har_groups.into_iter().enumerate().map(|(i, g)| {
             g.unwrap_or_else(|| {
                 let har = crypto_feeds::vol_params::HarParams {
@@ -247,8 +270,8 @@ async fn async_main(
         (None, vec![false; symbols.len()])
     };
 
-    // Build N engines — one per symbol, each with its own inventory manager
-    let mut engines: Vec<MmEngine<HyperliquidOms>> = Vec::with_capacity(symbols.len());
+    // Build engines
+    let mut engines: Vec<MmEngine<O>> = Vec::with_capacity(symbols.len());
     for (i, sym_cfg) in symbols.iter().enumerate() {
         let asset = sym_cfg.symbol
             .strip_prefix("PERP_")
@@ -276,23 +299,17 @@ async fn async_main(
     let sym_names: Vec<&str> = engines.iter().map(|e| e.symbol()).collect();
     info!("MM engine starting: symbols=[{}] ghost={}", sym_names.join(", "), ghost);
 
-    // Wait for OMS ready
-    oms.wait_ready().await?;
     let mut oms_state = OmsStateTracker::new(StateTrackerConfig::default());
     oms_state.apply_event(&OmsEvent::Ready);
     info!("OMS ready, entering main loop (dedicated thread)");
 
-    // Get OMS event receiver
     let oms_events = oms.event_receiver();
 
-    // Start display task (feature = "display")
-    // Start display task if active
     if let Some(rx) = display_rx {
         let sd = shutdown.clone();
         tokio::spawn(crypto_oms::mm::display::run_display(rx, sd));
     }
 
-    // Run the spin loop on a dedicated thread
     tokio::task::spawn_blocking(move || {
         spin_loop(
             &mut engines,
@@ -311,13 +328,12 @@ async fn async_main(
     std::process::exit(0);
 }
 
-/// Hot loop on a dedicated OS thread — no tokio scheduling jitter.
-fn spin_loop(
-    engines: &mut [MmEngine<HyperliquidOms>],
+fn spin_loop<O: ExchangeOms + 'static>(
+    engines: &mut [MmEngine<O>],
     oms_state: &mut OmsStateTracker,
     oms_events: &crossbeam_channel::Receiver<OmsEvent>,
     vol_provider: &mut Option<VolProvider>,
-    oms: &Arc<HyperliquidOms>,
+    oms: &Arc<O>,
     fair_price: &Arc<FairPriceEngine>,
     shutdown: &AtomicBool,
     spin_core: Option<usize>,
@@ -347,7 +363,7 @@ fn spin_loop(
     let mut last_basis_save = Instant::now();
 
     loop {
-        // ── DRAIN OMS EVENTS, dispatch to engines ──
+        // Drain OMS events
         loop {
             match oms_events.try_recv() {
                 Ok(event) => {
@@ -366,13 +382,12 @@ fn spin_loop(
             }
         }
 
-        // ── SHUTDOWN ──
+        // Shutdown
         if shutdown.load(Ordering::Relaxed) {
             info!("MM engine shutting down");
             for engine in engines.iter_mut() {
                 engine.cancel_all_quotes();
             }
-            // Let inflight HTTP requests land on exchange before final cancel
             std::thread::sleep(Duration::from_secs(1));
             if let Err(e) = tokio::runtime::Handle::current().block_on(
                 oms.shutdown_cancel_all(None)
@@ -383,7 +398,7 @@ fn spin_loop(
             return;
         }
 
-        // ── TICK EACH ENGINE ──
+        // Tick engines
         let mut any_ticked = false;
         for engine in engines.iter_mut() {
             if engine.tick(oms_state, vol_provider) {
@@ -392,11 +407,10 @@ fn spin_loop(
         }
 
         if !any_ticked {
-            // All engines had no new data — brief yield to avoid 100% CPU
             std::hint::spin_loop();
         }
 
-        // ── PERIODIC BASIS CACHE SAVE ──
+        // Periodic basis cache save
         if last_basis_save.elapsed() >= Duration::from_secs(10) {
             fair_price.save_basis_cache();
             last_basis_save = Instant::now();
