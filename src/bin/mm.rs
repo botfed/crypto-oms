@@ -119,7 +119,7 @@ async fn async_main(
             let oms_config = config.to_hl_oms_config(private_key, account_address);
             let oms = HyperliquidOms::new(oms_config)?;
             oms.start();
-            run_mm(oms, config, ghost, spin_core, display_bus, display_rx).await
+            run_mm(oms, crypto_oms::mm::fair_price::ExchangeId::Hyperliquid, config, ghost, spin_core, display_bus, display_rx).await
         }
         "hibachi" => {
             let api_key = std::env::var("HIBACHI_API_KEY")
@@ -132,7 +132,7 @@ async fn async_main(
             let oms_config = config.to_hibachi_oms_config(api_key, private_key, account_id);
             let oms = HibachiOms::new(oms_config)?;
             oms.start();
-            run_mm(oms, config, ghost, spin_core, display_bus, display_rx).await
+            run_mm(oms, crypto_oms::mm::fair_price::ExchangeId::Hibachi, config, ghost, spin_core, display_bus, display_rx).await
         }
         other => anyhow::bail!("unsupported exchange: {other}"),
     }
@@ -140,6 +140,7 @@ async fn async_main(
 
 async fn run_mm<O: ExchangeOms + 'static>(
     oms: Arc<O>,
+    target_exchange: crypto_oms::mm::fair_price::ExchangeId,
     config: MmConfig,
     ghost: bool,
     spin_core: Option<usize>,
@@ -291,6 +292,7 @@ async fn run_mm<O: ExchangeOms + 'static>(
             Arc::clone(&oms),
             Arc::clone(&fair_price),
             Arc::clone(&market_data),
+            target_exchange,
             target_rx,
             sym_cfg.clone(),
             ghost,

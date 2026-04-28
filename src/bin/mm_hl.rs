@@ -268,6 +268,7 @@ async fn async_main(
             Arc::clone(&oms),
             Arc::clone(&fair_price),
             Arc::clone(&market_data),
+            crypto_oms::mm::fair_price::ExchangeId::Hyperliquid,
             target_rx,
             sym_cfg.clone(),
             ghost,

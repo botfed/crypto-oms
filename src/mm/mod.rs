@@ -229,6 +229,7 @@ pub struct MmEngine<O: ExchangeOms> {
     oms: Arc<O>,
     fair_price: Arc<FairPriceEngine>,
     market_data: Arc<crypto_feeds::AllMarketData>,
+    target_exchange: ExchangeId,
     target_position_rx: Option<tokio::sync::watch::Receiver<f64>>,
     config: StrategyConfig,
     ghost: bool,
@@ -268,6 +269,7 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
         oms: Arc<O>,
         fair_price: Arc<FairPriceEngine>,
         market_data: Arc<crypto_feeds::AllMarketData>,
+        target_exchange: ExchangeId,
         target_position_rx: Option<tokio::sync::watch::Receiver<f64>>,
         config: StrategyConfig,
         ghost: bool,
@@ -354,6 +356,7 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
             oms,
             fair_price,
             market_data,
+            target_exchange,
             target_position_rx,
             config,
             ghost,
@@ -406,6 +409,10 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
             if self.state == EngineState::Running {
                 self.transition_to_paused();
             }
+            if self.display.is_some() && self.last_status_log.elapsed() >= Duration::from_secs(1) {
+                self.send_display_status(oms_state, vol_provider);
+                self.last_status_log = Instant::now();
+            }
             return false;
         }
 
@@ -428,6 +435,10 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
 
         // ── CHECK FOR NEW DATA ──
         let Some(tick) = self.resolve_tick() else {
+            if self.display.is_some() && self.last_status_log.elapsed() >= Duration::from_secs(1) {
+                self.send_display_status(oms_state, vol_provider);
+                self.last_status_log = Instant::now();
+            }
             return false;
         };
 
@@ -544,13 +555,13 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
 
         let wc = self
             .fair_price
-            .ref_write_count(ExchangeId::Hyperliquid, self.hl_symbol_id);
+            .ref_write_count(self.target_exchange, self.hl_symbol_id);
         if wc != self.last_ref_wc {
             self.last_ref_wc = wc;
 
             if let Some((fair, exchange_ts_ms, _, received_ts, feed_lat)) = self
                 .fair_price
-                .get_fair_price_detail(ExchangeId::Hyperliquid, self.hl_symbol_id)
+                .get_fair_price_detail(self.target_exchange, self.hl_symbol_id)
             {
                 if exchange_ts_ms > self.last_direct_exchange_ts_ms {
                     self.last_direct_exchange_ts_ms = exchange_ts_ms;
@@ -654,7 +665,7 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
             // Need fair price again (no factor model to store it)
             if let Some((fair, _, _, _, _)) = self
                 .fair_price
-                .get_fair_price_detail(ExchangeId::Hyperliquid, self.hl_symbol_id)
+                .get_fair_price_detail(self.target_exchange, self.hl_symbol_id)
             {
                 return Some(TickSource {
                     fair,
@@ -719,7 +730,7 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
         // so we can detect recovery while paused (tick loop doesn't run).
         let live_recv = self
             .fair_price
-            .get_fair_price_detail(ExchangeId::Hyperliquid, self.hl_symbol_id)
+            .get_fair_price_detail(self.target_exchange, self.hl_symbol_id)
             .and_then(|(_, _, _, recv, _)| recv);
         if let Some(recv) = live_recv {
             if recv.elapsed().as_millis() as u64 > self.config.max_feed_age_ms {
@@ -1212,10 +1223,10 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
     ) {
         let fair = self
             .fair_price
-            .get_fair_price(ExchangeId::Hyperliquid, self.hl_symbol_id);
+            .get_fair_price(self.target_exchange, self.hl_symbol_id);
         let basis = self
             .fair_price
-            .get_basis(ExchangeId::Hyperliquid, self.hl_symbol_id);
+            .get_basis(self.target_exchange, self.hl_symbol_id);
         let position = self.get_position(oms_state);
         let target_usd = self.target_position_rx.as_ref().map(|rx| *rx.borrow()).unwrap_or(0.0);
         let target = fair
@@ -1249,7 +1260,7 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
 
         let (exch_age_ms, ref_feed) = self
             .fair_price
-            .get_fair_price_detail(ExchangeId::Hyperliquid, self.hl_symbol_id)
+            .get_fair_price_detail(self.target_exchange, self.hl_symbol_id)
             .map(|(_, ex_ts_ms, feed, _, _)| {
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 (now_ms - ex_ts_ms, feed)
@@ -1258,7 +1269,7 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
 
         let hl_mid = self
             .fair_price
-            .get_mid(ExchangeId::Hyperliquid, self.hl_symbol_id);
+            .get_mid(self.target_exchange, self.hl_symbol_id);
         let residual_bps = match (hl_mid, fair) {
             (Some(hl), Some(f)) if f != 0.0 => (hl - f) / f * 10_000.0,
             _ => 0.0,
@@ -1331,10 +1342,10 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
         };
         let fair = self
             .fair_price
-            .get_fair_price(ExchangeId::Hyperliquid, self.hl_symbol_id);
+            .get_fair_price(self.target_exchange, self.hl_symbol_id);
         let basis = self
             .fair_price
-            .get_basis(ExchangeId::Hyperliquid, self.hl_symbol_id);
+            .get_basis(self.target_exchange, self.hl_symbol_id);
         let position = self.get_position(oms_state);
         let target_usd = self.target_position_rx.as_ref().map(|rx| *rx.borrow()).unwrap_or(0.0);
         let fair_val = fair.unwrap_or(0.0);
@@ -1348,7 +1359,7 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
 
         let hl_mid = self
             .fair_price
-            .get_mid(ExchangeId::Hyperliquid, self.hl_symbol_id);
+            .get_mid(self.target_exchange, self.hl_symbol_id);
         let residual_bps = match (hl_mid, fair) {
             (Some(hl), Some(f)) if f != 0.0 => (hl - f) / f * 10_000.0,
             _ => 0.0,
@@ -1371,7 +1382,7 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
 
         let feed_age_ms = self
             .fair_price
-            .get_fair_price_detail(ExchangeId::Hyperliquid, self.hl_symbol_id)
+            .get_fair_price_detail(self.target_exchange, self.hl_symbol_id)
             .map(|(_, ex_ts_ms, _, _, _)| {
                 chrono::Utc::now().timestamp_millis() - ex_ts_ms
             })
@@ -1555,7 +1566,7 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
 
         let fair = self
             .fair_price
-            .get_fair_price(ExchangeId::Hyperliquid, self.hl_symbol_id)
+            .get_fair_price(self.target_exchange, self.hl_symbol_id)
             .unwrap_or(0.0);
 
         let mut stray_bids: Vec<&OrderHandle> = Vec::new();

@@ -6,8 +6,8 @@ hibachi:
   max_fees_percent: 0.001
 
 perp:
-  binance: [BTC_USDT, ETH_USDT, SOL_USDT]
-  hibachi: [BTC_USDT, ETH_USDT, SOL_USDT]
+  binance: [BTC_USDT, ETH_USDT, SOL_USDT, HYPE_USDT, BNB_USDT, SUI_USDT, XRP_USDT]
+  hibachi: [BTC_USDT, ETH_USDT, SOL_USDT, HYPE_USDT, BNB_USDT, SUI_USDT, XRP_USDT]
 
 
 fair_price:
@@ -27,6 +27,22 @@ fair_price:
       target_symbol: PERP_SOL_USDT
       reference_exchange: binance
       reference_symbol: PERP_SOL_USDT
+    - target_exchange: hibachi
+      target_symbol: PERP_HYPE_USDT
+      reference_exchange: binance
+      reference_symbol: PERP_HYPE_USDT
+    - target_exchange: hibachi
+      target_symbol: PERP_BNB_USDT
+      reference_exchange: binance
+      reference_symbol: PERP_BNB_USDT
+    - target_exchange: hibachi
+      target_symbol: PERP_SUI_USDT
+      reference_exchange: binance
+      reference_symbol: PERP_SUI_USDT
+    - target_exchange: hibachi
+      target_symbol: PERP_XRP_USDT
+      reference_exchange: binance
+      reference_symbol: PERP_XRP_USDT
 
 inventory:
   mode: static
@@ -78,6 +94,54 @@ symbols:
     vol_mult_floor: 0.3
     vol_mult_cap: 2.0
     vol_symbol: "SOL"
+    quote_interval_ms: 150
+    warmup_secs: 3
+    max_feed_age_ms: 10000
+    stray_order_age_ms: 6000
+  - symbol: PERP_HYPE_USDT
+    max_stale_ms: 2000
+    order_notional_usd: 100.0
+    max_position_usd: 5000.0
+    ref_vol: 1.00
+    vol_mult_floor: 0.3
+    vol_mult_cap: 2.0
+    vol_symbol: "HYPE"
+    quote_interval_ms: 150
+    warmup_secs: 3
+    max_feed_age_ms: 10000
+    stray_order_age_ms: 6000
+  - symbol: PERP_BNB_USDT
+    max_stale_ms: 2000
+    order_notional_usd: 100.0
+    max_position_usd: 5000.0
+    ref_vol: 0.50
+    vol_mult_floor: 0.3
+    vol_mult_cap: 2.0
+    vol_symbol: "BNB"
+    quote_interval_ms: 150
+    warmup_secs: 3
+    max_feed_age_ms: 10000
+    stray_order_age_ms: 6000
+  - symbol: PERP_SUI_USDT
+    max_stale_ms: 2000
+    order_notional_usd: 100.0
+    max_position_usd: 5000.0
+    ref_vol: 0.80
+    vol_mult_floor: 0.3
+    vol_mult_cap: 2.0
+    vol_symbol: "SUI"
+    quote_interval_ms: 150
+    warmup_secs: 3
+    max_feed_age_ms: 10000
+    stray_order_age_ms: 6000
+  - symbol: PERP_XRP_USDT
+    max_stale_ms: 2000
+    order_notional_usd: 100.0
+    max_position_usd: 5000.0
+    ref_vol: 0.50
+    vol_mult_floor: 0.3
+    vol_mult_cap: 2.0
+    vol_symbol: "XRP"
     quote_interval_ms: 150
     warmup_secs: 3
     max_feed_age_ms: 10000
