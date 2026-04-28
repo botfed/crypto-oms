@@ -164,7 +164,7 @@ pub async fn run_display(
     rx: crossbeam_channel::Receiver<DisplayMsg>,
     shutdown: std::sync::Arc<tokio::sync::Notify>,
 ) {
-    let _ = flush(format!("{ALT_SCREEN_ON}{CURSOR_HIDE}"));
+    let _ = flush(format!("{CURSOR_HIDE}"));
 
     let start = Instant::now();
     let mut statuses: BTreeMap<String, SymbolStatus> = BTreeMap::new();
@@ -200,7 +200,7 @@ pub async fn run_display(
         }
     }
 
-    let _ = flush(format!("{CURSOR_SHOW}{ALT_SCREEN_OFF}"));
+    let _ = flush(format!("{CURSOR_SHOW}\n"));
 }
 
 // ---------------------------------------------------------------------------
