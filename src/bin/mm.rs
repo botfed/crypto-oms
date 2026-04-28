@@ -167,6 +167,12 @@ async fn run_mm<O: ExchangeOms + 'static>(
     let feeds_config = config.to_feeds_config();
     crypto_feeds::symbol_registry::seed_extra_bases(feeds_config.base_assets());
 
+    // Start display early so logs are visible during OMS init
+    if let Some(rx) = display_rx {
+        let sd = shutdown.clone();
+        tokio::spawn(crypto_oms::mm::display::run_display(rx, sd));
+    }
+
     // Start crypto-feeds
     let market_data = Arc::new(AllMarketData::new());
     let mut handles = Vec::new();
@@ -174,6 +180,7 @@ async fn run_mm<O: ExchangeOms + 'static>(
     load_perp(&mut handles, &feeds_config, &market_data, &shutdown)?;
 
     // Wait for OMS ready
+    info!("waiting for OMS to initialize...");
     oms.wait_ready().await?;
 
     anyhow::ensure!(!config.symbols.is_empty(), "config must have at least one symbol in 'symbols'");
@@ -311,11 +318,6 @@ async fn run_mm<O: ExchangeOms + 'static>(
     info!("OMS ready, entering main loop (dedicated thread)");
 
     let oms_events = oms.event_receiver();
-
-    if let Some(rx) = display_rx {
-        let sd = shutdown.clone();
-        tokio::spawn(crypto_oms::mm::display::run_display(rx, sd));
-    }
 
     tokio::task::spawn_blocking(move || {
         spin_loop(

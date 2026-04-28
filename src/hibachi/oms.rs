@@ -196,9 +196,34 @@ impl HibachiOms {
 
     async fn run_init(&self) -> Result<()> {
         self.diag.log("initializing...".into());
+        info!("hibachi OMS: fetching exchange info...");
 
-        // 1. Fetch exchange info for contract metadata
-        let info = self.client.get_exchange_info().await?;
+        // 1. Fetch exchange info for contract metadata (with timeout + retry)
+        let info = {
+            let mut last_err = None;
+            let mut result = None;
+            for attempt in 1..=3 {
+                match tokio::time::timeout(
+                    Duration::from_secs(10),
+                    self.client.get_exchange_info(),
+                ).await {
+                    Ok(Ok(info)) => { result = Some(info); break; }
+                    Ok(Err(e)) => {
+                        warn!("hibachi OMS: get_exchange_info attempt {attempt}/3 failed: {e}");
+                        last_err = Some(e);
+                    }
+                    Err(_) => {
+                        warn!("hibachi OMS: get_exchange_info attempt {attempt}/3 timed out (10s)");
+                        last_err = Some(anyhow::anyhow!("timeout"));
+                    }
+                }
+                if attempt < 3 {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+            result.ok_or_else(|| last_err.unwrap_or_else(|| anyhow::anyhow!("get_exchange_info failed")))?
+        };
+
         let mut contracts = HashMap::new();
         for fc in &info.future_contracts {
             let tick_size = fc.tick_size.as_deref()
@@ -220,10 +245,37 @@ impl HibachiOms {
             );
         }
         self.diag.log(format!("loaded {} contracts", contracts.len()));
+        info!("hibachi OMS: loaded {} contracts", contracts.len());
         *self.contracts.write() = contracts;
 
-        // 2. Snapshot full state
-        self.snapshot_from_rest().await?;
+        // 2. Snapshot full state (with timeout + retry)
+        info!("hibachi OMS: fetching account snapshot...");
+        {
+            let mut last_err = None;
+            let mut ok = false;
+            for attempt in 1..=3 {
+                match tokio::time::timeout(
+                    Duration::from_secs(10),
+                    self.snapshot_from_rest(),
+                ).await {
+                    Ok(Ok(())) => { ok = true; break; }
+                    Ok(Err(e)) => {
+                        warn!("hibachi OMS: snapshot attempt {attempt}/3 failed: {e}");
+                        last_err = Some(e);
+                    }
+                    Err(_) => {
+                        warn!("hibachi OMS: snapshot attempt {attempt}/3 timed out (10s)");
+                        last_err = Some(anyhow::anyhow!("timeout"));
+                    }
+                }
+                if attempt < 3 {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+            if !ok {
+                return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("snapshot_from_rest failed")));
+            }
+        }
 
         // 3. Mark ready
         self.ready.store(true, Ordering::Release);
