@@ -1,3 +1,5 @@
+exchange: hyperliquid
+
 hyperliquid:
   poll_interval_ms: 3000
   inflight_timeout_ms: 5000
