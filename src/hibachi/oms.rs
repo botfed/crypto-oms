@@ -1680,43 +1680,36 @@ impl ExchangeOms for HibachiOms {
             _ => { warn!("post_cancel called with non-cancel payload"); return; }
         };
 
-        // Try WS first — cancel by orderId, no nonce (matches SDK behavior)
+        // Fire both WS and REST in parallel — take whichever confirms first
         let ws_params = serde_json::json!({
-            "orderId": exchange_id,
+            "orderId": &exchange_id,
             "accountId": self.client.account_id,
         });
 
-        if let Some(resp) = self.send_trade_ws("order.cancel", ws_params, &signature_rest).await {
-            if resp.status == 200 {
-                info!("WS cancel confirmed for cid={}, emitting OrderCancelled", id.0);
-                if let Some(mut h) = self.state.orders.get_mut(&id.0) {
-                    h.state = OrderState::Cancelled;
-                    h.last_modified = Some(Instant::now());
-                }
-                let _ = self.event_tx.send(OmsEvent::OrderCancelled(*id));
-                return;
-            } else {
-                warn!("hibachi WS order.cancel failed for {}: status={} body={}", id.0, resp.status, resp.raw);
-                // Fall through to REST
-            }
-        }
+        let ws_fut = self.send_trade_ws("order.cancel", ws_params, &signature_rest);
+        let rest_fut = self.client.cancel_order_rest(body);
 
-        // REST fallback
-        debug!("trade WS unavailable for cancel, falling back to REST for {}", id.0);
-        match self.client.cancel_order_rest(body).await {
-            Ok(()) => {
-                if let Some(mut h) = self.state.orders.get_mut(&id.0) {
-                    h.state = OrderState::Cancelled;
-                    h.last_modified = Some(Instant::now());
-                }
-                let _ = self.event_tx.send(OmsEvent::OrderCancelled(*id));
+        let (ws_result, rest_result) = tokio::join!(ws_fut, rest_fut);
+
+        let confirmed = match (&ws_result, &rest_result) {
+            (Some(resp), _) if resp.status == 200 => true,
+            (_, Ok(())) => true,
+            _ => false,
+        };
+
+        if confirmed {
+            if let Some(mut h) = self.state.orders.get_mut(&id.0) {
+                h.state = OrderState::Cancelled;
+                h.last_modified = Some(Instant::now());
             }
-            Err(e) => {
-                warn!("hibachi REST cancel failed for {}: {e}, restoring to Accepted", id.0);
-                if let Some(mut h) = self.state.orders.get_mut(&id.0) {
-                    h.state = OrderState::Accepted;
-                    h.last_modified = Some(Instant::now());
-                }
+            let _ = self.event_tx.send(OmsEvent::OrderCancelled(*id));
+        } else {
+            let ws_err = ws_result.as_ref().map(|r| format!("status={} {}", r.status, r.raw)).unwrap_or_else(|| "WS unavailable".into());
+            let rest_err = rest_result.as_ref().err().map(|e| format!("{e}")).unwrap_or_default();
+            warn!("hibachi cancel failed for {} (ws: {}, rest: {}), restoring to Accepted", id.0, ws_err, rest_err);
+            if let Some(mut h) = self.state.orders.get_mut(&id.0) {
+                h.state = OrderState::Accepted;
+                h.last_modified = Some(Instant::now());
             }
         }
     }
