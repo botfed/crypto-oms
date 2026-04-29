@@ -1654,11 +1654,11 @@ impl ExchangeOms for HibachiOms {
             _ => { warn!("post_cancel called with non-cancel payload"); return; }
         };
 
-        // Try WS first
+        // Try WS first (cancel nonce must be string per hibachi API)
         let ws_params = serde_json::json!({
             "orderId": exchange_id,
             "accountId": self.client.account_id,
-            "nonce": nonce,
+            "nonce": nonce.to_string(),
         });
 
         if let Some(resp) = self.send_trade_ws("order.cancel", ws_params, &signature).await {
