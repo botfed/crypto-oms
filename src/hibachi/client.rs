@@ -150,8 +150,16 @@ impl HibachiClient {
     }
 
     /// Build the binary payload for cancel signing.
+    /// REST cancel: sign just order_id. WS cancel: sign nonce + order_id.
     pub fn build_cancel_payload(&self, order_id: u64) -> Vec<u8> {
         order_id.to_be_bytes().to_vec()
+    }
+
+    pub fn build_cancel_payload_with_nonce(&self, nonce: u64, order_id: u64) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(16);
+        buf.extend_from_slice(&nonce.to_be_bytes());
+        buf.extend_from_slice(&order_id.to_be_bytes());
+        buf
     }
 
     /// Generate a nonce (microsecond timestamp).

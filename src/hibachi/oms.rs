@@ -1092,7 +1092,13 @@ pub struct HibachiPreparedOrder {
 /// Signed payload ready for HTTP post (order or cancel).
 pub enum HibachiSignedPayload {
     Order { body: serde_json::Value },
-    Cancel { body: serde_json::Value, exchange_id: String, nonce: u64, signature: String },
+    Cancel {
+        body: serde_json::Value,       // REST body (no nonce)
+        exchange_id: String,
+        nonce: u64,
+        signature_rest: String,        // signs order_id only
+        signature_ws: String,          // signs nonce + order_id
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1605,16 +1611,22 @@ impl ExchangeOms for HibachiOms {
 
         let nonce = HibachiClient::gen_nonce();
         let oid_u64: u64 = exchange_id.parse().unwrap_or(0);
-        let payload = self.client.build_cancel_payload(oid_u64);
-        let signature = self.client.sign(&payload)?;
+
+        // REST signature: signs order_id only
+        let rest_payload = self.client.build_cancel_payload(oid_u64);
+        let signature_rest = self.client.sign(&rest_payload)?;
+
+        // WS signature: signs nonce + order_id
+        let ws_payload = self.client.build_cancel_payload_with_nonce(nonce, oid_u64);
+        let signature_ws = self.client.sign(&ws_payload)?;
 
         let body = serde_json::json!({
             "accountId": self.client.account_id,
             "orderId": &exchange_id,
-            "signature": &signature,
+            "signature": &signature_rest,
         });
 
-        Ok(HibachiSignedPayload::Cancel { body, exchange_id, nonce, signature })
+        Ok(HibachiSignedPayload::Cancel { body, exchange_id, nonce, signature_rest, signature_ws })
     }
 
     fn presign_cancel(&self, id: &ClientOrderId) -> Result<Self::SignedPayload> {
@@ -1626,19 +1638,22 @@ impl ExchangeOms for HibachiOms {
             .ok_or_else(|| OmsError::Internal("no exchange oid yet".into()))?;
         drop(handle);
 
-        // No state change — just sign
         let nonce = HibachiClient::gen_nonce();
         let oid_u64: u64 = exchange_id.parse().unwrap_or(0);
-        let payload = self.client.build_cancel_payload(oid_u64);
-        let signature = self.client.sign(&payload)?;
+
+        let rest_payload = self.client.build_cancel_payload(oid_u64);
+        let signature_rest = self.client.sign(&rest_payload)?;
+
+        let ws_payload = self.client.build_cancel_payload_with_nonce(nonce, oid_u64);
+        let signature_ws = self.client.sign(&ws_payload)?;
 
         let body = serde_json::json!({
             "accountId": self.client.account_id,
             "orderId": &exchange_id,
-            "signature": &signature,
+            "signature": &signature_rest,
         });
 
-        Ok(HibachiSignedPayload::Cancel { body, exchange_id, nonce, signature })
+        Ok(HibachiSignedPayload::Cancel { body, exchange_id, nonce, signature_rest, signature_ws })
     }
 
     fn mark_cancelling(&self, id: &ClientOrderId) {
@@ -1649,19 +1664,20 @@ impl ExchangeOms for HibachiOms {
     }
 
     async fn post_cancel(&self, id: &ClientOrderId, signed: Self::SignedPayload) {
-        let (body, exchange_id, nonce, signature) = match signed {
-            HibachiSignedPayload::Cancel { body, exchange_id, nonce, signature } => (body, exchange_id, nonce, signature),
+        let (body, exchange_id, nonce, signature_rest, signature_ws) = match signed {
+            HibachiSignedPayload::Cancel { body, exchange_id, nonce, signature_rest, signature_ws } =>
+                (body, exchange_id, nonce, signature_rest, signature_ws),
             _ => { warn!("post_cancel called with non-cancel payload"); return; }
         };
 
-        // Try WS first (cancel nonce must be string per hibachi API)
+        // Try WS first (cancel nonce must be string, signature includes nonce)
         let ws_params = serde_json::json!({
             "orderId": exchange_id,
             "accountId": self.client.account_id,
             "nonce": nonce.to_string(),
         });
 
-        if let Some(resp) = self.send_trade_ws("order.cancel", ws_params, &signature).await {
+        if let Some(resp) = self.send_trade_ws("order.cancel", ws_params, &signature_ws).await {
             if resp.status == 200 {
                 if let Some(mut h) = self.state.orders.get_mut(&id.0) {
                     h.state = OrderState::Cancelled;
