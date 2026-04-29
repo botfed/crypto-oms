@@ -926,6 +926,7 @@ impl HibachiOms {
                         Some(c) => c,
                         None => return Ok(()), // channel closed = shutdown
                     };
+                    debug!("trade WS send id={}: {}", cmd.id, cmd.json);
                     pending.insert(cmd.id, cmd.response_tx);
                     write.send(Message::Text(cmd.json.into())).await?;
                 }
@@ -944,6 +945,7 @@ impl HibachiOms {
                             }
                             // Parse response: {"id":N,"status":200,"result":{...}}
                             // Note: place response returns id as string, cancel as integer
+                            debug!("trade WS recv: {}", text);
                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.as_str()) {
                                 let id = v.get("id")
                                     .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
@@ -1168,7 +1170,7 @@ impl ExchangeOms for HibachiOms {
         let native_symbol = canonical_to_hibachi(&req.symbol);
         let mut body = serde_json::json!({
             "accountId": self.client.account_id,
-            "nonce": nonce,
+            "nonce": nonce.to_string(),
             "symbol": native_symbol,
             "quantity": format!("{rounded_size}"),
             "side": side_str,
@@ -1324,7 +1326,7 @@ impl ExchangeOms for HibachiOms {
 
         let body = serde_json::json!({
             "accountId": self.client.account_id,
-            "nonce": nonce,
+            "nonce": nonce.to_string(),
             "orderId": exchange_id,
             "maxFeesPercent": format!("{}", self.config.max_fees_percent),
             "updatedQuantity": format!("{rounded_size}"),
@@ -1472,7 +1474,7 @@ impl ExchangeOms for HibachiOms {
 
         let mut body = serde_json::json!({
             "accountId": self.client.account_id,
-            "nonce": prepared.nonce,
+            "nonce": prepared.nonce.to_string(),
             "symbol": native_symbol,
             "quantity": format!("{rounded_size}"),
             "side": side_str,
@@ -1652,11 +1654,11 @@ impl ExchangeOms for HibachiOms {
             _ => { warn!("post_cancel called with non-cancel payload"); return; }
         };
 
-        // Try WS first (nonce as integer for WS)
+        // Try WS first
         let ws_params = serde_json::json!({
             "orderId": exchange_id,
             "accountId": self.client.account_id,
-            "nonce": nonce,
+            "nonce": nonce.to_string(),
         });
 
         if let Some(resp) = self.send_trade_ws("order.cancel", ws_params, &signature).await {
