@@ -6,8 +6,8 @@ hibachi:
   max_fees_percent: 0.001
 
 perp:
-  binance: [BTC_USDT]
-  hibachi: [BTC_USDT]
+  binance: [BTC_USDT, SOL_USDT]
+  hibachi: [BTC_USDT, SOL_USDT]
 
 
 fair_price:
@@ -23,10 +23,10 @@ fair_price:
     #   target_symbol: PERP_ETH_USDT
     #   reference_exchange: binance
     #   reference_symbol: PERP_ETH_USDT
-    # - target_exchange: hibachi
-    #   target_symbol: PERP_SOL_USDT
-    #   reference_exchange: binance
-    #   reference_symbol: PERP_SOL_USDT
+    - target_exchange: hibachi
+      target_symbol: PERP_SOL_USDT
+      reference_exchange: binance
+      reference_symbol: PERP_SOL_USDT
     # - target_exchange: hibachi
     #   target_symbol: PERP_HYPE_USDT
     #   reference_exchange: binance
@@ -79,11 +79,11 @@ symbols:
   #   vol_mult_floor: 0.3
   #   vol_mult_cap: 2.0
   #   vol_symbol: "ETH"
-  # - symbol: PERP_SOL_USDT
-  #   ref_vol: 0.60
-  #   vol_mult_floor: 0.3
-  #   vol_mult_cap: 2.0
-  #   vol_symbol: "SOL"
+  - symbol: PERP_SOL_USDT
+    ref_vol: 0.60
+    vol_mult_floor: 0.3
+    vol_mult_cap: 2.0
+    vol_symbol: "SOL"
   # - symbol: PERP_HYPE_USDT
   #   ref_vol: 1.00
   #   vol_mult_floor: 0.3
