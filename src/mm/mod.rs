@@ -1460,6 +1460,20 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
                     age_ms: q.placed_at.elapsed().as_millis() as u64,
                 }
             }),
+            cancel_bid_bps: if fair_val > 0.0 {
+                let mid = fair_val + self.cached_skew_bps * fair_val / 10_000.0;
+                let min_spread = self.config.ref_min_spread_bps.unwrap() * vol_mult * fair_val / 10_000.0;
+                let min_edge = self.config.min_edge_bps.unwrap() * fair_val / 10_000.0;
+                let max_bid = (mid - min_spread).min(fair_val - min_edge);
+                (max_bid - fair_val) / fair_val * 10_000.0
+            } else { 0.0 },
+            cancel_ask_bps: if fair_val > 0.0 {
+                let mid = fair_val + self.cached_skew_bps * fair_val / 10_000.0;
+                let min_spread = self.config.ref_min_spread_bps.unwrap() * vol_mult * fair_val / 10_000.0;
+                let min_edge = self.config.min_edge_bps.unwrap() * fair_val / 10_000.0;
+                let min_ask = (mid + min_spread).max(fair_val + min_edge);
+                (min_ask - fair_val) / fair_val * 10_000.0
+            } else { 0.0 },
             feed_age_ms,
         });
     }
