@@ -1077,7 +1077,7 @@ pub struct HibachiPreparedOrder {
 /// Signed payload ready for HTTP post (order or cancel).
 pub enum HibachiSignedPayload {
     Order { body: serde_json::Value },
-    Cancel { body: serde_json::Value, exchange_id: String },
+    Cancel { body: serde_json::Value, exchange_id: String, nonce: u64, signature: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -1596,11 +1596,11 @@ impl ExchangeOms for HibachiOms {
         let body = serde_json::json!({
             "accountId": self.client.account_id,
             "orderId": &exchange_id,
-            "nonce": nonce,
-            "signature": signature,
+            "nonce": nonce.to_string(),
+            "signature": &signature,
         });
 
-        Ok(HibachiSignedPayload::Cancel { body, exchange_id })
+        Ok(HibachiSignedPayload::Cancel { body, exchange_id, nonce, signature })
     }
 
     fn presign_cancel(&self, id: &ClientOrderId) -> Result<Self::SignedPayload> {
@@ -1621,11 +1621,11 @@ impl ExchangeOms for HibachiOms {
         let body = serde_json::json!({
             "accountId": self.client.account_id,
             "orderId": &exchange_id,
-            "nonce": nonce,
-            "signature": signature,
+            "nonce": nonce.to_string(),
+            "signature": &signature,
         });
 
-        Ok(HibachiSignedPayload::Cancel { body, exchange_id })
+        Ok(HibachiSignedPayload::Cancel { body, exchange_id, nonce, signature })
     }
 
     fn mark_cancelling(&self, id: &ClientOrderId) {
