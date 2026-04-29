@@ -1034,34 +1034,6 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
 
         // ── PLACE new quotes where needed ──
 
-        if self.bid_quote.is_none() && !want_bid {
-            info!("[{}] skip bid: position limit (pos={:.4} target={:.4} max_pos={:.4})",
-                self.config.symbol, position, target, max_pos);
-        }
-        if self.ask_quote.is_none() && !want_ask {
-            info!("[{}] skip ask: position limit (pos={:.4} target={:.4} max_pos={:.4})",
-                self.config.symbol, position, target, max_pos);
-        }
-
-        if self.bid_quote.is_some() && want_bid {
-            let q = self.bid_quote.as_ref().unwrap();
-            let state = oms_state.get_order(q.client_id).map(|h| h.state);
-            let age_ms = q.placed_at.elapsed().as_millis();
-            if age_ms > 5000 {
-                info!("[{}] bid stuck: cid={} price={:.6} state={:?} age={}ms",
-                    self.config.symbol, q.client_id.0, q.price, state, age_ms);
-            }
-        }
-        if self.ask_quote.is_some() && want_ask {
-            let q = self.ask_quote.as_ref().unwrap();
-            let state = oms_state.get_order(q.client_id).map(|h| h.state);
-            let age_ms = q.placed_at.elapsed().as_millis();
-            if age_ms > 5000 {
-                info!("[{}] ask stuck: cid={} price={:.6} state={:?} age={}ms",
-                    self.config.symbol, q.client_id.0, q.price, state, age_ms);
-            }
-        }
-
         if self.bid_quote.is_none() && want_bid && self.ghost {}
         if self.bid_quote.is_none() && want_bid && !self.ghost {
             let tif = if self.config.post_only.unwrap_or(true) {
