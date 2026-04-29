@@ -1228,7 +1228,6 @@ impl ExchangeOms for HibachiOms {
         }
         let _ = self.event_tx.send(OmsEvent::OrderCancelling(*id));
 
-        let nonce = HibachiClient::gen_nonce();
         let oid_u64: u64 = exchange_id.parse().unwrap_or(0);
         let payload = self.client.build_cancel_payload(oid_u64);
         let signature = self.client.sign(&payload)?;
@@ -1236,7 +1235,6 @@ impl ExchangeOms for HibachiOms {
         let body = serde_json::json!({
             "accountId": self.client.account_id,
             "orderId": exchange_id,
-            "nonce": nonce.to_string(),
             "signature": signature,
         });
 
@@ -1598,7 +1596,6 @@ impl ExchangeOms for HibachiOms {
         let body = serde_json::json!({
             "accountId": self.client.account_id,
             "orderId": &exchange_id,
-            "nonce": nonce.to_string(),
             "signature": &signature,
         });
 
@@ -1623,7 +1620,6 @@ impl ExchangeOms for HibachiOms {
         let body = serde_json::json!({
             "accountId": self.client.account_id,
             "orderId": &exchange_id,
-            "nonce": nonce.to_string(),
             "signature": &signature,
         });
 
