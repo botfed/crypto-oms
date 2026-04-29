@@ -910,7 +910,7 @@ impl HibachiOms {
         let (ws, _) = tokio_tungstenite::connect_async(request).await?;
         let (mut write, mut read) = ws.split();
         self.trade_ws_connected.store(true, Ordering::Release);
-        info!("trade WS connected");
+        info!("trade WS connected to {}", url);
 
         let mut pending: HashMap<u64, tokio::sync::oneshot::Sender<TradeWsResponse>> =
             HashMap::new();
@@ -943,9 +943,10 @@ impl HibachiOms {
                                 continue;
                             }
                             // Parse response: {"id":N,"status":200,"result":{...}}
+                            // Note: place response returns id as string, cancel as integer
                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.as_str()) {
                                 let id = v.get("id")
-                                    .and_then(|v| v.as_u64())
+                                    .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
                                     .unwrap_or(0);
                                 let status = v.get("status")
                                     .and_then(|v| v.as_u64())
@@ -958,8 +959,20 @@ impl HibachiOms {
                                         result,
                                         raw: text.to_string(),
                                     });
+                                } else if pending.len() == 1 {
+                                    // Place responses return accountId as id, not request id.
+                                    // If exactly one pending, it must be for that request.
+                                    let key = *pending.keys().next().unwrap();
+                                    if let Some(tx) = pending.remove(&key) {
+                                        let _ = tx.send(TradeWsResponse {
+                                            status,
+                                            result,
+                                            raw: text.to_string(),
+                                        });
+                                    }
                                 } else {
-                                    debug!("trade WS response for unknown id={}: {}", id, text);
+                                    warn!("trade WS response for unknown id={} (pending={}): {}",
+                                        id, pending.len(), text);
                                 }
                             } else {
                                 debug!("trade WS unparseable: {}", text);
