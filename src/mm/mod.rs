@@ -422,7 +422,7 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
         if self.state != EngineState::Running {
             info!(
                 "[{}] entering Running state (warmup={}s)",
-                self.config.symbol, self.config.warmup_secs
+                self.config.symbol, self.config.warmup_secs.unwrap()
             );
             self.state = EngineState::Running;
             self.running_since = Some(Instant::now());
@@ -430,7 +430,7 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
 
         self.warmed_up = self
             .running_since
-            .map(|t| t.elapsed() >= Duration::from_secs(self.config.warmup_secs))
+            .map(|t| t.elapsed() >= Duration::from_secs(self.config.warmup_secs.unwrap()))
             .unwrap_or(false);
 
         // ── CHECK FOR NEW DATA ──
@@ -451,11 +451,11 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
         if tick.is_direct {
             if let Some(inst) = tick.trigger_received_instant {
                 let recv_age_ms = inst.elapsed().as_millis() as i64;
-                if recv_age_ms > self.config.max_stale_ms as i64 {
+                if recv_age_ms > self.config.stale_cancel_ms.unwrap() as i64 {
                     if self.bid_quote.is_some() || self.ask_quote.is_some() {
                         warn!(
                             "[{}] ref feed stale (recv_age={}ms > {}ms), cancelling quotes",
-                            self.config.symbol, recv_age_ms, self.config.max_stale_ms
+                            self.config.symbol, recv_age_ms, self.config.stale_cancel_ms.unwrap()
                         );
                         self.cancel_all_quotes();
                     }
@@ -479,7 +479,7 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
         let mut is_slow = false;
 
         // ── SLOW PATH (~quote_interval_ms): quote placement ──
-        let interval = Duration::from_millis(self.config.quote_interval_ms);
+        let interval = Duration::from_millis(self.config.quote_interval_ms.unwrap());
         if self.warmed_up && self.last_quote_eval.elapsed() >= interval {
             #[cfg(feature = "profiling")]
             { is_slow = true; }
@@ -733,13 +733,13 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
             .get_fair_price_detail(self.target_exchange, self.hl_symbol_id)
             .and_then(|(_, _, _, recv, _)| recv);
         if let Some(recv) = live_recv {
-            if recv.elapsed().as_millis() as u64 > self.config.max_feed_age_ms {
+            if recv.elapsed().as_millis() as u64 > self.config.max_feed_age_ms.unwrap() {
                 if should_log {
                     warn!(
                         "[{}] paused: reference feed dead (recv_age={}ms > {}ms)",
                         self.config.symbol,
                         recv.elapsed().as_millis(),
-                        self.config.max_feed_age_ms
+                        self.config.max_feed_age_ms.unwrap()
                     );
                     self.last_status_log = Instant::now();
                 }
@@ -943,9 +943,9 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
         let position = self.get_position(oms_state);
         let target_usd = self.target_position_rx.as_ref().map(|rx| *rx.borrow()).unwrap_or(0.0);
         let target = target_usd / fair;
-        let notional = self.config.order_notional_usd;
+        let notional = self.config.order_notional_usd.unwrap();
         let order_size = notional / fair;
-        let max_pos = self.config.max_position_usd / fair;
+        let max_pos = self.config.max_position_usd.unwrap() / fair;
 
         let half_spread =
             self.config.ref_half_spread_bps.unwrap() * self.cached_vol_mult * fair / 10_000.0;
@@ -1233,7 +1233,7 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
             .map(|f| target_usd / f)
             .unwrap_or(0.0);
         let max_pos = fair
-            .map(|f| self.config.max_position_usd / f)
+            .map(|f| self.config.max_position_usd.unwrap() / f)
             .unwrap_or(0.0);
 
         let basis_bps = match (basis, fair) {
@@ -1350,7 +1350,7 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
         let target_usd = self.target_position_rx.as_ref().map(|rx| *rx.borrow()).unwrap_or(0.0);
         let fair_val = fair.unwrap_or(0.0);
         let target = if fair_val != 0.0 { target_usd / fair_val } else { 0.0 };
-        let max_pos = if fair_val != 0.0 { self.config.max_position_usd / fair_val } else { 0.0 };
+        let max_pos = if fair_val != 0.0 { self.config.max_position_usd.unwrap() / fair_val } else { 0.0 };
 
         let basis_bps = match (basis, fair) {
             (Some(b), Some(f)) if f != 0.0 => b / f * 10_000.0,
@@ -1562,7 +1562,7 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
             .into_iter()
             .cloned()
             .collect();
-        let min_age = Duration::from_millis(self.config.stray_order_age_ms);
+        let min_age = Duration::from_millis(self.config.stray_order_age_ms.unwrap());
 
         let fair = self
             .fair_price

@@ -53,6 +53,21 @@ pub struct MmConfig {
     #[serde(default = "default_requote_tolerance")]
     pub ref_requote_tolerance_bps: f64,
 
+    #[serde(default = "default_quote_interval")]
+    pub quote_interval_ms: u64,
+    #[serde(default = "default_warmup_secs")]
+    pub warmup_secs: u64,
+    #[serde(default = "default_max_feed_age")]
+    pub max_feed_age_ms: u64,
+    #[serde(default = "default_stale_cancel")]
+    pub stale_cancel_ms: u64,
+    #[serde(default = "default_stray_age_ms")]
+    pub stray_order_age_ms: u64,
+    #[serde(default = "default_order_notional")]
+    pub order_notional_usd: f64,
+    #[serde(default = "default_max_position")]
+    pub max_position_usd: f64,
+
     /// Optional vol model config for vol-adjusted spreads
     #[serde(default)]
     pub vol_models: Option<crypto_feeds::app_config::VolModelConfig>,
@@ -108,7 +123,7 @@ impl MmConfig {
             poll_interval: Duration::from_millis(hl.poll_interval_ms),
             inflight_timeout: Duration::from_millis(hl.inflight_timeout_ms),
             stray_order_age: Duration::from_millis(
-                self.symbols.first().map(|s| s.stray_order_age_ms).unwrap_or(5000)
+                self.stray_order_age_ms
             ),
         }
     }
@@ -116,7 +131,7 @@ impl MmConfig {
     pub fn to_hibachi_oms_config(&self, api_key: String, private_key: String, account_id: u64) -> HibachiOmsConfig {
         let hb = self.hibachi.as_ref().expect("hibachi config required");
         let stray = Duration::from_millis(
-            self.symbols.first().map(|s| s.stray_order_age_ms).unwrap_or(5000)
+            self.stray_order_age_ms
         );
         HibachiOmsConfig {
             api_key,
@@ -212,9 +227,11 @@ pub struct StrategyConfig {
     /// HL symbol to market-make, e.g. "PERP_BTC_USDC"
     pub symbol: String,
     /// Order size per side in USD notional (engine computes qty from notional / fair_price)
-    pub order_notional_usd: f64,
+    #[serde(default)]
+    pub order_notional_usd: Option<f64>,
     /// Max absolute position before hard pause
-    pub max_position_usd: f64,
+    #[serde(default)]
+    pub max_position_usd: Option<f64>,
     /// Max inventory skew in bps (linear ramp, clamped at this value)
     #[serde(default)]
     pub max_skew_bps: Option<f64>,
@@ -247,23 +264,23 @@ pub struct StrategyConfig {
     #[serde(default)]
     pub vol_symbol: String,
     /// Slow-path cadence for quote evaluation (ms)
-    #[serde(default = "default_quote_interval")]
-    pub quote_interval_ms: u64,
+    #[serde(default)]
+    pub quote_interval_ms: Option<u64>,
     /// Pause engine if feed older than this (ms) — feed is dead
-    #[serde(default = "default_max_feed_age")]
-    pub max_feed_age_ms: u64,
+    #[serde(default)]
+    pub max_feed_age_ms: Option<u64>,
     /// Cancel all quotes if ref feed age exceeds this (ms) — trading staleness
-    #[serde(default = "default_max_stale")]
-    pub max_stale_ms: u64,
+    #[serde(default, alias = "max_stale_ms")]
+    pub stale_cancel_ms: Option<u64>,
     /// Minimum age (ms) before an unrecognized order is treated as stray and cancelled
-    #[serde(default = "default_stray_age_ms")]
-    pub stray_order_age_ms: u64,
+    #[serde(default)]
+    pub stray_order_age_ms: Option<u64>,
     /// Use PostOnly (true) or GTC (false) for quotes (overrides global)
     #[serde(default)]
     pub post_only: Option<bool>,
     /// Warmup period in seconds before placing first quotes (let EWMA settle)
-    #[serde(default = "default_warmup_secs")]
-    pub warmup_secs: u64,
+    #[serde(default)]
+    pub warmup_secs: Option<u64>,
     /// Optional multi-factor correlation model for fair price adjustment
     #[serde(default)]
     pub factor_model: Option<FactorModelConfig>,
@@ -301,7 +318,9 @@ fn default_vol_mult_floor() -> f64 { 0.3 }
 fn default_vol_mult_cap() -> f64 { 5.0 }
 fn default_quote_interval() -> u64 { 150 }
 fn default_max_feed_age() -> u64 { 5_000 }
-fn default_max_stale() -> u64 { 500 }
+fn default_stale_cancel() -> u64 { 2000 }
+fn default_order_notional() -> f64 { 100.0 }
+fn default_max_position() -> f64 { 5000.0 }
 fn default_stray_age_ms() -> u64 { 1000 }
 fn default_post_only() -> bool { true }
 fn default_warmup_secs() -> u64 { 10 }

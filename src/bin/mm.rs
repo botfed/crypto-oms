@@ -193,6 +193,13 @@ async fn run_mm<O: ExchangeOms + 'static>(
         sym.max_skew_bps.get_or_insert(config.max_skew_bps);
         sym.min_edge_bps.get_or_insert(config.min_edge_bps);
         sym.ref_requote_tolerance_bps.get_or_insert(config.ref_requote_tolerance_bps);
+        sym.quote_interval_ms.get_or_insert(config.quote_interval_ms);
+        sym.warmup_secs.get_or_insert(config.warmup_secs);
+        sym.max_feed_age_ms.get_or_insert(config.max_feed_age_ms);
+        sym.stray_order_age_ms.get_or_insert(config.stray_order_age_ms);
+        sym.stale_cancel_ms.get_or_insert(config.stale_cancel_ms);
+        sym.order_notional_usd.get_or_insert(config.order_notional_usd);
+        sym.max_position_usd.get_or_insert(config.max_position_usd);
     }
 
     let fair_price = Arc::new(FairPriceEngine::new(market_data.clone(), config.fair_price)?);
