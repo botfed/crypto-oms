@@ -19,30 +19,30 @@ fair_price:
       target_symbol: PERP_BTC_USDT
       reference_exchange: binance
       reference_symbol: PERP_BTC_USDT
-    - target_exchange: hibachi
-      target_symbol: PERP_ETH_USDT
-      reference_exchange: binance
-      reference_symbol: PERP_ETH_USDT
-    - target_exchange: hibachi
-      target_symbol: PERP_SOL_USDT
-      reference_exchange: binance
-      reference_symbol: PERP_SOL_USDT
-    - target_exchange: hibachi
-      target_symbol: PERP_HYPE_USDT
-      reference_exchange: binance
-      reference_symbol: PERP_HYPE_USDT
-    - target_exchange: hibachi
-      target_symbol: PERP_BNB_USDT
-      reference_exchange: binance
-      reference_symbol: PERP_BNB_USDT
-    - target_exchange: hibachi
-      target_symbol: PERP_SUI_USDT
-      reference_exchange: binance
-      reference_symbol: PERP_SUI_USDT
-    - target_exchange: hibachi
-      target_symbol: PERP_XRP_USDT
-      reference_exchange: binance
-      reference_symbol: PERP_XRP_USDT
+    # - target_exchange: hibachi
+    #   target_symbol: PERP_ETH_USDT
+    #   reference_exchange: binance
+    #   reference_symbol: PERP_ETH_USDT
+    # - target_exchange: hibachi
+    #   target_symbol: PERP_SOL_USDT
+    #   reference_exchange: binance
+    #   reference_symbol: PERP_SOL_USDT
+    # - target_exchange: hibachi
+    #   target_symbol: PERP_HYPE_USDT
+    #   reference_exchange: binance
+    #   reference_symbol: PERP_HYPE_USDT
+    # - target_exchange: hibachi
+    #   target_symbol: PERP_BNB_USDT
+    #   reference_exchange: binance
+    #   reference_symbol: PERP_BNB_USDT
+    # - target_exchange: hibachi
+    #   target_symbol: PERP_SUI_USDT
+    #   reference_exchange: binance
+    #   reference_symbol: PERP_SUI_USDT
+    # - target_exchange: hibachi
+    #   target_symbol: PERP_XRP_USDT
+    #   reference_exchange: binance
+    #   reference_symbol: PERP_XRP_USDT
 
 inventory:
   mode: static
@@ -74,33 +74,33 @@ symbols:
     vol_mult_floor: 0.3
     vol_mult_cap: 2.0
     vol_symbol: "BTC"
-  - symbol: PERP_ETH_USDT
-    ref_vol: 0.35
-    vol_mult_floor: 0.3
-    vol_mult_cap: 2.0
-    vol_symbol: "ETH"
-  - symbol: PERP_SOL_USDT
-    ref_vol: 0.60
-    vol_mult_floor: 0.3
-    vol_mult_cap: 2.0
-    vol_symbol: "SOL"
-  - symbol: PERP_HYPE_USDT
-    ref_vol: 1.00
-    vol_mult_floor: 0.3
-    vol_mult_cap: 2.0
-    vol_symbol: "HYPE"
-  - symbol: PERP_BNB_USDT
-    ref_vol: 0.50
-    vol_mult_floor: 0.3
-    vol_mult_cap: 2.0
-    vol_symbol: "BNB"
-  - symbol: PERP_SUI_USDT
-    ref_vol: 0.80
-    vol_mult_floor: 0.3
-    vol_mult_cap: 2.0
-    vol_symbol: "SUI"
-  - symbol: PERP_XRP_USDT
-    ref_vol: 0.50
-    vol_mult_floor: 0.3
-    vol_mult_cap: 2.0
-    vol_symbol: "XRP"
+  # - symbol: PERP_ETH_USDT
+  #   ref_vol: 0.35
+  #   vol_mult_floor: 0.3
+  #   vol_mult_cap: 2.0
+  #   vol_symbol: "ETH"
+  # - symbol: PERP_SOL_USDT
+  #   ref_vol: 0.60
+  #   vol_mult_floor: 0.3
+  #   vol_mult_cap: 2.0
+  #   vol_symbol: "SOL"
+  # - symbol: PERP_HYPE_USDT
+  #   ref_vol: 1.00
+  #   vol_mult_floor: 0.3
+  #   vol_mult_cap: 2.0
+  #   vol_symbol: "HYPE"
+  # - symbol: PERP_BNB_USDT
+  #   ref_vol: 0.50
+  #   vol_mult_floor: 0.3
+  #   vol_mult_cap: 2.0
+  #   vol_symbol: "BNB"
+  # - symbol: PERP_SUI_USDT
+  #   ref_vol: 0.80
+  #   vol_mult_floor: 0.3
+  #   vol_mult_cap: 2.0
+  #   vol_symbol: "SUI"
+  # - symbol: PERP_XRP_USDT
+  #   ref_vol: 0.50
+  #   vol_mult_floor: 0.3
+  #   vol_mult_cap: 2.0
+  #   vol_symbol: "XRP"
