@@ -1068,7 +1068,7 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
             match self.oms.prepare_place_order(&req) {
                 Ok((cid, sdk_req)) => {
                     let bid_from_fair_bps = (desired_bid - fair) / fair * 10_000.0;
-                    info!("[{}] place BID cid={} | {:.1}bps from fair (spread={:.1}bps edge={:.1}bps skew={:+.1}bps vmul={:.2})",
+                    debug!("[{}] place BID cid={} | {:.1}bps from fair (spread={:.1}bps edge={:.1}bps skew={:+.1}bps vmul={:.2})",
                         self.config.symbol, cid.0, bid_from_fair_bps,
                         self.config.ref_half_spread_bps.unwrap() * self.cached_vol_mult,
                         self.config.min_edge_bps.unwrap(), self.cached_skew_bps, self.cached_vol_mult);
@@ -1129,7 +1129,7 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
             match self.oms.prepare_place_order(&req) {
                 Ok((cid, sdk_req)) => {
                     let ask_from_fair_bps = (desired_ask - fair) / fair * 10_000.0;
-                    info!("[{}] place ASK cid={} | {:.1}bps from fair (spread={:.1}bps edge={:.1}bps skew={:+.1}bps vmul={:.2})",
+                    debug!("[{}] place ASK cid={} | {:.1}bps from fair (spread={:.1}bps edge={:.1}bps skew={:+.1}bps vmul={:.2})",
                         self.config.symbol, cid.0, ask_from_fair_bps,
                         self.config.ref_half_spread_bps.unwrap() * self.cached_vol_mult,
                         self.config.min_edge_bps.unwrap(), self.cached_skew_bps, self.cached_vol_mult);
