@@ -64,6 +64,9 @@ pub struct SymbolStatus {
     pub cancel_bid_bps: f64,
     /// Fast cancel boundary: min ask in bps from fair (positive = above fair)
     pub cancel_ask_bps: f64,
+    /// Requote boundary in bps from fair (outer side — where slow cancel triggers)
+    pub requote_bid_bps: f64,
+    pub requote_ask_bps: f64,
     pub feed_age_ms: i64,
 }
 
@@ -298,19 +301,19 @@ fn render_frame(
     let has_any_quote = statuses.values().any(|st| st.bid_quote.is_some() || st.ask_quote.is_some());
     if has_any_quote {
         let _ = writeln!(buf);
-        let _ = writeln!(buf, "  {CYAN}{:<16} {:>5} {:>6} {:>12} {:>8} {:>10} {:>10} {:>12} {:>8}{RESET}",
-            "Symbol", "Side", "CID", "Price", "Fair", "Cancel@", "Size", "State", "Age");
+        let _ = writeln!(buf, "  {CYAN}{:<16} {:>5} {:>6} {:>12} {:>8} {:>10} {:>10} {:>10} {:>12} {:>8}{RESET}",
+            "Symbol", "Side", "CID", "Price", "Fair", "Cancel@", "Requote@", "Size", "State", "Age");
         for st in statuses.values() {
             if let Some(ref q) = st.bid_quote {
                 let dist_bps = if st.fair > 0.0 { (q.price - st.fair) / st.fair * 10_000.0 } else { 0.0 };
-                let _ = writeln!(buf, "  {:<16} {GREEN}{:>5}{RESET} {:>6} {:>12} {:>+7.1}bp {:>+9.1}bp {:>10} {:>12} {:>7}s",
-                    st.symbol, "BID", q.cid, fmt_price(q.price), dist_bps, st.cancel_bid_bps,
+                let _ = writeln!(buf, "  {:<16} {GREEN}{:>5}{RESET} {:>6} {:>12} {:>+7.1}bp {:>+9.1}bp {:>+9.1}bp {:>10} {:>12} {:>7}s",
+                    st.symbol, "BID", q.cid, fmt_price(q.price), dist_bps, st.cancel_bid_bps, st.requote_bid_bps,
                     fmt_qty_compact(q.size), q.state, q.age_ms / 1000);
             }
             if let Some(ref q) = st.ask_quote {
                 let dist_bps = if st.fair > 0.0 { (q.price - st.fair) / st.fair * 10_000.0 } else { 0.0 };
-                let _ = writeln!(buf, "  {:<16} {RED}{:>5}{RESET} {:>6} {:>12} {:>+7.1}bp {:>+9.1}bp {:>10} {:>12} {:>7}s",
-                    st.symbol, "ASK", q.cid, fmt_price(q.price), dist_bps, st.cancel_ask_bps,
+                let _ = writeln!(buf, "  {:<16} {RED}{:>5}{RESET} {:>6} {:>12} {:>+7.1}bp {:>+9.1}bp {:>+9.1}bp {:>10} {:>12} {:>7}s",
+                    st.symbol, "ASK", q.cid, fmt_price(q.price), dist_bps, st.cancel_ask_bps, st.requote_ask_bps,
                     fmt_qty_compact(q.size), q.state, q.age_ms / 1000);
             }
         }

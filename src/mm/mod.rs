@@ -1479,6 +1479,22 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
                 let min_ask = (mid + min_spread).max(fair_val + min_edge);
                 (min_ask - fair_val) / fair_val * 10_000.0
             } else { 0.0 },
+            requote_bid_bps: if fair_val > 0.0 {
+                let mid = fair_val + self.cached_skew_bps * fair_val / 10_000.0;
+                let half_spread = self.config.ref_half_spread_bps.unwrap() * vol_mult * fair_val / 10_000.0;
+                let requote = self.config.ref_requote_tolerance_bps.unwrap() * vol_mult * fair_val / 10_000.0;
+                let desired_bid = mid - half_spread;
+                let outer_bid = desired_bid - requote;
+                (outer_bid - fair_val) / fair_val * 10_000.0
+            } else { 0.0 },
+            requote_ask_bps: if fair_val > 0.0 {
+                let mid = fair_val + self.cached_skew_bps * fair_val / 10_000.0;
+                let half_spread = self.config.ref_half_spread_bps.unwrap() * vol_mult * fair_val / 10_000.0;
+                let requote = self.config.ref_requote_tolerance_bps.unwrap() * vol_mult * fair_val / 10_000.0;
+                let desired_ask = mid + half_spread;
+                let outer_ask = desired_ask + requote;
+                (outer_ask - fair_val) / fair_val * 10_000.0
+            } else { 0.0 },
             feed_age_ms,
         });
     }
