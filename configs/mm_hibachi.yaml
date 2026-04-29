@@ -80,11 +80,11 @@ symbols:
     vol_mult_floor: 1.0
     vol_mult_cap: 10.0
     vol_symbol: "BTC"
-  # - symbol: PERP_ETH_USDT
-  #   ref_vol: 0.40
-  #   vol_mult_floor: 0.3
-  #   vol_mult_cap: 2.0
-  #   vol_symbol: "ETH"
+  - symbol: PERP_ETH_USDT
+    ref_vol: 0.40
+    vol_mult_floor: 1.0
+    vol_mult_cap: 10.0
+    vol_symbol: "ETH"
   # - symbol: PERP_SOL_USDT
   #   ref_vol: 0.40
   #   vol_mult_floor: 0.3
