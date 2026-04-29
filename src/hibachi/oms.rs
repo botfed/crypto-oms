@@ -1664,7 +1664,7 @@ impl ExchangeOms for HibachiOms {
     }
 
     async fn post_cancel(&self, id: &ClientOrderId, signed: Self::SignedPayload) {
-        let (body, exchange_id, nonce, _signature_rest, signature_ws) = match signed {
+        let (body, exchange_id, nonce, signature_rest, _signature_ws) = match signed {
             HibachiSignedPayload::Cancel { body, exchange_id, nonce, signature_rest, signature_ws } =>
                 (body, exchange_id, nonce, signature_rest, signature_ws),
             _ => { warn!("post_cancel called with non-cancel payload"); return; }
@@ -1677,7 +1677,7 @@ impl ExchangeOms for HibachiOms {
             "nonce": nonce.to_string(),
         });
 
-        if let Some(resp) = self.send_trade_ws("order.cancel", ws_params, &signature_ws).await {
+        if let Some(resp) = self.send_trade_ws("order.cancel", ws_params, &signature_rest).await {
             if resp.status == 200 {
                 if let Some(mut h) = self.state.orders.get_mut(&id.0) {
                     h.state = OrderState::Cancelled;
