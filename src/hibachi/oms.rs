@@ -854,7 +854,11 @@ impl HibachiOms {
         if tick_size <= 0.0 {
             return price;
         }
-        (price / tick_size).round() * tick_size
+        let ticks = (price / tick_size).round();
+        // Determine decimal precision from tick_size to avoid floating-point drift
+        let decimals = (-tick_size.log10()).ceil().max(0.0) as u32;
+        let factor = 10f64.powi(decimals as i32);
+        ((ticks * tick_size) * factor).round() / factor
     }
 
     fn round_to_lot(size: f64, lot_size: f64) -> f64 {
@@ -1186,9 +1190,14 @@ impl ExchangeOms for HibachiOms {
     }
 
     fn round_price(&self, price: f64) -> f64 {
+        // Use smallest tick size across all contracts as conservative default.
+        // Per-symbol rounding happens in sign_order via the contract lookup.
         let contracts = self.contracts.read();
-        if let Some(c) = contracts.values().next() {
-            Self::round_to_tick(price, c.tick_size)
+        let tick = contracts.values()
+            .map(|c| c.tick_size)
+            .fold(f64::MAX, f64::min);
+        if tick < f64::MAX {
+            Self::round_to_tick(price, tick)
         } else {
             price
         }
