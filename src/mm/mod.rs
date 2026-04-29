@@ -1442,6 +1442,30 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
             want_ask: position - target > -max_pos,
             bid_price: self.bid_quote.as_ref().map(|q| q.price),
             ask_price: self.ask_quote.as_ref().map(|q| q.price),
+            bid_quote: self.bid_quote.as_ref().map(|q| {
+                let state = oms_state.get_order(q.client_id)
+                    .map(|h| format!("{:?}", h.state))
+                    .unwrap_or_else(|| "?".into());
+                display::QuoteInfo {
+                    cid: q.client_id.0,
+                    price: q.price,
+                    size: q.size,
+                    state,
+                    age_ms: q.placed_at.elapsed().as_millis() as u64,
+                }
+            }),
+            ask_quote: self.ask_quote.as_ref().map(|q| {
+                let state = oms_state.get_order(q.client_id)
+                    .map(|h| format!("{:?}", h.state))
+                    .unwrap_or_else(|| "?".into());
+                display::QuoteInfo {
+                    cid: q.client_id.0,
+                    price: q.price,
+                    size: q.size,
+                    state,
+                    age_ms: q.placed_at.elapsed().as_millis() as u64,
+                }
+            }),
             feed_age_ms,
         });
     }

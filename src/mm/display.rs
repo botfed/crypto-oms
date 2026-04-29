@@ -29,6 +29,14 @@ const MAX_LOG_LINES: usize = 200;
 // Messages
 // ---------------------------------------------------------------------------
 
+pub struct QuoteInfo {
+    pub cid: u64,
+    pub price: f64,
+    pub size: f64,
+    pub state: String,
+    pub age_ms: u64,
+}
+
 pub struct SymbolStatus {
     pub symbol: String,
     pub fair: f64,
@@ -50,6 +58,8 @@ pub struct SymbolStatus {
     pub want_ask: bool,
     pub bid_price: Option<f64>,
     pub ask_price: Option<f64>,
+    pub bid_quote: Option<QuoteInfo>,
+    pub ask_quote: Option<QuoteInfo>,
     pub feed_age_ms: i64,
 }
 
@@ -278,6 +288,24 @@ fn render_frame(
             want,
             age_str,
         );
+    }
+
+    // Orders table
+    let has_any_quote = statuses.values().any(|st| st.bid_quote.is_some() || st.ask_quote.is_some());
+    if has_any_quote {
+        let _ = writeln!(buf);
+        let _ = writeln!(buf, "  {CYAN}{:<16} {:>5} {:>6} {:>12} {:>10} {:>12} {:>8}{RESET}",
+            "Symbol", "Side", "CID", "Price", "Size", "State", "Age");
+        for st in statuses.values() {
+            if let Some(ref q) = st.bid_quote {
+                let _ = writeln!(buf, "  {:<16} {GREEN}{:>5}{RESET} {:>6} {:>12} {:>10} {:>12} {:>7}s",
+                    st.symbol, "BID", q.cid, fmt_price(q.price), fmt_qty_compact(q.size), q.state, q.age_ms / 1000);
+            }
+            if let Some(ref q) = st.ask_quote {
+                let _ = writeln!(buf, "  {:<16} {RED}{:>5}{RESET} {:>6} {:>12} {:>10} {:>12} {:>7}s",
+                    st.symbol, "ASK", q.cid, fmt_price(q.price), fmt_qty_compact(q.size), q.state, q.age_ms / 1000);
+            }
+        }
     }
 
     // Log section — strictly cap total output to terminal height
