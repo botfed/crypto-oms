@@ -115,6 +115,22 @@ impl OmsState {
 }
 
 // ---------------------------------------------------------------------------
+// Trade WS types
+// ---------------------------------------------------------------------------
+
+struct TradeWsCommand {
+    id: u64,
+    json: String,
+    response_tx: tokio::sync::oneshot::Sender<TradeWsResponse>,
+}
+
+struct TradeWsResponse {
+    pub status: u16,
+    pub result: Option<serde_json::Value>,
+    pub raw: String,
+}
+
+// ---------------------------------------------------------------------------
 // Hibachi OMS
 // ---------------------------------------------------------------------------
 
@@ -126,8 +142,12 @@ pub struct HibachiOms {
     ready: Arc<AtomicBool>,
     ready_notify: Arc<Notify>,
     next_client_id: AtomicU64,
+    next_ws_id: AtomicU64,
     event_tx: crossbeam_channel::Sender<OmsEvent>,
     event_rx: crossbeam_channel::Receiver<OmsEvent>,
+    trade_ws_tx: tokio::sync::mpsc::UnboundedSender<TradeWsCommand>,
+    trade_ws_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<TradeWsCommand>>>,
+    trade_ws_connected: Arc<AtomicBool>,
     config: HibachiOmsConfig,
     shutdown: Arc<Notify>,
     pub diag: Arc<OmsDiagnostics>,
@@ -144,6 +164,7 @@ impl HibachiOms {
         )?;
         let client = Arc::new(client);
         let (event_tx, event_rx) = crossbeam_channel::bounded(4096);
+        let (trade_ws_tx, trade_ws_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let oms = Arc::new(Self {
             client,
@@ -152,8 +173,12 @@ impl HibachiOms {
             ready: Arc::new(AtomicBool::new(false)),
             ready_notify: Arc::new(Notify::new()),
             next_client_id: AtomicU64::new(1),
+            next_ws_id: AtomicU64::new(1),
             event_tx,
             event_rx,
+            trade_ws_tx,
+            trade_ws_rx: Mutex::new(Some(trade_ws_rx)),
+            trade_ws_connected: Arc::new(AtomicBool::new(false)),
             config,
             shutdown: Arc::new(Notify::new()),
             diag: Arc::new(OmsDiagnostics::new()),
@@ -184,6 +209,11 @@ impl HibachiOms {
 
         let this = Arc::clone(self);
         tokio::spawn(async move { this.run_inflight_watchdog().await });
+
+        let this = Arc::clone(self);
+        let trade_ws_rx = self.trade_ws_rx.lock().take()
+            .expect("start() called twice");
+        tokio::spawn(async move { this.run_trade_ws(trade_ws_rx).await });
     }
 
     pub fn shutdown(&self) {
@@ -833,6 +863,164 @@ impl HibachiOms {
     }
 
     // -----------------------------------------------------------------------
+    // Trade WS (order place/cancel/modify)
+    // -----------------------------------------------------------------------
+
+    async fn run_trade_ws(
+        &self,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<TradeWsCommand>,
+    ) {
+        self.ready_notify.notified().await;
+
+        let mut backoff = Duration::from_secs(1);
+        let max_backoff = Duration::from_secs(30);
+
+        loop {
+            match self.trade_ws_loop(&mut rx).await {
+                Ok(()) => return, // shutdown
+                Err(e) => {
+                    self.trade_ws_connected.store(false, Ordering::Release);
+                    warn!("trade WS disconnected: {e:#}");
+                }
+            }
+
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = self.shutdown.notified() => return,
+            }
+            backoff = (backoff * 2).min(max_backoff);
+        }
+    }
+
+    async fn trade_ws_loop(
+        &self,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<TradeWsCommand>,
+    ) -> Result<()> {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::protocol::Message;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let url = self.client.trade_ws_url();
+        let mut request = url.as_str().into_client_request()?;
+        request.headers_mut().insert(
+            "Authorization",
+            self.client.api_key.parse()?,
+        );
+
+        let (ws, _) = tokio_tungstenite::connect_async(request).await?;
+        let (mut write, mut read) = ws.split();
+        self.trade_ws_connected.store(true, Ordering::Release);
+        info!("trade WS connected");
+
+        let mut pending: HashMap<u64, tokio::sync::oneshot::Sender<TradeWsResponse>> =
+            HashMap::new();
+        let mut ping_timer = tokio::time::interval(Duration::from_secs(15));
+        ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ping_timer.tick().await; // consume immediate tick
+
+        loop {
+            tokio::select! {
+                // Outgoing commands from post_order / post_cancel
+                cmd = rx.recv() => {
+                    let cmd = match cmd {
+                        Some(c) => c,
+                        None => return Ok(()), // channel closed = shutdown
+                    };
+                    pending.insert(cmd.id, cmd.response_tx);
+                    write.send(Message::Text(cmd.json.into())).await?;
+                }
+
+                // Incoming responses from exchange
+                msg = read.next() => {
+                    let msg = match msg {
+                        Some(Ok(m)) => m,
+                        Some(Err(e)) => bail!("trade WS error: {e}"),
+                        None => bail!("trade WS stream ended"),
+                    };
+                    match msg {
+                        Message::Text(text) => {
+                            if text.as_str() == "pong" {
+                                continue;
+                            }
+                            // Parse response: {"id":N,"status":200,"result":{...}}
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.as_str()) {
+                                let id = v.get("id")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                let status = v.get("status")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0) as u16;
+                                let result = v.get("result").cloned();
+
+                                if let Some(tx) = pending.remove(&id) {
+                                    let _ = tx.send(TradeWsResponse {
+                                        status,
+                                        result,
+                                        raw: text.to_string(),
+                                    });
+                                } else {
+                                    debug!("trade WS response for unknown id={}: {}", id, text);
+                                }
+                            } else {
+                                debug!("trade WS unparseable: {}", text);
+                            }
+                        }
+                        Message::Ping(data) => {
+                            write.send(Message::Pong(data)).await?;
+                        }
+                        Message::Close(_) => bail!("trade WS closed by server"),
+                        _ => {}
+                    }
+                }
+
+                // Keepalive
+                _ = ping_timer.tick() => {
+                    write.send(Message::Text("ping".into())).await?;
+                }
+
+                _ = self.shutdown.notified() => {
+                    // Drop all pending — callers get RecvError → fall back to REST
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// Send a command over the trade WS and await the response.
+    /// Returns None if WS is down (caller should fall back to REST).
+    async fn send_trade_ws(&self, method: &str, params: serde_json::Value, signature: &str) -> Option<TradeWsResponse> {
+        if !self.trade_ws_connected.load(Ordering::Acquire) {
+            return None;
+        }
+
+        let id = self.next_ws_id.fetch_add(1, Ordering::Relaxed);
+        let json = serde_json::json!({
+            "id": id,
+            "method": method,
+            "params": params,
+            "signature": signature,
+        });
+        let json_str = serde_json::to_string(&json).ok()?;
+
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let cmd = TradeWsCommand { id, json: json_str, response_tx };
+
+        if self.trade_ws_tx.send(cmd).is_err() {
+            return None; // channel closed
+        }
+
+        // Timeout waiting for response
+        match tokio::time::timeout(Duration::from_secs(5), response_rx).await {
+            Ok(Ok(resp)) => Some(resp),
+            Ok(Err(_)) => None,   // sender dropped (WS reconnecting)
+            Err(_) => {
+                warn!("trade WS response timeout for id={}", id);
+                None
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Order helpers
     // -----------------------------------------------------------------------
 
@@ -1308,6 +1496,51 @@ impl ExchangeOms for HibachiOms {
             _ => { warn!("post_order called with non-order payload"); return; }
         };
 
+        // Extract signature for WS
+        let signature = body.get("signature").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+        // Build WS params (reuse REST body fields)
+        let ws_params = {
+            let mut p = body.clone();
+            p.as_object_mut().map(|o| o.remove("signature"));
+            p
+        };
+
+        if let Some(resp) = self.send_trade_ws("order.place", ws_params, &signature).await {
+            if resp.status == 200 {
+                let oid = resp.result
+                    .as_ref()
+                    .and_then(|r| r.get("orderId"))
+                    .and_then(|v| v.as_u64().map(|n| n.to_string()).or_else(|| v.as_str().map(|s| s.to_string())))
+                    .unwrap_or_default();
+                if let Some(mut h) = self.state.orders.get_mut(&cid) {
+                    h.exchange_id = Some(oid.clone());
+                    h.state = OrderState::Accepted;
+                    h.last_modified = Some(Instant::now());
+                }
+                self.state.oid_map.insert(oid.clone(), cid);
+                let _ = self.event_tx.send(OmsEvent::OrderAccepted {
+                    client_id: ClientOrderId(cid),
+                    exchange_id: oid,
+                });
+                return;
+            } else {
+                warn!("hibachi WS order.place failed for cid={cid}: status={} body={}", resp.status, resp.raw);
+                if let Some(mut h) = self.state.orders.get_mut(&cid) {
+                    h.state = OrderState::Rejected;
+                    h.reject_reason = Some(resp.raw.clone());
+                    h.last_modified = Some(Instant::now());
+                }
+                let _ = self.event_tx.send(OmsEvent::OrderRejected {
+                    client_id: ClientOrderId(cid),
+                    reason: resp.raw,
+                });
+                return;
+            }
+        }
+
+        // REST fallback
+        debug!("trade WS unavailable, falling back to REST for cid={cid}");
         match self.client.place_order_rest(body).await {
             Ok(resp) => {
                 let oid = resp.order_id;
@@ -1323,7 +1556,7 @@ impl ExchangeOms for HibachiOms {
                 });
             }
             Err(e) => {
-                warn!("hibachi post_order failed for cid={cid}: {e}");
+                warn!("hibachi REST post_order failed for cid={cid}: {e}");
                 if let Some(mut h) = self.state.orders.get_mut(&cid) {
                     h.state = OrderState::Rejected;
                     h.reject_reason = Some(format!("{e}"));
@@ -1355,6 +1588,7 @@ impl ExchangeOms for HibachiOms {
         }
         let _ = self.event_tx.send(OmsEvent::OrderCancelling(*id));
 
+        let nonce = HibachiClient::gen_nonce();
         let oid_u64: u64 = exchange_id.parse().unwrap_or(0);
         let payload = self.client.build_cancel_payload(oid_u64);
         let signature = self.client.sign(&payload)?;
@@ -1362,6 +1596,7 @@ impl ExchangeOms for HibachiOms {
         let body = serde_json::json!({
             "accountId": self.client.account_id,
             "orderId": &exchange_id,
+            "nonce": nonce,
             "signature": signature,
         });
 
@@ -1378,6 +1613,7 @@ impl ExchangeOms for HibachiOms {
         drop(handle);
 
         // No state change — just sign
+        let nonce = HibachiClient::gen_nonce();
         let oid_u64: u64 = exchange_id.parse().unwrap_or(0);
         let payload = self.client.build_cancel_payload(oid_u64);
         let signature = self.client.sign(&payload)?;
@@ -1385,6 +1621,7 @@ impl ExchangeOms for HibachiOms {
         let body = serde_json::json!({
             "accountId": self.client.account_id,
             "orderId": &exchange_id,
+            "nonce": nonce,
             "signature": signature,
         });
 
@@ -1399,14 +1636,37 @@ impl ExchangeOms for HibachiOms {
     }
 
     async fn post_cancel(&self, id: &ClientOrderId, signed: Self::SignedPayload) {
-        let body = match signed {
-            HibachiSignedPayload::Cancel { body, .. } => body,
+        let (body, exchange_id) = match signed {
+            HibachiSignedPayload::Cancel { body, exchange_id } => (body, exchange_id),
             _ => { warn!("post_cancel called with non-cancel payload"); return; }
         };
 
+        // Try WS first
+        let signature = body.get("signature").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let ws_params = serde_json::json!({
+            "orderId": exchange_id,
+            "accountId": self.client.account_id,
+            "nonce": body.get("nonce").cloned().unwrap_or(serde_json::json!(0)),
+        });
+
+        if let Some(resp) = self.send_trade_ws("order.cancel", ws_params, &signature).await {
+            if resp.status == 200 {
+                if let Some(mut h) = self.state.orders.get_mut(&id.0) {
+                    h.state = OrderState::Cancelled;
+                    h.last_modified = Some(Instant::now());
+                }
+                let _ = self.event_tx.send(OmsEvent::OrderCancelled(*id));
+                return;
+            } else {
+                warn!("hibachi WS order.cancel failed for {}: status={} body={}", id.0, resp.status, resp.raw);
+                // Fall through to REST
+            }
+        }
+
+        // REST fallback
+        debug!("trade WS unavailable for cancel, falling back to REST for {}", id.0);
         match self.client.cancel_order_rest(body).await {
             Ok(()) => {
-                // REST 200 = cancel confirmed. Mark Cancelled immediately.
                 if let Some(mut h) = self.state.orders.get_mut(&id.0) {
                     h.state = OrderState::Cancelled;
                     h.last_modified = Some(Instant::now());
@@ -1414,7 +1674,7 @@ impl ExchangeOms for HibachiOms {
                 let _ = self.event_tx.send(OmsEvent::OrderCancelled(*id));
             }
             Err(e) => {
-                warn!("hibachi cancel failed for {}: {e}, restoring to Accepted", id.0);
+                warn!("hibachi REST cancel failed for {}: {e}, restoring to Accepted", id.0);
                 if let Some(mut h) = self.state.orders.get_mut(&id.0) {
                     h.state = OrderState::Accepted;
                     h.last_modified = Some(Instant::now());
