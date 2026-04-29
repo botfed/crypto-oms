@@ -9,6 +9,12 @@ perp:
   binance: [BTC_USDT, SOL_USDT]
   hibachi: [BTC_USDT, SOL_USDT]
 
+vol_models:
+  params_dir: "../botfed-params/vol"
+  bar_data_dir: "../data/binance_ohlcv/perps/1m"
+  model: "har_qlike"
+  warmup_days: 2
+
 
 fair_price:
   basis_halflife_secs: 600.0
