@@ -1052,7 +1052,11 @@ impl ExchangeOms for HibachiOms {
 
         match self.client.cancel_order_rest(body).await {
             Ok(()) => {
-                // Cancelling already set, REST poll will confirm
+                if let Some(mut h) = self.state.orders.get_mut(&id.0) {
+                    h.state = OrderState::Cancelled;
+                    h.last_modified = Some(Instant::now());
+                }
+                let _ = self.event_tx.send(OmsEvent::OrderCancelled(*id));
             }
             Err(e) => {
                 warn!("hibachi cancel failed for {}: {e}, restoring to Accepted", id.0);
@@ -1401,7 +1405,14 @@ impl ExchangeOms for HibachiOms {
         };
 
         match self.client.cancel_order_rest(body).await {
-            Ok(()) => { /* Cancelling already set, REST poll will confirm */ }
+            Ok(()) => {
+                // REST 200 = cancel confirmed. Mark Cancelled immediately.
+                if let Some(mut h) = self.state.orders.get_mut(&id.0) {
+                    h.state = OrderState::Cancelled;
+                    h.last_modified = Some(Instant::now());
+                }
+                let _ = self.event_tx.send(OmsEvent::OrderCancelled(*id));
+            }
             Err(e) => {
                 warn!("hibachi cancel failed for {}: {e}, restoring to Accepted", id.0);
                 if let Some(mut h) = self.state.orders.get_mut(&id.0) {
