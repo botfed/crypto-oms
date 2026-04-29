@@ -1228,6 +1228,7 @@ impl ExchangeOms for HibachiOms {
         }
         let _ = self.event_tx.send(OmsEvent::OrderCancelling(*id));
 
+        let nonce = HibachiClient::gen_nonce();
         let oid_u64: u64 = exchange_id.parse().unwrap_or(0);
         let payload = self.client.build_cancel_payload(oid_u64);
         let signature = self.client.sign(&payload)?;
@@ -1235,6 +1236,7 @@ impl ExchangeOms for HibachiOms {
         let body = serde_json::json!({
             "accountId": self.client.account_id,
             "orderId": exchange_id,
+            "nonce": nonce.to_string(),
             "signature": signature,
         });
 
@@ -1636,17 +1638,16 @@ impl ExchangeOms for HibachiOms {
     }
 
     async fn post_cancel(&self, id: &ClientOrderId, signed: Self::SignedPayload) {
-        let (body, exchange_id) = match signed {
-            HibachiSignedPayload::Cancel { body, exchange_id } => (body, exchange_id),
+        let (body, exchange_id, nonce, signature) = match signed {
+            HibachiSignedPayload::Cancel { body, exchange_id, nonce, signature } => (body, exchange_id, nonce, signature),
             _ => { warn!("post_cancel called with non-cancel payload"); return; }
         };
 
-        // Try WS first
-        let signature = body.get("signature").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        // Try WS first (nonce as integer for WS)
         let ws_params = serde_json::json!({
             "orderId": exchange_id,
             "accountId": self.client.account_id,
-            "nonce": body.get("nonce").cloned().unwrap_or(serde_json::json!(0)),
+            "nonce": nonce,
         });
 
         if let Some(resp) = self.send_trade_ws("order.cancel", ws_params, &signature).await {
