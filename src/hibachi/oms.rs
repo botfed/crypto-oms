@@ -339,6 +339,9 @@ impl HibachiOms {
         )?;
 
         // Reconcile orders
+        let tracked_count = self.state.orders.len();
+        let pending_count = pending_orders.len();
+        debug!("poller: {} orders on exchange, {} tracked locally", pending_count, tracked_count);
         let mut exchange_oids: HashSet<String> = HashSet::new();
 
         for oo in &pending_orders {
@@ -480,8 +483,13 @@ impl HibachiOms {
             ) {
                 if let Some(eid) = &handle.exchange_id {
                     if !exchange_oids.contains(eid) {
+                        info!("poller: cid={} eid={} state={:?} disappeared from exchange",
+                            entry.key(), eid, handle.state);
                         to_remove.push(*entry.key());
                     }
+                } else {
+                    debug!("poller: cid={} state={:?} has no exchange_id, skipping disappear check",
+                        entry.key(), handle.state);
                 }
             }
         }
@@ -587,6 +595,8 @@ impl HibachiOms {
         let snap_balances: Vec<Balance> = self.state.balances.iter()
             .map(|e| e.value().clone())
             .collect();
+        debug!("poller: emitting snapshot ({} orders, {} positions, {} balances)",
+            snap_orders.len(), snap_positions.len(), snap_balances.len());
         let _ = self.event_tx.send(OmsEvent::Snapshot {
             orders: snap_orders,
             positions: snap_positions,
