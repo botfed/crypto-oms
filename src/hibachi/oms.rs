@@ -572,6 +572,7 @@ impl HibachiOms {
 
         loop {
             if let Err(e) = self.snapshot_from_rest().await {
+                warn!("hibachi REST poll failed: {e:#}");
                 self.diag.set_error(format!("REST poll failed: {e:#}"));
             }
 

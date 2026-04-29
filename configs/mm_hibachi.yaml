@@ -58,7 +58,7 @@ post_only: true
 ref_half_spread_bps: 3.0
 ref_min_spread_bps: 0.5
 min_edge_bps: 0.5
-max_skew_bps: 2.0
+max_skew_bps: 10.0
 ref_requote_tolerance_bps: 6.0
 quote_interval_ms: 1000
 warmup_secs: 3
