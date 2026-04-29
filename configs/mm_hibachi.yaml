@@ -6,8 +6,8 @@ hibachi:
   max_fees_percent: 0.001
 
 perp:
-  binance: [BTC_USDT, ETH_USDT, SOL_USDT, HYPE_USDT, BNB_USDT, SUI_USDT, XRP_USDT]
-  hibachi: [BTC_USDT, ETH_USDT, SOL_USDT, HYPE_USDT, BNB_USDT, SUI_USDT, XRP_USDT]
+  binance: [BTC_USDT]
+  hibachi: [BTC_USDT]
 
 
 fair_price:
