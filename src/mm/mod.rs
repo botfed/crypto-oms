@@ -773,8 +773,10 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
                     q.size = h.size - h.filled_size;
                 }
                 Some(h) if h.state == OrderState::Cancelling => {
-                    // Give cancels a timeout — don't hold the slot forever
-                    if q.placed_at.elapsed() > CANCEL_TIMEOUT {
+                    let cancel_age = h.last_modified
+                        .map(|t| t.elapsed())
+                        .unwrap_or(Duration::ZERO);
+                    if cancel_age > CANCEL_TIMEOUT {
                         warn!("[{}] bid cid={} stuck in Cancelling for >{}s, force-clearing",
                             self.config.symbol, q.client_id.0, CANCEL_TIMEOUT.as_secs());
                         self.bid_quote = None;
@@ -805,7 +807,10 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
                     q.size = h.size - h.filled_size;
                 }
                 Some(h) if h.state == OrderState::Cancelling => {
-                    if q.placed_at.elapsed() > CANCEL_TIMEOUT {
+                    let cancel_age = h.last_modified
+                        .map(|t| t.elapsed())
+                        .unwrap_or(Duration::ZERO);
+                    if cancel_age > CANCEL_TIMEOUT {
                         warn!("[{}] ask cid={} stuck in Cancelling for >{}s, force-clearing",
                             self.config.symbol, q.client_id.0, CANCEL_TIMEOUT.as_secs());
                         self.ask_quote = None;
