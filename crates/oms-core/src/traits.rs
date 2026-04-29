@@ -122,9 +122,6 @@ pub trait ExchangeOms: Send + Sync {
     /// Current balances.
     fn balances(&self) -> Vec<Balance>;
 
-    /// Get the event receiver for OMS events (single consumer).
-    fn event_receiver(&self) -> crossbeam_channel::Receiver<OmsEvent>;
-
     /// Round a price to the exchange's tick/precision rules.
     fn round_price(&self, price: f64) -> f64;
 }

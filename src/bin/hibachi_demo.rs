@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
         max_fees_percent: 0.001,
     };
 
-    let oms = HibachiOms::new(config)?;
+    let (oms, oms_rx) = HibachiOms::new(config)?;
     oms.start();
 
     info!("waiting for OMS to be ready...");
@@ -74,7 +74,7 @@ async fn main() -> Result<()> {
     }
 
     // Drain events until shutdown
-    let rx = oms.event_receiver();
+    let rx = oms_rx;
     loop {
         tokio::select! {
             _ = shutdown.notified() => break,

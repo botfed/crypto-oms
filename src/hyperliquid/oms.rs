@@ -140,14 +140,13 @@ pub struct HyperliquidOms {
     ready_notify: Arc<Notify>,
     next_client_id: AtomicU64,
     event_tx: crossbeam_channel::Sender<OmsEvent>,
-    event_rx: crossbeam_channel::Receiver<OmsEvent>,
     config: HyperliquidOmsConfig,
     shutdown: Arc<Notify>,
     pub diag: Arc<OmsDiagnostics>,
 }
 
 impl HyperliquidOms {
-    pub fn new(config: HyperliquidOmsConfig) -> Result<Arc<Self>> {
+    pub fn new(config: HyperliquidOmsConfig) -> Result<(Arc<Self>, crossbeam_channel::Receiver<OmsEvent>)> {
         let client = HyperliquidClient::new(
             &config.private_key,
             config.account_address.clone(),
@@ -164,13 +163,12 @@ impl HyperliquidOms {
             ready_notify: Arc::new(Notify::new()),
             next_client_id: AtomicU64::new(1),
             event_tx,
-            event_rx,
             config,
             shutdown: Arc::new(Notify::new()),
             diag: Arc::new(OmsDiagnostics::new()),
         });
 
-        Ok(oms)
+        Ok((oms, event_rx))
     }
 
     pub fn client(&self) -> &HyperliquidClient {
@@ -1450,9 +1448,6 @@ impl ExchangeOms for HyperliquidOms {
             .collect()
     }
 
-    fn event_receiver(&self) -> crossbeam_channel::Receiver<OmsEvent> {
-        self.event_rx.clone()
-    }
 
     fn round_price(&self, price: f64) -> f64 {
         round_price_for_hl(price)

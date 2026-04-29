@@ -117,9 +117,9 @@ async fn async_main(
             let account_address = std::env::var("HL_ACCOUNT_ADDRESS")
                 .context("HL_ACCOUNT_ADDRESS env var not set")?;
             let oms_config = config.to_hl_oms_config(private_key, account_address);
-            let oms = HyperliquidOms::new(oms_config)?;
+            let (oms, oms_events) = HyperliquidOms::new(oms_config)?;
             oms.start();
-            run_mm(oms, crypto_oms::mm::fair_price::ExchangeId::Hyperliquid, config, ghost, spin_core, display_bus, display_rx).await
+            run_mm(oms, oms_events, crypto_oms::mm::fair_price::ExchangeId::Hyperliquid, config, ghost, spin_core, display_bus, display_rx).await
         }
         "hibachi" => {
             let api_key = std::env::var("HIBACHI_API_KEY")
@@ -130,9 +130,9 @@ async fn async_main(
                 .context("HIBACHI_ACCOUNT_ID env var not set")?
                 .parse().context("HIBACHI_ACCOUNT_ID must be a number")?;
             let oms_config = config.to_hibachi_oms_config(api_key, private_key, account_id);
-            let oms = HibachiOms::new(oms_config)?;
+            let (oms, oms_events) = HibachiOms::new(oms_config)?;
             oms.start();
-            run_mm(oms, crypto_oms::mm::fair_price::ExchangeId::Hibachi, config, ghost, spin_core, display_bus, display_rx).await
+            run_mm(oms, oms_events, crypto_oms::mm::fair_price::ExchangeId::Hibachi, config, ghost, spin_core, display_bus, display_rx).await
         }
         other => anyhow::bail!("unsupported exchange: {other}"),
     }
@@ -140,6 +140,7 @@ async fn async_main(
 
 async fn run_mm<O: ExchangeOms + 'static>(
     oms: Arc<O>,
+    oms_events: crossbeam_channel::Receiver<OmsEvent>,
     target_exchange: crypto_oms::mm::fair_price::ExchangeId,
     config: MmConfig,
     ghost: bool,
@@ -324,7 +325,6 @@ async fn run_mm<O: ExchangeOms + 'static>(
     oms_state.apply_event(&OmsEvent::Ready);
     info!("OMS ready, entering main loop (dedicated thread)");
 
-    let oms_events = oms.event_receiver();
 
     tokio::task::spawn_blocking(move || {
         spin_loop(

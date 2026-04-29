@@ -119,7 +119,6 @@ pub struct NadoOms {
     ready_notify: Arc<Notify>,
     next_client_id: AtomicU64,
     event_tx: crossbeam_channel::Sender<OmsEvent>,
-    event_rx: crossbeam_channel::Receiver<OmsEvent>,
     config: NadoOmsConfig,
     shutdown: Arc<Notify>,
     pub diag: Arc<NadoDiagnostics>,
@@ -130,7 +129,7 @@ pub struct NadoOms {
 }
 
 impl NadoOms {
-    pub fn new(config: NadoOmsConfig) -> Result<Arc<Self>> {
+    pub fn new(config: NadoOmsConfig) -> Result<(Arc<Self>, crossbeam_channel::Receiver<OmsEvent>)> {
         let client = NadoClient::new(
             &config.private_key,
             config.account_address.clone(),
@@ -151,7 +150,6 @@ impl NadoOms {
             ready_notify: Arc::new(Notify::new()),
             next_client_id: AtomicU64::new(1),
             event_tx,
-            event_rx,
             config,
             shutdown: Arc::new(Notify::new()),
             diag: Arc::new(NadoDiagnostics::new()),
@@ -160,7 +158,7 @@ impl NadoOms {
             account_address,
         });
 
-        Ok(oms)
+        Ok((oms, event_rx))
     }
 
     pub fn sender(&self) -> &str {
@@ -1177,9 +1175,6 @@ impl ExchangeOms for NadoOms {
             .collect()
     }
 
-    fn event_receiver(&self) -> crossbeam_channel::Receiver<OmsEvent> {
-        self.event_rx.clone()
-    }
 
     fn round_price(&self, price: f64) -> f64 {
         price

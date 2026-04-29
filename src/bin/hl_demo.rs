@@ -488,7 +488,7 @@ async fn main() -> Result<()> {
         inflight_timeout: Duration::from_millis(config.hyperliquid.inflight_timeout_ms),
         stray_order_age: Duration::from_secs(5),
     };
-    let oms = HyperliquidOms::new(oms_config)?;
+    let (oms, _oms_rx) = HyperliquidOms::new(oms_config)?;
     oms.start();
 
     // Run display

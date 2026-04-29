@@ -532,7 +532,7 @@ async fn main() -> Result<()> {
         poll_interval: Duration::from_millis(config.nado.poll_interval_ms),
         inflight_timeout: Duration::from_millis(config.nado.inflight_timeout_ms),
     };
-    let oms = NadoOms::new(oms_config)?;
+    let (oms, _oms_rx) = NadoOms::new(oms_config)?;
     let diag = Arc::clone(&oms.diag);
     let ctx = DisplayCtx {
         sender: oms.sender().to_string(),

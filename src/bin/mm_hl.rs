@@ -144,7 +144,7 @@ async fn async_main(
 
     // Start HL OMS
     let oms_config = config.to_hl_oms_config(private_key, account_address);
-    let oms = HyperliquidOms::new(oms_config)?;
+    let (oms, oms_events) = HyperliquidOms::new(oms_config)?;
     oms.start();
 
     anyhow::ensure!(!config.symbols.is_empty(), "config must have at least one symbol in 'symbols'");
@@ -296,7 +296,6 @@ async fn async_main(
     info!("OMS ready, entering main loop (dedicated thread)");
 
     // Get OMS event receiver
-    let oms_events = oms.event_receiver();
 
     // Start display task (feature = "display")
     // Start display task if active

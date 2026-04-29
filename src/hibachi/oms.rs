@@ -144,7 +144,6 @@ pub struct HibachiOms {
     next_client_id: AtomicU64,
     next_ws_id: AtomicU64,
     event_tx: crossbeam_channel::Sender<OmsEvent>,
-    event_rx: crossbeam_channel::Receiver<OmsEvent>,
     trade_ws_tx: tokio::sync::mpsc::UnboundedSender<TradeWsCommand>,
     trade_ws_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<TradeWsCommand>>>,
     trade_ws_connected: Arc<AtomicBool>,
@@ -154,7 +153,7 @@ pub struct HibachiOms {
 }
 
 impl HibachiOms {
-    pub fn new(config: HibachiOmsConfig) -> Result<Arc<Self>> {
+    pub fn new(config: HibachiOmsConfig) -> Result<(Arc<Self>, crossbeam_channel::Receiver<OmsEvent>)> {
         let client = HibachiClient::new(
             config.api_key.clone(),
             config.account_id,
@@ -175,7 +174,6 @@ impl HibachiOms {
             next_client_id: AtomicU64::new(1),
             next_ws_id: AtomicU64::new(1),
             event_tx,
-            event_rx,
             trade_ws_tx,
             trade_ws_rx: Mutex::new(Some(trade_ws_rx)),
             trade_ws_connected: Arc::new(AtomicBool::new(false)),
@@ -184,7 +182,7 @@ impl HibachiOms {
             diag: Arc::new(OmsDiagnostics::new()),
         });
 
-        Ok(oms)
+        Ok((oms, event_rx))
     }
 
     pub fn client(&self) -> &HibachiClient {
@@ -1404,9 +1402,6 @@ impl ExchangeOms for HibachiOms {
         self.state.balances.iter().map(|e| e.value().clone()).collect()
     }
 
-    fn event_receiver(&self) -> crossbeam_channel::Receiver<OmsEvent> {
-        self.event_rx.clone()
-    }
 
     fn round_price(&self, price: f64) -> f64 {
         // Use smallest tick size across all contracts as conservative default.
