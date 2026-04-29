@@ -294,16 +294,18 @@ fn render_frame(
     let has_any_quote = statuses.values().any(|st| st.bid_quote.is_some() || st.ask_quote.is_some());
     if has_any_quote {
         let _ = writeln!(buf);
-        let _ = writeln!(buf, "  {CYAN}{:<16} {:>5} {:>6} {:>12} {:>10} {:>12} {:>8}{RESET}",
-            "Symbol", "Side", "CID", "Price", "Size", "State", "Age");
+        let _ = writeln!(buf, "  {CYAN}{:<16} {:>5} {:>6} {:>12} {:>8} {:>10} {:>12} {:>8}{RESET}",
+            "Symbol", "Side", "CID", "Price", "Fair", "Size", "State", "Age");
         for st in statuses.values() {
             if let Some(ref q) = st.bid_quote {
-                let _ = writeln!(buf, "  {:<16} {GREEN}{:>5}{RESET} {:>6} {:>12} {:>10} {:>12} {:>7}s",
-                    st.symbol, "BID", q.cid, fmt_price(q.price), fmt_qty_compact(q.size), q.state, q.age_ms / 1000);
+                let dist_bps = if st.fair > 0.0 { (q.price - st.fair) / st.fair * 10_000.0 } else { 0.0 };
+                let _ = writeln!(buf, "  {:<16} {GREEN}{:>5}{RESET} {:>6} {:>12} {:>+7.1}bp {:>10} {:>12} {:>7}s",
+                    st.symbol, "BID", q.cid, fmt_price(q.price), dist_bps, fmt_qty_compact(q.size), q.state, q.age_ms / 1000);
             }
             if let Some(ref q) = st.ask_quote {
-                let _ = writeln!(buf, "  {:<16} {RED}{:>5}{RESET} {:>6} {:>12} {:>10} {:>12} {:>7}s",
-                    st.symbol, "ASK", q.cid, fmt_price(q.price), fmt_qty_compact(q.size), q.state, q.age_ms / 1000);
+                let dist_bps = if st.fair > 0.0 { (q.price - st.fair) / st.fair * 10_000.0 } else { 0.0 };
+                let _ = writeln!(buf, "  {:<16} {RED}{:>5}{RESET} {:>6} {:>12} {:>+7.1}bp {:>10} {:>12} {:>7}s",
+                    st.symbol, "ASK", q.cid, fmt_price(q.price), dist_bps, fmt_qty_compact(q.size), q.state, q.age_ms / 1000);
             }
         }
     }
