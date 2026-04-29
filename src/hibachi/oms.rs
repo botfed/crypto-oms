@@ -1683,6 +1683,7 @@ impl ExchangeOms for HibachiOms {
 
         if let Some(resp) = self.send_trade_ws("order.cancel", ws_params, &signature_rest).await {
             if resp.status == 200 {
+                info!("WS cancel confirmed for cid={}, emitting OrderCancelled", id.0);
                 if let Some(mut h) = self.state.orders.get_mut(&id.0) {
                     h.state = OrderState::Cancelled;
                     h.last_modified = Some(Instant::now());
