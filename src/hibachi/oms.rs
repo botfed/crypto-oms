@@ -1170,7 +1170,7 @@ impl ExchangeOms for HibachiOms {
         let native_symbol = canonical_to_hibachi(&req.symbol);
         let mut body = serde_json::json!({
             "accountId": self.client.account_id,
-            "nonce": nonce.to_string(),
+            "nonce": nonce,
             "symbol": native_symbol,
             "quantity": format!("{rounded_size}"),
             "side": side_str,
@@ -1326,7 +1326,7 @@ impl ExchangeOms for HibachiOms {
 
         let body = serde_json::json!({
             "accountId": self.client.account_id,
-            "nonce": nonce.to_string(),
+            "nonce": nonce,
             "orderId": exchange_id,
             "maxFeesPercent": format!("{}", self.config.max_fees_percent),
             "updatedQuantity": format!("{rounded_size}"),
@@ -1474,7 +1474,7 @@ impl ExchangeOms for HibachiOms {
 
         let mut body = serde_json::json!({
             "accountId": self.client.account_id,
-            "nonce": prepared.nonce.to_string(),
+            "nonce": prepared.nonce,
             "symbol": native_symbol,
             "quantity": format!("{rounded_size}"),
             "side": side_str,
@@ -1658,7 +1658,7 @@ impl ExchangeOms for HibachiOms {
         let ws_params = serde_json::json!({
             "orderId": exchange_id,
             "accountId": self.client.account_id,
-            "nonce": nonce.to_string(),
+            "nonce": nonce,
         });
 
         if let Some(resp) = self.send_trade_ws("order.cancel", ws_params, &signature).await {
