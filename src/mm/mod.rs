@@ -1067,7 +1067,11 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
             };
             match self.oms.prepare_place_order(&req) {
                 Ok((cid, sdk_req)) => {
-                    debug!("placing bid cid={} price={:.6}", cid.0, desired_bid);
+                    let bid_from_fair_bps = (desired_bid - fair) / fair * 10_000.0;
+                    info!("[{}] place BID cid={} | {:.1}bps from fair (spread={:.1}bps edge={:.1}bps skew={:+.1}bps vmul={:.2})",
+                        self.config.symbol, cid.0, bid_from_fair_bps,
+                        self.config.ref_half_spread_bps.unwrap() * self.cached_vol_mult,
+                        self.config.min_edge_bps.unwrap(), self.cached_skew_bps, self.cached_vol_mult);
                     oms_state.insert_inflight(OrderHandle {
                         client_id: cid,
                         exchange_id: None,
@@ -1124,7 +1128,11 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
             };
             match self.oms.prepare_place_order(&req) {
                 Ok((cid, sdk_req)) => {
-                    debug!("placing ask cid={} price={:.6}", cid.0, desired_ask);
+                    let ask_from_fair_bps = (desired_ask - fair) / fair * 10_000.0;
+                    info!("[{}] place ASK cid={} | {:.1}bps from fair (spread={:.1}bps edge={:.1}bps skew={:+.1}bps vmul={:.2})",
+                        self.config.symbol, cid.0, ask_from_fair_bps,
+                        self.config.ref_half_spread_bps.unwrap() * self.cached_vol_mult,
+                        self.config.min_edge_bps.unwrap(), self.cached_skew_bps, self.cached_vol_mult);
                     oms_state.insert_inflight(OrderHandle {
                         client_id: cid,
                         exchange_id: None,
