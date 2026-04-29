@@ -41,14 +41,14 @@ fair_price:
     #   target_symbol: PERP_BNB_USDT
     #   reference_exchange: binance
     #   reference_symbol: PERP_BNB_USDT
-    # - target_exchange: hibachi
-    #   target_symbol: PERP_SUI_USDT
-    #   reference_exchange: binance
-    #   reference_symbol: PERP_SUI_USDT
-    # - target_exchange: hibachi
-    #   target_symbol: PERP_XRP_USDT
-    #   reference_exchange: binance
-    #   reference_symbol: PERP_XRP_USDT
+    - target_exchange: hibachi
+      target_symbol: PERP_SUI_USDT
+      reference_exchange: binance
+      reference_symbol: PERP_SUI_USDT
+    - target_exchange: hibachi
+      target_symbol: PERP_XRP_USDT
+      reference_exchange: binance
+      reference_symbol: PERP_XRP_USDT
 
 inventory:
   mode: static
@@ -100,13 +100,13 @@ symbols:
   #   vol_mult_floor: 0.3
   #   vol_mult_cap: 2.0
   #   vol_symbol: "BNB"
-  # - symbol: PERP_SUI_USDT
-  #   ref_vol: 0.80
-  #   vol_mult_floor: 0.3
-  #   vol_mult_cap: 2.0
-  #   vol_symbol: "SUI"
-  # - symbol: PERP_XRP_USDT
-  #   ref_vol: 0.50
-  #   vol_mult_floor: 0.3
-  #   vol_mult_cap: 2.0
-  #   vol_symbol: "XRP"
+  - symbol: PERP_SUI_USDT
+    ref_vol: 0.80
+    vol_mult_floor: 0.3
+    vol_mult_cap: 2.0
+    vol_symbol: "SUI"
+  - symbol: PERP_XRP_USDT
+    ref_vol: 0.50
+    vol_mult_floor: 0.3
+    vol_mult_cap: 2.0
+    vol_symbol: "XRP"
