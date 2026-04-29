@@ -399,6 +399,11 @@ impl HibachiOms {
                             handle.last_modified = Some(Instant::now());
                         }
                         OrderState::Cancelling => {
+                            let age_ms = handle.last_modified
+                                .map(|t| t.elapsed().as_millis())
+                                .unwrap_or(0);
+                            warn!("order cid={} still on exchange in Cancelling state (age={}ms) — cancel may have failed",
+                                cid, age_ms);
                             if age_exceeded {
                                 warn!("cancel failed for cid={}, restoring to {:?}", cid, active_state);
                                 handle.state = active_state;
