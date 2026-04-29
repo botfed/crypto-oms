@@ -72,7 +72,7 @@ pub struct HibachiPosition {
 pub struct HibachiOrder {
     #[serde(rename = "orderId")]
     pub order_id: String,
-    #[serde(rename = "accountId")]
+    #[serde(rename = "accountId", deserialize_with = "de_string_or_u64")]
     pub account_id: u64,
     pub symbol: String,
     #[serde(rename = "orderType")]
@@ -80,19 +80,52 @@ pub struct HibachiOrder {
     pub side: String,
     pub status: String,
     pub price: Option<String>,
-    /// Remaining (available) quantity
     #[serde(rename = "availableQuantity")]
     pub available_quantity: Option<String>,
     #[serde(rename = "totalQuantity")]
     pub total_quantity: Option<String>,
     #[serde(rename = "triggerPrice")]
     pub trigger_price: Option<String>,
-    #[serde(rename = "creationTime")]
+    #[serde(rename = "creationTime", default, deserialize_with = "de_opt_string_or_u64")]
     pub creation_time: Option<u64>,
-    #[serde(rename = "finishTime")]
+    #[serde(rename = "finishTime", default, deserialize_with = "de_opt_string_or_u64")]
     pub finish_time: Option<u64>,
     #[serde(rename = "orderFlags")]
     pub order_flags: Option<String>,
+}
+
+fn de_string_or_u64<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    use serde::de;
+    struct Visitor;
+    impl<'de> de::Visitor<'de> for Visitor {
+        type Value = u64;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("u64 or string-encoded u64")
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<u64, E> { Ok(v) }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<u64, E> {
+            v.parse().map_err(de::Error::custom)
+        }
+    }
+    deserializer.deserialize_any(Visitor)
+}
+
+fn de_opt_string_or_u64<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
+    use serde::de;
+    struct Visitor;
+    impl<'de> de::Visitor<'de> for Visitor {
+        type Value = Option<u64>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("null, u64, or string-encoded u64")
+        }
+        fn visit_none<E: de::Error>(self) -> Result<Option<u64>, E> { Ok(None) }
+        fn visit_unit<E: de::Error>(self) -> Result<Option<u64>, E> { Ok(None) }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Option<u64>, E> { Ok(Some(v)) }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Option<u64>, E> {
+            v.parse().map(Some).map_err(de::Error::custom)
+        }
+    }
+    deserializer.deserialize_any(Visitor)
 }
 
 /// Response to POST /trade/order
