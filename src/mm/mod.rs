@@ -1034,6 +1034,34 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
 
         // ── PLACE new quotes where needed ──
 
+        if self.bid_quote.is_none() && !want_bid {
+            info!("[{}] skip bid: position limit (pos={:.4} target={:.4} max_pos={:.4})",
+                self.config.symbol, position, target, max_pos);
+        }
+        if self.ask_quote.is_none() && !want_ask {
+            info!("[{}] skip ask: position limit (pos={:.4} target={:.4} max_pos={:.4})",
+                self.config.symbol, position, target, max_pos);
+        }
+
+        if self.bid_quote.is_some() && want_bid {
+            let q = self.bid_quote.as_ref().unwrap();
+            let state = oms_state.get_order(q.client_id).map(|h| h.state);
+            let age_ms = q.placed_at.elapsed().as_millis();
+            if age_ms > 5000 {
+                info!("[{}] bid stuck: cid={} price={:.6} state={:?} age={}ms",
+                    self.config.symbol, q.client_id.0, q.price, state, age_ms);
+            }
+        }
+        if self.ask_quote.is_some() && want_ask {
+            let q = self.ask_quote.as_ref().unwrap();
+            let state = oms_state.get_order(q.client_id).map(|h| h.state);
+            let age_ms = q.placed_at.elapsed().as_millis();
+            if age_ms > 5000 {
+                info!("[{}] ask stuck: cid={} price={:.6} state={:?} age={}ms",
+                    self.config.symbol, q.client_id.0, q.price, state, age_ms);
+            }
+        }
+
         if self.bid_quote.is_none() && want_bid && self.ghost {}
         if self.bid_quote.is_none() && want_bid && !self.ghost {
             let tif = if self.config.post_only.unwrap_or(true) {
@@ -1053,7 +1081,7 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
             };
             match self.oms.prepare_place_order(&req) {
                 Ok((cid, sdk_req)) => {
-                    debug!("placing bid cid={} price={:.6}", cid.0, desired_bid);
+                    info!("[{}] placing bid cid={} price={:.6} size={:.6}", self.config.symbol, cid.0, desired_bid, order_size);
                     oms_state.insert_inflight(OrderHandle {
                         client_id: cid,
                         exchange_id: None,
@@ -1110,7 +1138,7 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
             };
             match self.oms.prepare_place_order(&req) {
                 Ok((cid, sdk_req)) => {
-                    debug!("placing ask cid={} price={:.6}", cid.0, desired_ask);
+                    info!("[{}] placing ask cid={} price={:.6} size={:.6}", self.config.symbol, cid.0, desired_ask, order_size);
                     oms_state.insert_inflight(OrderHandle {
                         client_id: cid,
                         exchange_id: None,
