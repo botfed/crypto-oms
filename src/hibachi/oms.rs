@@ -1664,7 +1664,7 @@ impl ExchangeOms for HibachiOms {
     }
 
     async fn post_cancel(&self, id: &ClientOrderId, signed: Self::SignedPayload) {
-        let (body, exchange_id, nonce, signature_rest, signature_ws) = match signed {
+        let (body, exchange_id, nonce, _signature_rest, signature_ws) = match signed {
             HibachiSignedPayload::Cancel { body, exchange_id, nonce, signature_rest, signature_ws } =>
                 (body, exchange_id, nonce, signature_rest, signature_ws),
             _ => { warn!("post_cancel called with non-cancel payload"); return; }
