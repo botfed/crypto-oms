@@ -11,8 +11,6 @@ use tracing_subscriber::Layer;
 // Terminal escape sequences
 // ---------------------------------------------------------------------------
 
-const ALT_SCREEN_ON: &str = "\x1B[?1049h";
-const ALT_SCREEN_OFF: &str = "\x1B[?1049l";
 const CURSOR_HOME: &str = "\x1B[H";
 const CLEAR_BELOW: &str = "\x1B[J";
 const CURSOR_HIDE: &str = "\x1B[?25l";

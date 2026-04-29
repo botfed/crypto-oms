@@ -209,8 +209,15 @@ impl HibachiOms {
                 ).await {
                     Ok(Ok(info)) => { result = Some(info); break; }
                     Ok(Err(e)) => {
+                        let err_str = format!("{e}");
+                        let is_429 = err_str.contains("429");
                         warn!("hibachi OMS: get_exchange_info attempt {attempt}/3 failed: {e}");
                         last_err = Some(e);
+                        if is_429 && attempt < 3 {
+                            warn!("hibachi OMS: rate limited, waiting 30s before retry");
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                            continue;
+                        }
                     }
                     Err(_) => {
                         warn!("hibachi OMS: get_exchange_info attempt {attempt}/3 timed out (10s)");
@@ -218,7 +225,7 @@ impl HibachiOms {
                     }
                 }
                 if attempt < 3 {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
             result.ok_or_else(|| last_err.unwrap_or_else(|| anyhow::anyhow!("get_exchange_info failed")))?
@@ -260,8 +267,15 @@ impl HibachiOms {
                 ).await {
                     Ok(Ok(())) => { ok = true; break; }
                     Ok(Err(e)) => {
+                        let err_str = format!("{e}");
+                        let is_429 = err_str.contains("429");
                         warn!("hibachi OMS: snapshot attempt {attempt}/3 failed: {e}");
                         last_err = Some(e);
+                        if is_429 && attempt < 3 {
+                            warn!("hibachi OMS: rate limited, waiting 30s before retry");
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                            continue;
+                        }
                     }
                     Err(_) => {
                         warn!("hibachi OMS: snapshot attempt {attempt}/3 timed out (10s)");
@@ -269,7 +283,7 @@ impl HibachiOms {
                     }
                 }
                 if attempt < 3 {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
             if !ok {

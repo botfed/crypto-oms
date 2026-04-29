@@ -175,7 +175,16 @@ impl HibachiClient {
 
     pub async fn get_exchange_info(&self) -> Result<ExchangeInfoResponse> {
         let url = format!("{}/market/exchange-info", self.data_api_url);
-        let resp = self.http.get(&url).send().await?.error_for_status()?;
+        let resp = self.http.get(&url).send().await?;
+        if resp.status() == 429 {
+            let retry_after = resp.headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(60);
+            anyhow::bail!("429 Too Many Requests (retry-after: {retry_after}s)");
+        }
+        let resp = resp.error_for_status()?;
         Ok(resp.json().await?)
     }
 
