@@ -6,8 +6,8 @@ hibachi:
   max_fees_percent: 0.001
 
 perp:
-  binance: [BTC_USDT, ETH_USDT, SOL_USDT]
-  hibachi: [BTC_USDT, ETH_USDT, SOL_USDT]
+  binance: [BTC_USDT, ETH_USDT, SOL_USDT, SUI_USDT, XRP_USDT]
+  hibachi: [BTC_USDT, ETH_USDT, SOL_USDT, SUI_USDT, XRP_USDT]
 
 vol_models:
   params_dir: "../botfed-params/vol"
