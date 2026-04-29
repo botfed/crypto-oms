@@ -1670,11 +1670,10 @@ impl ExchangeOms for HibachiOms {
             _ => { warn!("post_cancel called with non-cancel payload"); return; }
         };
 
-        // Try WS first (cancel nonce must be string, signature includes nonce)
+        // Try WS first — cancel by orderId, no nonce (matches SDK behavior)
         let ws_params = serde_json::json!({
             "orderId": exchange_id,
             "accountId": self.client.account_id,
-            "nonce": nonce.to_string(),
         });
 
         if let Some(resp) = self.send_trade_ws("order.cancel", ws_params, &signature_rest).await {
