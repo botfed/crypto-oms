@@ -76,17 +76,17 @@ max_position_usd: 5000.0
 
 symbols:
   - symbol: PERP_BTC_USDT
-    ref_vol: 0.50
+    ref_vol: 0.40
     vol_mult_floor: 0.3
     vol_mult_cap: 2.0
     vol_symbol: "BTC"
   - symbol: PERP_ETH_USDT
-    ref_vol: 0.50
+    ref_vol: 0.40
     vol_mult_floor: 0.3
     vol_mult_cap: 2.0
     vol_symbol: "ETH"
   - symbol: PERP_SOL_USDT
-    ref_vol: 0.60
+    ref_vol: 0.40
     vol_mult_floor: 0.3
     vol_mult_cap: 2.0
     vol_symbol: "SOL"
@@ -101,12 +101,12 @@ symbols:
   #   vol_mult_cap: 2.0
   #   vol_symbol: "BNB"
   - symbol: PERP_SUI_USDT
-    ref_vol: 0.80
+    ref_vol: 0.40
     vol_mult_floor: 0.3
     vol_mult_cap: 2.0
     vol_symbol: "SUI"
   - symbol: PERP_XRP_USDT
-    ref_vol: 0.50
+    ref_vol: 0.40
     vol_mult_floor: 0.3
     vol_mult_cap: 2.0
     vol_symbol: "XRP"
