@@ -1,3 +1,5 @@
+exchange: hyperliquid
+
 hyperliquid:
   poll_interval_ms: 3000
   inflight_timeout_ms: 5000
@@ -6,18 +8,14 @@ perp:
   binance: [ETH_USDT, AIXBT_USDT, BRETT_USDT]
   hyperliquid: [AIXBT_USDC, BRETT_USDC]
 
-sample_interval_ms: 10
-
 fair_price:
   basis_halflife_secs: 600.0
   basis_tick_ms: 100
   pairs:
-    # AIXBT pairs
     - target_exchange: hyperliquid
       target_symbol: PERP_AIXBT_USDC
       reference_exchange: binance
       reference_symbol: PERP_AIXBT_USDT
-    # BRETT pairs
     - target_exchange: hyperliquid
       target_symbol: PERP_BRETT_USDC
       reference_exchange: binance
@@ -28,56 +26,44 @@ inventory:
   static_target:
     target: 0.0
 
+order_notional_usd: 15.0
+max_position_usd: 100.0
+stale_cancel_ms: 2000
+quote_interval_ms: 150
+post_only: false
+warmup_secs: 10
+max_feed_age_ms: 10000
+stray_order_age_ms: 6000
+ref_half_spread_bps: 20
+ref_min_spread_bps: 10
+ref_requote_tolerance_bps: 3.0
+max_skew_bps: 10.0
+min_edge_bps: 5
+
 vol_models:
   params_dir: "../botfed-params/vol"
   bar_data_dir: "../data/binance_ohlcv/perps/1m"
   model: "har_qlike"
   warmup_days: 2
 
-# Multi-symbol config
 symbols:
   - symbol: PERP_AIXBT_USDC
-    max_stale_ms: 2000
-    order_notional_usd: 15.0
-    max_position_usd: 100.0
-    ref_half_spread_bps: 20
-    ref_min_spread_bps: 10
-    ref_requote_tolerance_bps: 3.0
-    max_skew_bps: 10.0
-    min_edge_bps: 5
     ref_vol: 1.00
     vol_mult_floor: 0.3
     vol_mult_cap: 5.0
     vol_symbol: "AIXBT"
-    quote_interval_ms: 150
-    post_only: false
-    warmup_secs: 10
     max_feed_age_ms: 5000
-    stray_order_age_ms: 6000
     factor_model:
       enabled: true
       factors:
         - symbol: PERP_ETH_USDT
           exchanges: [binance]
           beta: 0.97
-
   - symbol: PERP_BRETT_USDC
-    max_stale_ms: 2000
-    order_notional_usd: 15.0
-    max_position_usd: 100.0
-    ref_half_spread_bps: 20
-    ref_min_spread_bps: 10
-    ref_requote_tolerance_bps: 3.0
-    max_skew_bps: 10.0
-    min_edge_bps: 5
     ref_vol: 1.20
     vol_mult_floor: 0.3
     vol_mult_cap: 5.0
     vol_symbol: "BRETT"
-    quote_interval_ms: 150
-    post_only: false
-    warmup_secs: 10
-    max_feed_age_ms: 10000
     stray_order_age_ms: 5000
     factor_model:
       enabled: true

@@ -270,7 +270,7 @@ pub struct StrategyConfig {
     #[serde(default)]
     pub max_feed_age_ms: Option<u64>,
     /// Cancel all quotes if ref feed age exceeds this (ms) — trading staleness
-    #[serde(default, alias = "max_stale_ms")]
+    #[serde(default)]
     pub stale_cancel_ms: Option<u64>,
     /// Minimum age (ms) before an unrecognized order is treated as stray and cancelled
     #[serde(default)]
