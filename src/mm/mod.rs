@@ -861,13 +861,13 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
                 Some(OrderState::Accepted) | Some(OrderState::PartiallyFilled)
             );
             if can_cancel && q.price > self.oms.round_price(max_bid) + 1e-12 {
-                let cancel_msg = format!(
-                    "[{}] fast cancel BID cid={} price={:.6} > max_bid={:.6} | fair={:.6} skew={:+.2}bps mid={:.6} min_spread={:.6} min_edge={:.6} bound=[mid-spread={:.6}, fair-edge={:.6}]",
-                    self.config.symbol, q.client_id.0, q.price, max_bid,
-                    fair, self.cached_skew_bps, mid, min_spread, min_edge,
-                    mid - min_spread, fair - min_edge,
+                let bid_from_fair_bps = (q.price - fair) / fair * 10_000.0;
+                let min_spread_bps = self.config.ref_min_spread_bps.unwrap() * self.cached_vol_mult;
+                let edge_bps = self.config.min_edge_bps.unwrap();
+                warn!(
+                    "[{}] fast cancel BID cid={} | bid {:.1}bps from fair (min_spread={:.1}bps edge={:.1}bps skew={:+.1}bps)",
+                    self.config.symbol, q.client_id.0, bid_from_fair_bps, min_spread_bps, edge_bps, self.cached_skew_bps,
                 );
-                warn!("{}", cancel_msg);
                 #[cfg(feature = "profiling")]
                 let sign_start = Instant::now();
                 let signed = if let Some(s) = self.presigned_cancels.remove(&q.client_id) {
@@ -907,13 +907,13 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
                 Some(OrderState::Accepted) | Some(OrderState::PartiallyFilled)
             );
             if can_cancel && q.price < self.oms.round_price(min_ask) - 1e-12 {
-                let cancel_msg = format!(
-                    "[{}] fast cancel ASK cid={} price={:.6} < min_ask={:.6} | fair={:.6} skew={:+.2}bps mid={:.6} min_spread={:.6} min_edge={:.6} bound=[mid+spread={:.6}, fair+edge={:.6}]",
-                    self.config.symbol, q.client_id.0, q.price, min_ask,
-                    fair, self.cached_skew_bps, mid, min_spread, min_edge,
-                    mid + min_spread, fair + min_edge,
+                let ask_from_fair_bps = (q.price - fair) / fair * 10_000.0;
+                let min_spread_bps = self.config.ref_min_spread_bps.unwrap() * self.cached_vol_mult;
+                let edge_bps = self.config.min_edge_bps.unwrap();
+                warn!(
+                    "[{}] fast cancel ASK cid={} | ask {:.1}bps from fair (min_spread={:.1}bps edge={:.1}bps skew={:+.1}bps)",
+                    self.config.symbol, q.client_id.0, ask_from_fair_bps, min_spread_bps, edge_bps, self.cached_skew_bps,
                 );
-                warn!("{}", cancel_msg);
                 #[cfg(feature = "profiling")]
                 let sign_start = Instant::now();
                 let signed = if let Some(s) = self.presigned_cancels.remove(&q.client_id) {
@@ -1067,7 +1067,7 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
             };
             match self.oms.prepare_place_order(&req) {
                 Ok((cid, sdk_req)) => {
-                    info!("[{}] placing bid cid={} price={:.6} size={:.6}", self.config.symbol, cid.0, desired_bid, order_size);
+                    debug!("placing bid cid={} price={:.6}", cid.0, desired_bid);
                     oms_state.insert_inflight(OrderHandle {
                         client_id: cid,
                         exchange_id: None,
@@ -1124,7 +1124,7 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
             };
             match self.oms.prepare_place_order(&req) {
                 Ok((cid, sdk_req)) => {
-                    info!("[{}] placing ask cid={} price={:.6} size={:.6}", self.config.symbol, cid.0, desired_ask, order_size);
+                    debug!("placing ask cid={} price={:.6}", cid.0, desired_ask);
                     oms_state.insert_inflight(OrderHandle {
                         client_id: cid,
                         exchange_id: None,
