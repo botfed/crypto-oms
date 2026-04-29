@@ -100,11 +100,15 @@ symbols:
   #   vol_mult_floor: 0.3
   #   vol_mult_cap: 2.0
   #   vol_symbol: "BNB"
-  # - symbol: PERP_SUI_USDT
-  #   ref_vol: 0.40
-  #   vol_mult_floor: 0.3
-  #   vol_mult_cap: 2.0
-  #   vol_symbol: "SUI"
+  - symbol: PERP_SUI_USDT
+    ref_vol: 0.40
+    vol_mult_floor: 1.0
+    vol_mult_cap: 1.0
+    vol_symbol: "SUI"
+    ref_half_spread_bps: 100
+    ref_min_spread_bps: 50
+    ref_requote_tolerance_bps: 50
+    min_edge_bps: -0.1
   # - symbol: PERP_XRP_USDT
   #   ref_vol: 0.40
   #   vol_mult_floor: 0.3
