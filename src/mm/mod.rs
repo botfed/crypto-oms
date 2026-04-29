@@ -755,6 +755,8 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
     // -----------------------------------------------------------------------
 
     fn sync_quote_state(&mut self, oms_state: &OmsStateTracker) {
+        const CANCEL_TIMEOUT: Duration = Duration::from_secs(10);
+
         if let Some(ref mut q) = self.bid_quote {
             match oms_state.get_order(q.client_id) {
                 Some(h)
@@ -763,14 +765,20 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
                         OrderState::Accepted
                             | OrderState::PartiallyFilled
                             | OrderState::Inflight
-                            | OrderState::Cancelling
                     ) =>
                 {
                     if q.exchange_id.is_none() && h.exchange_id.is_some() {
                         q.exchange_id = h.exchange_id.clone();
                     }
-                    // Sync remaining size on partial fills
                     q.size = h.size - h.filled_size;
+                }
+                Some(h) if h.state == OrderState::Cancelling => {
+                    // Give cancels a timeout — don't hold the slot forever
+                    if q.placed_at.elapsed() > CANCEL_TIMEOUT {
+                        warn!("[{}] bid cid={} stuck in Cancelling for >{}s, force-clearing",
+                            self.config.symbol, q.client_id.0, CANCEL_TIMEOUT.as_secs());
+                        self.bid_quote = None;
+                    }
                 }
                 _ => {
                     debug!(
@@ -789,13 +797,19 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
                         OrderState::Accepted
                             | OrderState::PartiallyFilled
                             | OrderState::Inflight
-                            | OrderState::Cancelling
                     ) =>
                 {
                     if q.exchange_id.is_none() && h.exchange_id.is_some() {
                         q.exchange_id = h.exchange_id.clone();
                     }
                     q.size = h.size - h.filled_size;
+                }
+                Some(h) if h.state == OrderState::Cancelling => {
+                    if q.placed_at.elapsed() > CANCEL_TIMEOUT {
+                        warn!("[{}] ask cid={} stuck in Cancelling for >{}s, force-clearing",
+                            self.config.symbol, q.client_id.0, CANCEL_TIMEOUT.as_secs());
+                        self.ask_quote = None;
+                    }
                 }
                 _ => {
                     debug!(
