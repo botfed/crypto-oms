@@ -184,6 +184,7 @@ pub async fn run_display(
     let start = Instant::now();
     let mut statuses: BTreeMap<String, SymbolStatus> = BTreeMap::new();
     let mut logs: VecDeque<String> = VecDeque::new();
+    let mut resid_tracker: BTreeMap<String, (f64, f64, Instant)> = BTreeMap::new(); // (min, max, reset_at)
 
     let shutdown_fut = shutdown.notified();
     tokio::pin!(shutdown_fut);
@@ -198,6 +199,15 @@ pub async fn run_display(
                 while let Ok(msg) = rx.try_recv() {
                     match msg {
                         DisplayMsg::Status(s) => {
+                            let r = s.residual_bps;
+                            let entry = resid_tracker.entry(s.symbol.clone())
+                                .or_insert((r, r, Instant::now()));
+                            if entry.2.elapsed() >= Duration::from_secs(60) {
+                                *entry = (r, r, Instant::now());
+                            } else {
+                                entry.0 = entry.0.min(r);
+                                entry.1 = entry.1.max(r);
+                            }
                             statuses.insert(s.symbol.clone(), s);
                         }
                         DisplayMsg::Log(line) => {
@@ -209,7 +219,7 @@ pub async fn run_display(
                     }
                 }
 
-                let frame = render_frame(&statuses, &logs, start);
+                let frame = render_frame(&statuses, &resid_tracker, &logs, start);
                 let _ = flush(frame);
             }
         }
@@ -224,14 +234,15 @@ pub async fn run_display(
 
 fn header() -> String {
     format!(
-        "  {:<16} {:>12} {:>12} {:>7} {:>7} {:>7} {:>7} {:>7} {:>5} {:>14} {:>8} {:>12} {:>12} {:>10} {:>10} {:>4} {:>8}",
-        "Symbol", "Fair", "HlMid", "Resid", "Basis", "Factor", "Skew", "Vol%", "VMul",
+        "  {:<16} {:>12} {:>12} {:>7} {:>12} {:>7} {:>7} {:>7} {:>7} {:>5} {:>14} {:>8} {:>12} {:>12} {:>10} {:>10} {:>4} {:>8}",
+        "Symbol", "Fair", "HlMid", "Resid", "R[min,max]", "Basis", "Factor", "Skew", "Vol%", "VMul",
         "Band", "MinEdge", "Bid", "Ask", "Pos", "Target", "Want", "FeedAge",
     )
 }
 
 fn render_frame(
     statuses: &BTreeMap<String, SymbolStatus>,
+    resid_tracker: &BTreeMap<String, (f64, f64, Instant)>,
     logs: &VecDeque<String>,
     start: Instant,
 ) -> String {
@@ -274,13 +285,19 @@ fn render_frame(
             "      -".into()
         };
 
+        let (rmin, rmax) = resid_tracker.get(&st.symbol)
+            .map(|(mn, mx, _)| (*mn, *mx))
+            .unwrap_or((0.0, 0.0));
+        let resid_range = format!("[{:+.1},{:+.1}]", rmin, rmax);
+
         let _ = writeln!(
             buf,
-            "  {:<16} {:>12} {:>12} {:>+7.1} {:>+7.1} {:>+7.1} {:>+7.1} {:>7.1} {:>5.2} {:>14} {:>+8.1} {:>12} {:>12} {:>10} {:>10} {} {:>8}",
+            "  {:<16} {:>12} {:>12} {:>+7.1} {:>12} {:>+7.1} {:>+7.1} {:>+7.1} {:>7.1} {:>5.2} {:>14} {:>+8.1} {:>12} {:>12} {:>10} {:>10} {} {:>8}",
             st.symbol,
             fmt_price(st.fair),
             fmt_price(st.hl_mid),
             st.residual_bps,
+            resid_range,
             st.basis_bps,
             st.factor_bps,
             st.skew_bps,
