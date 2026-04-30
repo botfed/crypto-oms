@@ -284,7 +284,33 @@ pub struct StrategyConfig {
     /// Optional multi-factor correlation model for fair price adjustment
     #[serde(default)]
     pub factor_model: Option<FactorModelConfig>,
+    /// Optional momentum taker after fast cancel
+    #[serde(default)]
+    pub taker: Option<TakerConfig>,
 }
+
+// ---------------------------------------------------------------------------
+// Taker config
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TakerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Min fair price move (bps) to trigger taker
+    pub threshold_bps: f64,
+    /// IOC order size in USD
+    pub notional_usd: f64,
+    /// Fee cap for taker orders
+    #[serde(default = "default_taker_max_fees")]
+    pub max_fees_percent: f64,
+    /// Min time between taker fires (ms)
+    #[serde(default = "default_taker_cooldown")]
+    pub cooldown_ms: u64,
+}
+
+fn default_taker_max_fees() -> f64 { 0.001 }
+fn default_taker_cooldown() -> u64 { 1000 }
 
 // ---------------------------------------------------------------------------
 // Factor model config (cross-instrument correlation)

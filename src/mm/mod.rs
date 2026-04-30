@@ -13,7 +13,7 @@ use oms_core::*;
 use tracing::{debug, info, warn};
 
 use crate::ExchangeOms;
-use config::StrategyConfig;
+use config::{StrategyConfig, TakerConfig};
 use crypto_feeds::MarketDataCollection;
 use crypto_feeds::market_data::InstrumentType;
 use crypto_feeds::symbol_registry::{REGISTRY, SymbolId};
@@ -255,6 +255,9 @@ pub struct MmEngine<O: ExchangeOms> {
     cached_skew_bps: f64,
     has_vol_params: bool,
     presigned_cancels: HashMap<ClientOrderId, O::SignedPayload>,
+    taker_config: Option<TakerConfig>,
+    last_taker_fair: f64,
+    last_taker_time: Option<Instant>,
     display: Option<display::DisplayBus>,
     // TODO: per-engine profiling files for multi-ticker
     #[cfg(feature = "profiling")]
@@ -352,6 +355,8 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
             None
         };
 
+        let taker_config = config.taker.clone();
+
         Ok(Self {
             oms,
             fair_price,
@@ -380,6 +385,9 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
             cached_skew_bps: 0.0,
             has_vol_params,
             presigned_cancels: HashMap::new(),
+            taker_config,
+            last_taker_fair: 0.0,
+            last_taker_time: None,
             display,
             #[cfg(feature = "profiling")]
             latency,
@@ -469,6 +477,9 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
 
         // ── FAST PATH: adverse cancel guard ──
         self.fast_cancel_check(tick.fair, oms_state);
+
+        // ── FAST PATH: momentum taker ──
+        self.fast_taker_check(tick.fair, oms_state);
 
         #[cfg(feature = "profiling")]
         let t3 = Instant::now(); // after fast path
@@ -949,6 +960,78 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
                 }
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Fast path: momentum taker
+    // -----------------------------------------------------------------------
+
+    fn fast_taker_check(&mut self, fair: f64, oms_state: &OmsStateTracker) {
+        let tc = match &self.taker_config {
+            Some(tc) if tc.enabled => tc,
+            _ => {
+                self.last_taker_fair = fair;
+                return;
+            }
+        };
+
+        if self.last_taker_fair <= 0.0 || !self.warmed_up || self.ghost {
+            self.last_taker_fair = fair;
+            return;
+        }
+
+        // Cooldown
+        if let Some(last) = self.last_taker_time {
+            if last.elapsed() < Duration::from_millis(tc.cooldown_ms) {
+                return;
+            }
+        }
+
+        let move_bps = (fair - self.last_taker_fair) / self.last_taker_fair * 10_000.0;
+        self.last_taker_fair = fair;
+
+        if move_bps.abs() < tc.threshold_bps {
+            return;
+        }
+
+        // Position limit check
+        let position = self.get_position(oms_state);
+        let max_pos = self.config.max_position_usd.unwrap() / fair;
+        let order_size = tc.notional_usd / fair;
+
+        let edge = tc.threshold_bps * fair / 10_000.0;
+        let (side, price) = if move_bps > 0.0 {
+            // Binance up → buy at fair - threshold (guaranteed edge if filled)
+            if position + order_size > max_pos { return; }
+            (Side::Buy, fair - edge)
+        } else {
+            // Binance down → sell at fair + threshold
+            if position - order_size < -max_pos { return; }
+            (Side::Sell, fair + edge)
+        };
+
+        info!("[{}] TAKER {:?} {:.1}bps move, size={:.6} price={:.2}",
+            self.config.symbol, side, move_bps, order_size, price);
+
+        let req = OrderRequest {
+            symbol: self.config.symbol.clone(),
+            side,
+            order_type: OrderType::Limit {
+                price,
+                tif: TimeInForce::IOC,
+            },
+            size: order_size,
+            reduce_only: false,
+        };
+
+        let oms = Arc::clone(&self.oms);
+        tokio::spawn(async move {
+            if let Err(e) = oms.place_order(req).await {
+                warn!("taker order failed: {e}");
+            }
+        });
+
+        self.last_taker_time = Some(Instant::now());
     }
 
     // -----------------------------------------------------------------------

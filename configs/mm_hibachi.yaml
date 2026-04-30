@@ -83,11 +83,21 @@ symbols:
     vol_mult_floor: 1.0
     vol_mult_cap: 10.0
     vol_symbol: "BTC"
+    taker:
+      enabled: true
+      threshold_bps: 5.0
+      notional_usd: 100.0
+      cooldown_ms: 1000
   - symbol: PERP_ETH_USDT
     ref_vol: 0.40
     vol_mult_floor: 1.0
     vol_mult_cap: 10.0
     vol_symbol: "ETH"
+    taker:
+      enabled: true
+      threshold_bps: 7.0
+      notional_usd: 100.0
+      cooldown_ms: 1000
   # - symbol: PERP_SOL_USDT
   #   ref_vol: 0.40
   #   vol_mult_floor: 0.3
@@ -111,6 +121,11 @@ symbols:
     ref_half_spread_bps: 100
     ref_min_spread_bps: 50
     ref_requote_tolerance_bps: 50
+    taker:
+      enabled: true
+      threshold_bps: 10.0
+      notional_usd: 100.0
+      cooldown_ms: 1000
   # - symbol: PERP_XRP_USDT
   #   ref_vol: 0.40
   #   vol_mult_floor: 0.3
