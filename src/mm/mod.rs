@@ -1480,20 +1480,22 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
                 (min_ask - fair_val) / fair_val * 10_000.0
             } else { 0.0 },
             requote_bid_bps: if fair_val > 0.0 {
+                // Bid requotes when q.price < desired_bid - requote_thresh (too passive)
                 let mid = fair_val + self.cached_skew_bps * fair_val / 10_000.0;
                 let half_spread = self.config.ref_half_spread_bps.unwrap() * vol_mult * fair_val / 10_000.0;
+                let min_edge = self.config.min_edge_bps.unwrap() * fair_val / 10_000.0;
+                let desired_bid = (mid - half_spread).min(fair_val - min_edge);
                 let requote = self.config.ref_requote_tolerance_bps.unwrap() * vol_mult * fair_val / 10_000.0;
-                let desired_bid = mid - half_spread;
-                let outer_bid = desired_bid - requote;
-                (outer_bid - fair_val) / fair_val * 10_000.0
+                (desired_bid - requote - fair_val) / fair_val * 10_000.0
             } else { 0.0 },
             requote_ask_bps: if fair_val > 0.0 {
+                // Ask requotes when q.price > desired_ask + requote_thresh (too passive)
                 let mid = fair_val + self.cached_skew_bps * fair_val / 10_000.0;
                 let half_spread = self.config.ref_half_spread_bps.unwrap() * vol_mult * fair_val / 10_000.0;
+                let min_edge = self.config.min_edge_bps.unwrap() * fair_val / 10_000.0;
+                let desired_ask = (mid + half_spread).max(fair_val + min_edge);
                 let requote = self.config.ref_requote_tolerance_bps.unwrap() * vol_mult * fair_val / 10_000.0;
-                let desired_ask = mid + half_spread;
-                let outer_ask = desired_ask + requote;
-                (outer_ask - fair_val) / fair_val * 10_000.0
+                (desired_ask + requote - fair_val) / fair_val * 10_000.0
             } else { 0.0 },
             feed_age_ms,
         });
