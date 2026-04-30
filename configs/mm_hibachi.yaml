@@ -61,9 +61,9 @@ inventory:
 
 skew_scale_usd: 100.0
 post_only: true
-ref_half_spread_bps: 3
-ref_min_spread_bps: 1.5
-ref_requote_tolerance_bps: 3.0
+ref_half_spread_bps: 1.5
+ref_min_spread_bps: 0.75
+ref_requote_tolerance_bps: 1.5
 min_edge_bps: -0.1
 max_skew_bps: 10.0
 quote_interval_ms: 1000
