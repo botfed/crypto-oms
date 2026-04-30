@@ -256,7 +256,6 @@ pub struct MmEngine<O: ExchangeOms> {
     has_vol_params: bool,
     presigned_cancels: HashMap<ClientOrderId, O::SignedPayload>,
     taker_config: Option<TakerConfig>,
-    last_taker_fair: f64,
     last_taker_time: Option<Instant>,
     display: Option<display::DisplayBus>,
     // TODO: per-engine profiling files for multi-ticker
@@ -386,7 +385,6 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
             has_vol_params,
             presigned_cancels: HashMap::new(),
             taker_config,
-            last_taker_fair: 0.0,
             last_taker_time: None,
             display,
             #[cfg(feature = "profiling")]
@@ -969,14 +967,10 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
     fn fast_taker_check(&mut self, fair: f64, oms_state: &OmsStateTracker) {
         let tc = match &self.taker_config {
             Some(tc) if tc.enabled => tc,
-            _ => {
-                self.last_taker_fair = fair;
-                return;
-            }
+            _ => return,
         };
 
-        if self.last_taker_fair <= 0.0 || !self.warmed_up || self.ghost {
-            self.last_taker_fair = fair;
+        if !self.warmed_up || self.ghost || fair <= 0.0 {
             return;
         }
 
@@ -987,10 +981,13 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
             }
         }
 
-        let move_bps = (fair - self.last_taker_fair) / self.last_taker_fair * 10_000.0;
-        self.last_taker_fair = fair;
+        // Residual: how far hibachi mid is from fair
+        let target_mid = self.fair_price
+            .get_mid(self.target_exchange, self.hl_symbol_id)
+            .unwrap_or(fair);
+        let residual_bps = (fair - target_mid) / fair * 10_000.0;
 
-        if move_bps.abs() < tc.threshold_bps {
+        if residual_bps.abs() < tc.threshold_bps {
             return;
         }
 
@@ -1000,18 +997,18 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
         let order_size = tc.notional_usd / fair;
 
         let edge = tc.threshold_bps * fair / 10_000.0;
-        let (side, price) = if move_bps > 0.0 {
-            // Binance up → buy at fair - threshold (guaranteed edge if filled)
+        let (side, price) = if residual_bps > 0.0 {
+            // Fair above hibachi mid → buy stale asks at fair - threshold
             if position + order_size > max_pos { return; }
             (Side::Buy, fair - edge)
         } else {
-            // Binance down → sell at fair + threshold
+            // Fair below hibachi mid → sell into stale bids at fair + threshold
             if position - order_size < -max_pos { return; }
             (Side::Sell, fair + edge)
         };
 
-        info!("[{}] TAKER {:?} {:.1}bps move, size={:.6} price={:.2}",
-            self.config.symbol, side, move_bps, order_size, price);
+        info!("[{}] TAKER {:?} resid={:.1}bps size={:.6} price={:.2}",
+            self.config.symbol, side, residual_bps, order_size, price);
 
         let req = OrderRequest {
             symbol: self.config.symbol.clone(),
