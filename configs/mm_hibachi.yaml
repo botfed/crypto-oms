@@ -37,10 +37,10 @@ fair_price:
     #   target_symbol: PERP_HYPE_USDT
     #   reference_exchange: binance
     #   reference_symbol: PERP_HYPE_USDT
-    # - target_exchange: hibachi
-    #   target_symbol: PERP_BNB_USDT
-    #   reference_exchange: binance
-    #   reference_symbol: PERP_BNB_USDT
+    - target_exchange: hibachi
+      target_symbol: PERP_BNB_USDT
+      reference_exchange: binance
+      reference_symbol: PERP_BNB_USDT
     - target_exchange: hibachi
       target_symbol: PERP_SUI_USDT
       reference_exchange: binance
