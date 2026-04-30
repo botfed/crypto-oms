@@ -92,7 +92,7 @@ symbols:
     vol_symbol: "ETH"
     taker:
       enabled: true
-      threshold_bps: 7.0
+      threshold_bps: 6.0
       notional_usd: 100.0
       cooldown_ms: 1000
   # - symbol: PERP_SOL_USDT
@@ -120,7 +120,7 @@ symbols:
     ref_requote_tolerance_bps: 50
     taker:
       enabled: true
-      threshold_bps: 10.0
+      threshold_bps: 7.0
       notional_usd: 100.0
       cooldown_ms: 1000
   # - symbol: PERP_XRP_USDT

@@ -184,7 +184,7 @@ pub async fn run_display(
     let start = Instant::now();
     let mut statuses: BTreeMap<String, SymbolStatus> = BTreeMap::new();
     let mut logs: VecDeque<String> = VecDeque::new();
-    let mut resid_tracker: BTreeMap<String, (f64, f64, Instant)> = BTreeMap::new(); // (min, max, reset_at)
+    let mut resid_tracker: BTreeMap<String, (f64, f64)> = BTreeMap::new(); // (min, max)
 
     let shutdown_fut = shutdown.notified();
     tokio::pin!(shutdown_fut);
@@ -201,13 +201,9 @@ pub async fn run_display(
                         DisplayMsg::Status(s) => {
                             let r = s.residual_bps;
                             let entry = resid_tracker.entry(s.symbol.clone())
-                                .or_insert((r, r, Instant::now()));
-                            if entry.2.elapsed() >= Duration::from_secs(60) {
-                                *entry = (r, r, Instant::now());
-                            } else {
-                                entry.0 = entry.0.min(r);
-                                entry.1 = entry.1.max(r);
-                            }
+                                .or_insert((r, r));
+                            entry.0 = entry.0.min(r);
+                            entry.1 = entry.1.max(r);
                             statuses.insert(s.symbol.clone(), s);
                         }
                         DisplayMsg::Log(line) => {
@@ -242,7 +238,7 @@ fn header() -> String {
 
 fn render_frame(
     statuses: &BTreeMap<String, SymbolStatus>,
-    resid_tracker: &BTreeMap<String, (f64, f64, Instant)>,
+    resid_tracker: &BTreeMap<String, (f64, f64)>,
     logs: &VecDeque<String>,
     start: Instant,
 ) -> String {
@@ -286,7 +282,7 @@ fn render_frame(
         };
 
         let (rmin, rmax) = resid_tracker.get(&st.symbol)
-            .map(|(mn, mx, _)| (*mn, *mx))
+            .copied()
             .unwrap_or((0.0, 0.0));
         let resid_range = format!("[{:+.1},{:+.1}]", rmin, rmax);
 

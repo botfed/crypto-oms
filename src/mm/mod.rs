@@ -996,13 +996,13 @@ impl<O: ExchangeOms + 'static> MmEngine<O> {
         let max_pos = self.config.max_position_usd.unwrap() / fair;
         let order_size = tc.notional_usd / fair;
 
-        let edge = tc.threshold_bps * fair / 10_000.0;
+        let edge = tc.threshold_bps * 0.8 * fair / 10_000.0;
         let (side, price) = if residual_bps > 0.0 {
-            // Fair above hibachi mid → buy stale asks at fair - threshold
+            // Fair above hibachi mid → buy stale asks at fair - 80% of threshold
             if position + order_size > max_pos { return; }
             (Side::Buy, fair - edge)
         } else {
-            // Fair below hibachi mid → sell into stale bids at fair + threshold
+            // Fair below hibachi mid → sell into stale bids at fair + 80% of threshold
             if position - order_size < -max_pos { return; }
             (Side::Sell, fair + edge)
         };
